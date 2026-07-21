@@ -12,6 +12,5 @@ uploads
 .env.before-cloudflare-*
 docker-compose*.yml
 Caddyfile
-scripts
 !.env.example
 !.env.cloudflare.example
