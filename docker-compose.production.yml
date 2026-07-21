@@ -1,0 +1,141 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: shortdrama
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: shortdrama
+    volumes:
+      - production_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shortdrama -d shortdrama"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    mem_limit: 320m
+    logging: *default-logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 64mb --maxmemory-policy noeviction
+    volumes:
+      - production_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    mem_limit: 96m
+    logging: *default-logging
+
+  minio:
+    profiles: ["legacy-storage"]
+    image: minio/minio:RELEASE.2025-02-28T09-55-16Z
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":9001"
+    volumes:
+      - production_minio:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    mem_limit: 256m
+    logging: *default-logging
+
+  web:
+    image: imaideo-app:latest
+    build:
+      context: .
+      target: runtime
+    restart: unless-stopped
+    env_file: .env.production
+    environment:
+      NODE_ENV: production
+      NODE_OPTIONS: --max-old-space-size=320
+      DATABASE_URL: postgresql://shortdrama:${POSTGRES_PASSWORD}@postgres:5432/shortdrama?schema=public
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    command: sh -c "npx prisma db push && npm run seed && npm run start"
+    ports:
+      - "127.0.0.1:14000:14000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:14000/login').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    mem_limit: 384m
+    logging: *default-logging
+    networks:
+      default:
+        ipv4_address: 172.19.0.9
+
+  worker:
+    image: imaideo-app:latest
+    restart: unless-stopped
+    env_file: .env.production
+    environment:
+      NODE_ENV: production
+      NODE_OPTIONS: --max-old-space-size=384
+      DATABASE_URL: postgresql://shortdrama:${POSTGRES_PASSWORD}@postgres:5432/shortdrama?schema=public
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      TEXT_WORKER_CONCURRENCY: "1"
+    command: npx tsx src/lib/worker/index.ts
+    depends_on:
+      web:
+        condition: service_healthy
+    mem_limit: 512m
+    logging: *default-logging
+    networks:
+      default:
+        ipv4_address: 172.19.0.10
+
+  caddy:
+    profiles: ["direct"]
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      SERVER_IP: ${SERVER_IP}
+      APP_DOMAIN: ${APP_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - production_caddy_data:/data
+      - production_caddy_config:/config
+    depends_on:
+      web:
+        condition: service_healthy
+    mem_limit: 96m
+    logging: *default-logging
+
+volumes:
+  production_postgres:
+  production_redis:
+  production_minio:
+  production_caddy_data:
+  production_caddy_config:
+
+networks:
+  default:
+    name: imaideo_default
+    external: true

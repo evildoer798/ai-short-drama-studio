@@ -1,0 +1,336 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum AssetType {
+  character
+  location
+  prop
+}
+
+enum MediaKind {
+  image
+  video
+}
+
+enum ProjectRole {
+  owner
+  admin
+  member
+}
+
+enum TaskStatus {
+  queued
+  processing
+  completed
+  failed
+}
+
+enum GenerationTaskType {
+  script_adaptation
+  script_revision
+  asset_extraction
+  storyboard_generation
+  image_generation
+  video_generation
+  project_render
+}
+
+enum VisualStyle {
+  photorealistic
+  anime_2d
+  anime_3d
+  chibi
+}
+
+model User {
+  id                 String            @id @default(cuid())
+  email              String            @unique
+  username           String?           @unique
+  name               String
+  passwordHash       String
+  mustChangePassword Boolean           @default(false)
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
+  assets             Asset[]           @relation("AssetCreator")
+  memberships        ProjectMember[]
+  taskRuns           GenerationTask[]
+  workspaces         WorkspaceMember[]
+  scriptComments     ScriptComment[]
+}
+
+model Workspace {
+  id        String            @id @default(cuid())
+  name      String
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @updatedAt
+  members   WorkspaceMember[]
+  projects  Project[]
+}
+
+model WorkspaceMember {
+  id          String      @id @default(cuid())
+  workspaceId String
+  userId      String
+  role        ProjectRole @default(member)
+  createdAt   DateTime    @default(now())
+  user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace   Workspace   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, userId])
+  @@index([userId])
+}
+
+model Project {
+  id                String           @id @default(cuid())
+  workspaceId       String
+  name              String
+  visualStyle       VisualStyle      @default(photorealistic)
+  customStylePrompt String?          @db.Text
+  selectedRenderId  String?          @unique
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+  workspace         Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  members           ProjectMember[]
+  assets            Asset[]
+  storyboards       Storyboard[]
+  tasks             GenerationTask[]
+  renders           ProjectRender[]  @relation("ProjectRenders")
+  selectedRender    ProjectRender?   @relation("SelectedProjectRender", fields: [selectedRenderId], references: [id], onDelete: SetNull)
+  novelSource       NovelSource?
+  scriptEpisodes    ScriptEpisode[]
+
+  @@index([workspaceId])
+}
+
+model NovelSource {
+  id        String   @id @default(cuid())
+  projectId String   @unique
+  title     String
+  content   String   @db.Text
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+}
+
+model ScriptEpisode {
+  id                 String          @id @default(cuid())
+  projectId          String
+  episodeNumber      Int
+  title              String
+  logline            String?         @db.Text
+  content            String          @db.Text
+  locked             Boolean         @default(false)
+  sourceChunkIndexes Int[]           @default([])
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+  project            Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  comments           ScriptComment[]
+  storyboards        Storyboard[]
+
+  @@unique([projectId, episodeNumber])
+  @@index([projectId, locked])
+}
+
+model ScriptComment {
+  id          String        @id @default(cuid())
+  episodeId   String
+  createdById String
+  quotedText  String        @db.Text
+  instruction String        @db.Text
+  startOffset Int?
+  endOffset   Int?
+  resolved    Boolean       @default(false)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+  episode     ScriptEpisode @relation(fields: [episodeId], references: [id], onDelete: Cascade)
+  createdBy   User          @relation(fields: [createdById], references: [id], onDelete: Cascade)
+
+  @@index([episodeId, resolved])
+  @@index([createdById])
+}
+
+model ProjectMember {
+  id        String      @id @default(cuid())
+  projectId String
+  userId    String
+  role      ProjectRole @default(member)
+  createdAt DateTime    @default(now())
+  project   Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, userId])
+  @@index([userId])
+}
+
+model Asset {
+  id              String            @id @default(cuid())
+  projectId       String
+  type            AssetType
+  name            String
+  description     String            @db.Text
+  tags            String[]          @default([])
+  prompt          String?           @db.Text
+  videoPrompt     String?           @db.Text
+  selectedImageId String?           @unique
+  createdById     String
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+  createdBy       User              @relation("AssetCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  project         Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  selectedImage   AssetImage?       @relation("SelectedAssetImage", fields: [selectedImageId], references: [id], onDelete: SetNull)
+  images          AssetImage[]      @relation("AssetImages")
+  tasks           GenerationTask[]
+  storyboardLinks StoryboardAsset[]
+
+  @@index([projectId, type])
+  @@index([createdById])
+}
+
+model AssetImage {
+  id          String      @id @default(cuid())
+  assetId     String
+  mediaId     String
+  prompt      String      @db.Text
+  variant     Int
+  isSelected  Boolean     @default(false)
+  createdAt   DateTime    @default(now())
+  asset       Asset       @relation("AssetImages", fields: [assetId], references: [id], onDelete: Cascade)
+  media       MediaObject @relation(fields: [mediaId], references: [id], onDelete: Restrict)
+  selectedFor Asset?      @relation("SelectedAssetImage")
+
+  @@unique([assetId, variant])
+  @@index([mediaId])
+}
+
+model MediaObject {
+  id               String            @id @default(cuid())
+  kind             MediaKind
+  storageKey       String            @unique
+  mimeType         String
+  sizeBytes        BigInt
+  width            Int?
+  height           Int?
+  createdAt        DateTime          @default(now())
+  images           AssetImage[]
+  storyboardVideos StoryboardVideo[]
+  projectRenders   ProjectRender[]
+}
+
+model GenerationTask {
+  id             String             @id @default(cuid())
+  type           GenerationTaskType
+  status         TaskStatus         @default(queued)
+  projectId      String
+  assetId        String?
+  storyboardId   String?
+  createdById    String
+  provider       String             @default("openai-compatible")
+  model          String
+  prompt         String             @db.Text
+  requestedCount Int                @default(1)
+  progress       Int                @default(0)
+  error          String?            @db.Text
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+  startedAt      DateTime?
+  completedAt    DateTime?
+  payload        Json?
+  asset          Asset?             @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  storyboard     Storyboard?        @relation(fields: [storyboardId], references: [id], onDelete: Cascade)
+  createdBy      User               @relation(fields: [createdById], references: [id], onDelete: Cascade)
+  project        Project            @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, status])
+  @@index([assetId])
+  @@index([storyboardId])
+  @@index([createdById])
+}
+
+model Storyboard {
+  id              String            @id @default(cuid())
+  projectId       String
+  episodeId       String?
+  title           String
+  sceneNumber     Int               @default(1)
+  episodeSceneNumber Int?
+  generatedByAI   Boolean           @default(false)
+  notes           String?           @db.Text
+  imagePrompt     String?           @db.Text
+  videoPrompt     String?           @db.Text
+  duration        Int               @default(15)
+  aspectRatio     String            @default("16:9")
+  generateAudio   Boolean           @default(true)
+  selectedVideoId String?           @unique
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+  project         Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  episode         ScriptEpisode?    @relation(fields: [episodeId], references: [id], onDelete: SetNull)
+  selectedVideo   StoryboardVideo?  @relation("SelectedStoryboardVideo", fields: [selectedVideoId], references: [id], onDelete: SetNull)
+  videos          StoryboardVideo[] @relation("StoryboardVideos")
+  assetLinks      StoryboardAsset[]
+  tasks           GenerationTask[]
+
+  @@unique([projectId, sceneNumber])
+  @@index([projectId])
+  @@index([episodeId, episodeSceneNumber])
+}
+
+model StoryboardAsset {
+  id             String     @id @default(cuid())
+  storyboardId   String
+  assetId        String
+  matchScore     Int
+  matchReason    String
+  referenceOrder Int
+  createdAt      DateTime   @default(now())
+  storyboard     Storyboard @relation(fields: [storyboardId], references: [id], onDelete: Cascade)
+  asset          Asset      @relation(fields: [assetId], references: [id], onDelete: Cascade)
+
+  @@unique([storyboardId, assetId])
+  @@index([assetId])
+  @@index([storyboardId, referenceOrder])
+}
+
+model StoryboardVideo {
+  id            String      @id @default(cuid())
+  storyboardId  String
+  sourceStoryboardIds String[] @default([])
+  mediaId       String
+  prompt        String      @db.Text
+  model         String
+  providerJobId String?
+  duration      Int
+  aspectRatio   String
+  isSelected    Boolean     @default(false)
+  createdAt     DateTime    @default(now())
+  storyboard    Storyboard  @relation("StoryboardVideos", fields: [storyboardId], references: [id], onDelete: Cascade)
+  media         MediaObject @relation(fields: [mediaId], references: [id], onDelete: Restrict)
+  selectedFor   Storyboard? @relation("SelectedStoryboardVideo")
+
+  @@index([storyboardId])
+  @@index([mediaId])
+}
+
+model ProjectRender {
+  id             String      @id @default(cuid())
+  projectId      String
+  mediaId        String
+  title          String
+  duration       Float
+  aspectRatio    String
+  clipCount      Int
+  sourceVideoIds String[]
+  createdAt      DateTime    @default(now())
+  project        Project     @relation("ProjectRenders", fields: [projectId], references: [id], onDelete: Cascade)
+  media          MediaObject @relation(fields: [mediaId], references: [id], onDelete: Restrict)
+  selectedFor    Project?    @relation("SelectedProjectRender")
+
+  @@index([projectId, createdAt])
+  @@index([mediaId])
+}

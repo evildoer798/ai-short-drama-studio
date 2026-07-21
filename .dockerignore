@@ -1,0 +1,17 @@
+.git
+.next
+node_modules
+artifacts
+coverage
+uploads
+*.log
+.env
+.env.production
+.deploy-*.tar.gz
+.env.cloudflare
+.env.before-cloudflare-*
+docker-compose*.yml
+Caddyfile
+scripts
+!.env.example
+!.env.cloudflare.example

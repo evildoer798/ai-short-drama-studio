@@ -1,0 +1,99 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: shortdrama-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: shortdrama
+      POSTGRES_PASSWORD: shortdrama
+      POSTGRES_DB: shortdrama
+    ports:
+      - "15432:5432"
+    volumes:
+      - shortdrama_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shortdrama -d shortdrama"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    container_name: shortdrama-redis
+    restart: unless-stopped
+    ports:
+      - "16400:6379"
+    volumes:
+      - shortdrama_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  minio:
+    image: minio/minio:RELEASE.2025-02-28T09-55-16Z
+    container_name: shortdrama-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    ports:
+      - "19100:9000"
+      - "19101:9001"
+    volumes:
+      - shortdrama_minio:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  web:
+    build: .
+    container_name: shortdrama-web
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: "postgresql://shortdrama:shortdrama@postgres:5432/shortdrama?schema=public"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      S3_ENDPOINT: "http://minio:9000"
+    ports:
+      - "14000:14000"
+    volumes:
+      - .:/app
+      - shortdrama_node_modules:/app/node_modules
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    command: sh -c "npx prisma db push && npm run seed && npm run dev:web"
+
+  worker:
+    build: .
+    container_name: shortdrama-worker
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: "postgresql://shortdrama:shortdrama@postgres:5432/shortdrama?schema=public"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      S3_ENDPOINT: "http://minio:9000"
+    volumes:
+      - .:/app
+      - shortdrama_node_modules:/app/node_modules
+    depends_on:
+      web:
+        condition: service_started
+    command: npm run dev:worker
+
+volumes:
+  shortdrama_pg:
+  shortdrama_redis:
+  shortdrama_minio:
+  shortdrama_node_modules:

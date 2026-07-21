@@ -1,0 +1,18 @@
+Create a 15-second, 16:9, low-detail 3D blocking animatic for shot approval. This is a motion and camera preview, not a finished film.
+
+Visual rules for the entire video:
+- Use exactly two smooth, faceless humanoid mannequins with stable colors and proportions.
+- The mother is a matte red adult female mannequin. The daughter is a matte white young female mannequin and appears only inside the tablet video-call screen.
+- Use a simple green-and-gray blockout set with flat materials, no realistic faces, no skin, no hair strands, no clothing texture, no text, no subtitles, no logos.
+- Keep the mother on the sofa and the daughter inside the tablet screen. Never swap their colors or positions. Do not add a third person.
+- Prioritize readable body motion, eyelines, screen direction, camera movement, and timing.
+
+0-4 seconds, shot 1: medium locked shot with a gentle push-in. Nighttime blockout of a villa living room. A sofa, floor lamp, coffee table, tablet, and wine glass are represented by simple geometric props. The red mother mannequin sits on the sofa and looks at the tablet. The white daughter mannequin is visible on the tablet screen, leaning against a simple bed headboard.
+
+4-8 seconds, shot 2: fixed close shot with very slight handheld movement. Move closer to the red mother's head, shoulders, hands, and tablet. She makes one restrained speaking gesture and maintains eye contact with the screen.
+
+8-12 seconds, shot 3: side medium shot with a slow horizontal camera move. Clearly show the red mother, tablet, floor lamp, and wine glass. The white daughter remains inside the tablet screen with tired, slouched body language.
+
+12-15 seconds, shot 4: cut to a close view of the tablet screen with a subtle downward camera angle. The white daughter mannequin gives a minimal tired response, slightly lifts her eyes, then settles back. Hold on her final pose.
+
+No audio is required. Avoid montage, split screen, rapid cuts, extra limbs, object morphing, and changes to the number of characters.

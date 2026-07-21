@@ -1,0 +1,18 @@
+Create a 15-second photorealistic Chinese urban drama video in 16:9. The supplied image is the strict visual reference and already combines the two selected character assets in the intended scene.
+
+Identity and continuity lock:
+- Su Wenjing is the elegant Chinese woman in her early 40s seated on the left. Preserve her exact face, age, dark hair, burgundy silk robe, body proportions, and restrained upper-class presence from the reference.
+- Chen Rui is the pale 18-year-old Chinese daughter visible only inside the tablet video-call screen. Preserve her exact face, messy black hair pinned with a wooden pencil, black oversized T-shirt, tired eyes, and rebellious slouched posture from the reference.
+- Keep both identities stable in every frame. Never swap faces, ages, clothing, positions, or hairstyles. Do not add a third person. Chen Rui must remain inside the tablet screen.
+
+Visual style: live-action photorealism, contemporary Chinese short-drama cinematography, natural skin texture, realistic hair and fabric, warm tungsten floor-lamp light mixed with cool night window light, restrained cinematic contrast, realistic hands, coherent reflections, shallow depth of field. This is a finished realistic scene, not an animatic, illustration, character sheet, collage, or 3D mannequin video.
+
+0-4 seconds: medium shot with a gentle push-in. In the villa living room at night, Su Wenjing sits on the sofa and looks coldly at the tablet. The coffee table holds the tablet and a half-filled red-wine glass. Chen Rui is visible on the tablet, leaning against her bed headboard.
+
+4-8 seconds: close shot with subtle handheld movement. Move closer to Su Wenjing's face, hands, and tablet. She makes one restrained speaking gesture and silently mouths: "下周我过来带你们见面吃饭。"
+
+8-12 seconds: side medium shot with a slow horizontal camera move. Keep the floor lamp, wine glass, sofa, and tablet spatially consistent. Su Wenjing maintains her composed posture while Chen Rui remains tired and slouched on the video call.
+
+12-15 seconds: close view of the tablet with a slight downward angle. Chen Rui lifts her eyes, silently mouths "哦", then settles back with a weary, defiant expression. Hold the final pose.
+
+No subtitles, captions, logos, watermarks, extra text, split screen, montage, rapid cuts, face morphing, extra fingers, or duplicated objects. No audio is required.
