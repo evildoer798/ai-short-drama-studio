@@ -888,12 +888,20 @@ function AssetPlanningWorkspace({
   onNotice: (text: string, tone?: NoticeTone) => void
   onNext: () => void
 }) {
+  const eligibleEpisodes = episodes.filter((episode) => episode.locked && episode.storyboardCount > 0)
   const [filter, setFilter] = useState<AssetType | 'all'>('all')
   const [selectedId, setSelectedId] = useState(assets[0]?.id || '')
   const [deletingId, setDeletingId] = useState('')
-  const locked = episodes.length > 0 && episodes.every((episode) => episode.locked)
+  const [episodeScope, setEpisodeScope] = useState(eligibleEpisodes.at(-1)?.id || '')
   const storyboardReadyCount = episodes.filter((episode) => episode.storyboardCount > 0).length
-  const storyboardsReady = episodes.length > 0 && storyboardReadyCount === episodes.length
+  const selectedEpisodeIds = episodeScope === 'all-ready'
+    ? eligibleEpisodes.map((episode) => episode.id)
+    : eligibleEpisodes.some((episode) => episode.id === episodeScope) ? [episodeScope] : []
+  const selectedScopeLabel = episodeScope === 'all-ready'
+    ? `已完成的 ${eligibleEpisodes.length} 集`
+    : eligibleEpisodes.find((episode) => episode.id === episodeScope)
+      ? `第 ${eligibleEpisodes.find((episode) => episode.id === episodeScope)?.episodeNumber} 集`
+      : '所选分集'
   const sceneConsistency = calculateSceneConsistency(storyboards, assets)
   const locationAssetCount = assets.filter((asset) => asset.type === 'location').length
   const filtered = filter === 'all' ? assets : assets.filter((asset) => asset.type === filter)
@@ -903,15 +911,30 @@ function AssetPlanningWorkspace({
     if (!selected && filtered[0]) setSelectedId(filtered[0].id)
   }, [filtered, selected])
 
+  useEffect(() => {
+    if (eligibleEpisodes.length === 0) {
+      if (episodeScope) setEpisodeScope('')
+      return
+    }
+    if (episodeScope === 'all-ready') return
+    if (!eligibleEpisodes.some((episode) => episode.id === episodeScope)) {
+      setEpisodeScope(eligibleEpisodes.at(-1)?.id || '')
+    }
+  }, [episodeScope, eligibleEpisodes.map((episode) => episode.id).join('|')])
+
   async function extractAssets() {
+    if (selectedEpisodeIds.length === 0) {
+      onNotice('请先选择一集已经完成分镜的剧本', 'error')
+      return
+    }
     try {
       const payload = await requestJson<{ task: TextTask }>(`/api/projects/${projectId}/extract-assets`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ refreshDrafts: true }),
+        body: JSON.stringify({ refreshDrafts: true, episodeIds: selectedEpisodeIds }),
       })
       onTask(payload.task)
-      onNotice('资产提取任务已提交，将按已完成分镜锁定角色和场景名称')
+      onNotice(`${selectedScopeLabel}资产规划已提交，将复用已有角色和场景资产`)
     } catch (error) {
       onNotice(error instanceof Error ? error.message : '资产提取失败', 'error')
     }
@@ -946,9 +969,24 @@ function AssetPlanningWorkspace({
       <aside className="planningRail">
         <div className="panelHeading"><span><Sparkles size={17} /><strong>资产规划</strong></span><small>{assets.length} 项</small></div>
         <div className="planningStatus">
-          {locked && storyboardsReady ? <Check size={17} /> : <CircleAlert size={17} />}
-          <span><strong>{storyboardsReady ? '分镜已完成' : '分镜尚未完成'}</strong><small>{storyboardReadyCount}/{episodes.length} 集已有分镜</small></span>
+          {storyboardReadyCount > 0 ? <Check size={17} /> : <CircleAlert size={17} />}
+          <span><strong>{storyboardReadyCount > 0 ? '可按集规划资产' : '尚无可规划分集'}</strong><small>{storyboardReadyCount}/{episodes.length} 集已有分镜</small></span>
         </div>
+        <label className="episodeAssetScope">
+          <span>本次规划范围</span>
+          <select
+            value={episodeScope}
+            disabled={taskRunning || eligibleEpisodes.length === 0}
+            onChange={(event) => setEpisodeScope(event.target.value)}
+          >
+            {eligibleEpisodes.map((episode) => (
+              <option key={episode.id} value={episode.id}>第 {episode.episodeNumber} 集 · {episode.title}</option>
+            ))}
+            {eligibleEpisodes.length > 1 ? (
+              <option value="all-ready">全部已完成分镜（累计核对）</option>
+            ) : null}
+          </select>
+        </label>
         <div
           className={`planningStatus ${locationAssetCount > 0 && !sceneConsistency.exact ? 'sceneMismatch' : ''}`}
           title={sceneConsistency.missingNames.length > 0 ? `尚未匹配：${sceneConsistency.missingNames.join('、')}` : undefined}
@@ -967,11 +1005,11 @@ function AssetPlanningWorkspace({
           className="primaryButton"
           data-assistant-target="extract-assets"
           type="button"
-          disabled={!locked || !storyboardsReady || taskRunning}
+          disabled={selectedEpisodeIds.length === 0 || taskRunning}
           onClick={() => void extractAssets()}
         >
           {taskRunning ? <Loader2 className="spin" size={17} /> : <WandSparkles size={17} />}
-          {assets.length ? '按分镜重新提取' : '从分镜提取资产'}
+          {episodeScope === 'all-ready' ? '累计更新资产规划' : `规划${selectedScopeLabel}资产`}
         </button>
         <div className="planningFilters">
           {(['all', 'character', 'location', 'prop'] as const).map((type) => (

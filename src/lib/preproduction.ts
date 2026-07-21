@@ -39,6 +39,7 @@ export const createScriptCommentSchema = z.object({
 
 export const extractAssetsSchema = z.object({
   refreshDrafts: z.boolean().default(true),
+  episodeIds: z.array(z.string().trim().min(1)).min(1).max(60).optional(),
 })
 
 export const generateStoryboardsSchema = z.object({
@@ -218,9 +219,14 @@ export async function requireLockedEpisodes(projectId: string, requestedEpisodeI
 }
 
 export async function requireAllEpisodesStoryboarded(projectId: string) {
+  return requireEpisodesStoryboarded(projectId)
+}
+
+export async function requireEpisodesStoryboarded(projectId: string, requestedEpisodeIds?: string[]) {
   const episodes = await prisma.scriptEpisode.findMany({
     where: { projectId },
     select: {
+      id: true,
       episodeNumber: true,
       _count: { select: { storyboards: true } },
     },
@@ -229,15 +235,22 @@ export async function requireAllEpisodesStoryboarded(projectId: string) {
   if (episodes.length === 0) {
     throw new HttpError(409, 'SCRIPT_REQUIRED', '请先完成小说改编，生成分集剧本')
   }
-  const missing = episodes.filter((episode) => episode._count.storyboards === 0)
+  const requestedIds = [...new Set(requestedEpisodeIds || [])]
+  const selected = requestedIds.length > 0
+    ? episodes.filter((episode) => requestedIds.includes(episode.id))
+    : episodes
+  if (requestedIds.length > 0 && selected.length !== requestedIds.length) {
+    throw new HttpError(404, 'EPISODE_NOT_FOUND', '指定的分集不存在或不属于当前项目')
+  }
+  const missing = selected.filter((episode) => episode._count.storyboards === 0)
   if (missing.length > 0) {
     throw new HttpError(
       409,
       'STORYBOARDS_REQUIRED',
-      `请先完成全部分集的分镜拆解；尚未生成：${missing.map((item) => `第 ${item.episodeNumber} 集`).join('、')}`,
+      `请先完成所选分集的分镜拆解；尚未生成：${missing.map((item) => `第 ${item.episodeNumber} 集`).join('、')}`,
     )
   }
-  return episodes
+  return selected
 }
 
 export async function createTextTask(input: {

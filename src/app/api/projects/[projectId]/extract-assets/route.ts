@@ -6,8 +6,8 @@ import { requireWritableProject } from '@/lib/permissions'
 import {
   createTextTask,
   extractAssetsSchema,
-  requireAllEpisodesLocked,
-  requireAllEpisodesStoryboarded,
+  requireEpisodesStoryboarded,
+  requireLockedEpisodes,
 } from '@/lib/preproduction'
 
 export async function POST(
@@ -18,14 +18,14 @@ export async function POST(
     const user = await requireUser()
     const { projectId } = await context.params
     await requireWritableProject(projectId, user.id)
-    await requireAllEpisodesLocked(projectId)
-    await requireAllEpisodesStoryboarded(projectId)
     const body = extractAssetsSchema.parse(await request.json().catch(() => ({})))
+    const episodes = await requireLockedEpisodes(projectId, body.episodeIds)
+    await requireEpisodesStoryboarded(projectId, episodes.map((episode) => episode.id))
     const task = await createTextTask({
       type: GenerationTaskType.asset_extraction,
       projectId,
       createdById: user.id,
-      prompt: '从已锁定分集剧本和已完成分镜提取角色、场景和道具资产提示词',
+      prompt: `从已完成分镜的第 ${episodes.map((episode) => episode.episodeNumber).join('、')} 集提取角色、场景和核心道具资产提示词`,
       payload: body,
     })
     return NextResponse.json({ task }, { status: 202 })

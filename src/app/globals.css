@@ -876,6 +876,19 @@ textarea:focus {
   font-size: 10px;
 }
 
+.episodeAssetScope {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.episodeAssetScope select {
+  width: 100%;
+  min-width: 0;
+  background: var(--panel);
+}
+
 .planningFilters button {
   min-height: 40px;
   display: grid;

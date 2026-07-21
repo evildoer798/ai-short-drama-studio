@@ -43,8 +43,7 @@ import {
   STORYBOARD_SYSTEM_PROMPT,
 } from '@/lib/preproduction-prompts'
 import {
-  requireAllEpisodesLocked,
-  requireAllEpisodesStoryboarded,
+  requireEpisodesStoryboarded,
   requireLockedEpisodes,
 } from '@/lib/preproduction'
 import {
@@ -1675,15 +1674,17 @@ async function processAssetExtraction(task: {
   createdById: string
   payload: Prisma.JsonValue | null
 }) {
-  await requireAllEpisodesLocked(task.projectId)
-  await requireAllEpisodesStoryboarded(task.projectId)
   const payload = payloadRecord(task.payload)
+  const requestedEpisodeIds = storyboardRequestedEpisodeIds(payload)
+  const selectedEpisodes = await requireLockedEpisodes(task.projectId, requestedEpisodeIds)
+  const targetEpisodeIds = selectedEpisodes.map((episode) => episode.id)
+  await requireEpisodesStoryboarded(task.projectId, targetEpisodeIds)
   const project = await prisma.project.findUnique({ where: { id: task.projectId } })
   if (!project) throw new Error('项目不存在')
   const productionProject = project
   const [episodes, existingAssets, storyboards] = await Promise.all([
     prisma.scriptEpisode.findMany({
-      where: { projectId: task.projectId, locked: true },
+      where: { projectId: task.projectId, locked: true, id: { in: targetEpisodeIds } },
       orderBy: { episodeNumber: 'asc' },
     }),
     prisma.asset.findMany({
@@ -1700,7 +1701,7 @@ async function processAssetExtraction(task: {
       orderBy: [{ type: 'asc' }, { name: 'asc' }],
     }),
     prisma.storyboard.findMany({
-      where: { projectId: task.projectId },
+      where: { projectId: task.projectId, episodeId: { in: targetEpisodeIds } },
       select: { id: true, episodeId: true, notes: true, videoPrompt: true, updatedAt: true },
       orderBy: { sceneNumber: 'asc' },
     }),
@@ -1709,7 +1710,7 @@ async function processAssetExtraction(task: {
   const allStoryboardLocations = extractAllStoryboardLocationInventories(storyboards)
   const sourceFingerprint = createHash('sha256')
     .update(JSON.stringify({
-      pipelineVersion: 'storyboard-first-asset-extraction-v5',
+      pipelineVersion: 'storyboard-first-asset-extraction-v6-episode-scope',
       visualStyle: productionProject.visualStyle,
       customStylePrompt: project.customStylePrompt,
       episodes: episodes.map((episode) => ({
@@ -2138,6 +2139,8 @@ async function processAssetExtraction(task: {
     storyboardFallbackScenes,
     apiOnly: true,
     model: env.textModel(),
+    episodeIds: targetEpisodeIds,
+    episodeNumbers: episodes.map((episode) => episode.episodeNumber),
   }
 }
 
