@@ -1158,51 +1158,200 @@ textarea:focus {
 .batchVideoBar {
   grid-column: 1 / -1;
   display: grid;
-  grid-template-columns: minmax(190px, 1fr) minmax(184px, auto) minmax(190px, 230px) 120px minmax(150px, auto) auto;
-  align-items: end;
-  gap: 10px;
+  grid-template-columns: minmax(320px, 1.05fr) minmax(560px, 1.95fr);
+  align-items: stretch;
+  gap: 14px;
   border-bottom: 1px solid var(--line);
   background: var(--panel);
-  padding: 10px 14px;
+  padding: 12px 14px;
 }
 
+.batchComposer,
 .batchVideoSummary,
 .batchVideoEstimate,
-.storyboardsPerVideoControl {
+.batchDurationControl {
   min-width: 0;
   display: grid;
-  gap: 4px;
+  gap: 5px;
+}
+
+.batchVideoSummary > span {
+  display: flex;
+  align-items: center;
+  gap: 7px;
 }
 
 .batchVideoSummary strong,
-.batchVideoEstimate strong {
+.batchVideoEstimate strong,
+.batchDurationControl strong {
   font-size: 13px;
 }
 
 .batchVideoSummary small,
 .batchVideoEstimate small,
-.storyboardsPerVideoControl small,
 .batchVideoError {
   color: var(--muted);
   font-size: 10px;
   line-height: 1.4;
 }
 
-.storyboardsPerVideoControl > span {
+.storyboardDropzone {
+  position: relative;
+  min-height: 76px;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  border: 1px dashed var(--line-strong);
+  border-radius: 7px;
+  background: var(--panel-muted);
+  padding: 9px 42px 9px 10px;
+  transition: border-color 180ms ease, background-color 180ms ease, transform 180ms ease;
+}
+
+.storyboardDropzone.dragOver {
+  border-color: var(--accent-strong);
+  background: var(--accent-soft);
+  transform: translateY(-1px);
+}
+
+.storyboardDropzone.full {
+  border-style: solid;
+}
+
+.dropzoneEmpty {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  color: var(--muted);
+  text-align: left;
+}
+
+.dropzoneEmpty > span {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.dropzoneEmpty strong {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.dropzoneEmpty small {
+  font-size: 10px;
+}
+
+.batchStoryboardTokens {
+  min-width: 0;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+
+.batchStoryboardToken {
+  min-width: 132px;
+  max-width: 190px;
+  flex: 1 1 150px;
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) 26px;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  padding: 7px 5px 7px 7px;
+}
+
+.batchStoryboardToken > svg {
+  color: var(--muted);
+}
+
+.batchStoryboardToken > span {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.batchStoryboardToken strong,
+.batchStoryboardToken small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.batchStoryboardToken strong {
+  font-size: 10px;
+}
+
+.batchStoryboardToken small {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.batchStoryboardToken button {
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  padding: 0;
+}
+
+.batchStoryboardToken button:hover {
+  background: var(--coral-soft);
+  color: var(--danger);
+}
+
+.batchSlotCount {
+  position: absolute;
+  right: 10px;
+  top: 9px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 750;
+}
+
+.batchSettingsGrid {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(190px, 1.5fr) minmax(155px, 1fr) 112px minmax(110px, 0.75fr) auto;
+  align-items: end;
+  gap: 10px;
+}
+
+.batchDurationControl > span {
+  display: flex;
+  justify-content: space-between;
   color: var(--muted);
   font-size: 12px;
   font-weight: 650;
 }
 
-.storyboardsPerVideoControl .ratioControl {
+.batchDurationControl .ratioControl {
   width: fit-content;
 }
 
-.storyboardsPerVideoControl .ratioControl button {
-  min-width: 48px;
+.batchDurationControl .ratioControl button {
+  min-width: 44px;
   min-height: 30px;
-  padding-inline: 8px;
+  padding-inline: 7px;
   font-size: 11px;
+}
+
+.batchDurationControl input[type="range"] {
+  min-height: 30px;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  accent-color: var(--accent-strong);
 }
 
 .batchVideoError {
@@ -1221,6 +1370,10 @@ textarea:focus {
 
 .batchVideoBar .primaryButton {
   white-space: nowrap;
+}
+
+.batchGenerateButton {
+  min-height: 36px;
 }
 
 .batchModelControl {
@@ -1903,6 +2056,9 @@ textarea:focus {
 }
 
 .batchSelectionRow > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   color: var(--muted);
   font-size: 10px;
   font-weight: 700;
@@ -1915,14 +2071,35 @@ textarea:focus {
 .sceneRow {
   min-width: 0;
   display: grid;
-  grid-template-columns: 36px minmax(0, 1fr);
+  grid-template-columns: 28px 36px minmax(0, 1fr);
   align-items: stretch;
   border-bottom: 1px solid var(--line);
   background: transparent;
+  transition: opacity 160ms ease, background-color 160ms ease;
 }
 
 .sceneRow.checked {
   background: var(--accent-soft);
+}
+
+.sceneRow.dragging {
+  opacity: 0.46;
+}
+
+.sceneDragHandle {
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  cursor: grab;
+}
+
+.sceneDragHandle.disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.sceneRow[draggable="true"]:active .sceneDragHandle {
+  cursor: grabbing;
 }
 
 .sceneBatchCheck {
@@ -3992,7 +4169,7 @@ textarea:focus {
   }
 
   .batchVideoBar {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: 1fr;
   }
 
   .videoPanel {
@@ -4114,12 +4291,16 @@ textarea:focus {
   }
 
   .batchVideoBar {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-columns: 1fr;
   }
 
-  .batchVideoSummary,
-  .batchVideoError {
-    grid-column: 1 / -1;
+  .batchSettingsGrid {
+    grid-template-columns: minmax(210px, 1.35fr) minmax(150px, 1fr) minmax(110px, 0.65fr);
+  }
+
+  .batchVideoEstimate,
+  .batchGenerateButton {
+    align-self: stretch;
   }
 
   .scriptWorkspace {
@@ -4342,6 +4523,22 @@ textarea:focus {
   .batchVideoSummary,
   .batchVideoError {
     grid-column: 1;
+  }
+
+  .batchSettingsGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .batchSettingsGrid > * {
+    min-width: 0;
+  }
+
+  .batchDurationControl .ratioControl {
+    width: 100%;
+  }
+
+  .batchDurationControl .ratioControl button {
+    flex: 1;
   }
 
   .styleOptions button {

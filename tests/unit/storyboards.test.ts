@@ -365,7 +365,11 @@ describe('storyboard video generation settings', () => {
     expect(generateStoryboardVideoGroupSchema.parse({
       storyboardIds: ['shot-1', 'shot-2', 'shot-3', 'shot-4'],
       model: 'seedance-2.0-mini',
-    }).storyboardIds).toHaveLength(4)
+      duration: 12,
+    })).toMatchObject({
+      storyboardIds: ['shot-1', 'shot-2', 'shot-3', 'shot-4'],
+      duration: 12,
+    })
     expect(() => generateStoryboardVideoGroupSchema.parse({
       storyboardIds: ['shot-1', 'shot-1'],
     })).toThrow()

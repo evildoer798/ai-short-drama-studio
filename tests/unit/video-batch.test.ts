@@ -91,6 +91,13 @@ describe('sequential video batches', () => {
     })
   })
 
+  it('fits the combined timeline to the duration selected by the user', () => {
+    const fitted = fitVideoGroupDurations([4, 4, 4], 15, null, 4, 10)
+
+    expect(fitted.duration).toBe(10)
+    expect(fitted.timelineDurations).toEqual([3.33, 3.33, 3.34])
+  })
+
   it('starts a new video when selected shots are not adjacent', () => {
     const groups = groupSingleEpisodeVideoBatch([
       shot('episode-1', 1, 4),

@@ -124,6 +124,7 @@ export async function POST(request: NextRequest) {
       modelDefinition.maximumDuration,
       modelDefinition.supportedDurations,
       modelDefinition.minimumDuration,
+      body.duration,
     )
     const duration = fittedTimeline.duration
     if (duration < modelDefinition.minimumDuration || duration > modelDefinition.maximumDuration) {

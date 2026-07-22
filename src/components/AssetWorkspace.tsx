@@ -1,6 +1,6 @@
 'use client'
 
-import { FormEvent, SyntheticEvent, useEffect, useMemo, useRef, useState } from 'react'
+import { DragEvent, FormEvent, SyntheticEvent, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ArrowRight,
   BookOpenText,
@@ -12,6 +12,7 @@ import {
   Clapperboard,
   Download,
   Film,
+  GripVertical,
   House,
   ImageIcon,
   Layers3,
@@ -37,12 +38,9 @@ import {
 import { splitAssetHighlights } from '@/lib/asset-highlights'
 import { readableTextTaskError } from '@/lib/text-task-error'
 import {
-  estimateSequentialVideoBatchSeconds,
   estimateVideoGenerationSeconds,
   fitVideoGroupDurations,
-  groupSingleEpisodeVideoBatch,
   normalizeVideoDuration,
-  type StoryboardVideoGroupSize,
 } from '@/lib/video-batch'
 import { PreproductionWorkspace, type PreproductionSummary } from './PreproductionWorkspace'
 
@@ -1284,6 +1282,7 @@ export function AssetWorkspace({
   }
 
   async function generateVideoGroup(storyboardIds: string[], settings: {
+    duration: number
     resolution: VideoResolution
     generateAudio?: boolean
     model: string
@@ -2395,6 +2394,7 @@ function StoryboardWorkspace({
     model: string
   }, quiet?: boolean) => Promise<TaskRecord | null>
   onGenerateGroup: (storyboardIds: string[], settings: {
+    duration: number
     resolution: VideoResolution
     generateAudio?: boolean
     model: string
@@ -2432,10 +2432,12 @@ function StoryboardWorkspace({
   const initialEpisodeKey = selectedEpisodeKey || episodeGroups[0]?.key || ''
   const [openEpisodeKeys, setOpenEpisodeKeys] = useState<string[]>(initialEpisodeKey ? [initialEpisodeKey] : [])
   const [batchIds, setBatchIds] = useState<string[]>([])
-  const [storyboardsPerVideo, setStoryboardsPerVideo] = useState<StoryboardVideoGroupSize>(3)
   const [batchModel, setBatchModel] = useState(defaultVideoModel)
+  const [batchDuration, setBatchDuration] = useState(15)
   const [batchResolution, setBatchResolution] = useState<VideoResolution>('720p')
   const [batchSubmitting, setBatchSubmitting] = useState(false)
+  const [draggingStoryboardId, setDraggingStoryboardId] = useState<string | null>(null)
+  const [dropActive, setDropActive] = useState(false)
   const selectedBatchModel = videoModels.find((model) => model.id === batchModel) || null
 
   useEffect(() => {
@@ -2462,52 +2464,51 @@ function StoryboardWorkspace({
     setBatchResolution((current) => usableModel.resolutions.includes(current)
       ? current
       : usableModel.defaultResolution)
+    setBatchDuration((current) => normalizeVideoDuration(
+      current,
+      usableModel.minimumDuration,
+      usableModel.maximumDuration,
+      usableModel.supportedDurations,
+    ))
   }, [defaultVideoModel, selectedBatchModel, videoModels])
 
   const batchEpisode = episodeGroups.find((group) => (
     group.storyboards.some((storyboard) => batchIds.includes(storyboard.id))
   )) || null
   const batchStoryboards = batchEpisode?.storyboards.filter((storyboard) => batchIds.includes(storyboard.id)) || []
-  let plannedVideoGroups: StoryboardRecord[][] = []
-  let groupingError = ''
-  try {
-    plannedVideoGroups = groupSingleEpisodeVideoBatch(
-      batchStoryboards,
-      storyboardsPerVideo,
-      selectedBatchModel?.maximumDuration || 15,
-    )
-  } catch (error) {
-    groupingError = error instanceof Error ? error.message : '无法组合所选分镜'
-  }
-  const mixedRatioGroupCount = plannedVideoGroups.filter((group) => (
-    new Set(group.map((storyboard) => storyboard.aspectRatio)).size > 1
-  )).length
-  const tooManyReferencesGroupCount = plannedVideoGroups.filter((group) => (
-    new Set(group.flatMap((storyboard) => storyboard.assets
-      .filter((asset) => asset.hasSelectedImage && asset.type !== 'prop')
-      .map((asset) => asset.id))).size > (selectedBatchModel?.maximumReferenceImages || 4)
-  )).length
+  const storyboardNumbers = batchStoryboards.map((storyboard) => (
+    storyboard.episodeSceneNumber || storyboard.sceneNumber
+  ))
+  const nonContiguous = storyboardNumbers.some((number, index) => (
+    index > 0 && number !== storyboardNumbers[index - 1] + 1
+  ))
+  const mixedAspectRatios = new Set(batchStoryboards.map((storyboard) => storyboard.aspectRatio)).size > 1
+  const batchReferenceCount = new Set(batchStoryboards.flatMap((storyboard) => storyboard.assets
+    .filter((asset) => asset.hasSelectedImage && asset.type !== 'prop')
+    .map((asset) => asset.id))).size
   const unsupportedRatioCount = selectedBatchModel
     ? batchStoryboards.filter((storyboard) => !selectedBatchModel.aspectRatios.includes(storyboard.aspectRatio)).length
     : 0
-  const batchValidationError = groupingError
-    || (mixedRatioGroupCount > 0 ? '同一条组合视频中的分镜必须使用相同画幅' : '')
-    || (tooManyReferencesGroupCount > 0
-      ? `当前模型最多接收 ${selectedBatchModel?.maximumReferenceImages || 4} 张人物或场景参考图，请减少每条包含的分镜数或更换模型`
-      : '')
-  const plannedDurations = plannedVideoGroups.map((group) => ({
-    duration: fitVideoGroupDurations(
-      group.map((storyboard) => storyboard.duration),
-      selectedBatchModel?.maximumDuration || 15,
-      selectedBatchModel?.supportedDurations || null,
-      selectedBatchModel?.minimumDuration || 1,
-    ).duration,
-  }))
+  const fittedBatch = fitVideoGroupDurations(
+    batchStoryboards.map((storyboard) => storyboard.duration),
+    selectedBatchModel?.maximumDuration || 15,
+    selectedBatchModel?.supportedDurations || null,
+    selectedBatchModel?.minimumDuration || 1,
+    batchDuration,
+  )
+  const effectiveBatchDuration = batchStoryboards.length > 0 ? fittedBatch.duration : batchDuration
+  const batchValidationError = batchStoryboards.length > 1 && batchStoryboards.some((storyboard) => !storyboard.episodeId)
+    ? '组合视频只能使用同一集内已归档的分镜'
+    : nonContiguous ? '请拖入同一集内连续相邻的分镜'
+      : mixedAspectRatios ? '同一条组合视频中的分镜必须使用相同画幅'
+        : batchReferenceCount > (selectedBatchModel?.maximumReferenceImages || 4)
+          ? `当前模型最多接收 ${selectedBatchModel?.maximumReferenceImages || 4} 张人物或场景参考图，请减少组合分镜或更换模型`
+          : ''
   const batchPrice = selectedBatchModel
-    ? plannedDurations.reduce((total, item) => total + videoPriceAmount(selectedBatchModel, item.duration), 0)
+    ? videoPriceAmount(selectedBatchModel, effectiveBatchDuration)
     : 0
   const batchTime = selectedBatchModel
-    ? estimateSequentialVideoBatchSeconds(selectedBatchModel.family, plannedDurations)
+    ? estimateVideoGenerationSeconds(selectedBatchModel.family, effectiveBatchDuration)
     : { minimum: 0, maximum: 0 }
   const generatedVideoStoryboardIds = new Set(storyboards.flatMap((storyboard) => (
     storyboard.videos.flatMap((video) => video.sourceStoryboardIds?.length
@@ -2524,59 +2525,58 @@ function StoryboardWorkspace({
       : [...current, episodeKey])
   }
 
-  function toggleStoryboard(storyboard: StoryboardRecord) {
-    if (batchIds.includes(storyboard.id)) {
-      setBatchIds((current) => current.filter((id) => id !== storyboard.id))
+  function addStoryboardToBatch(storyboard: StoryboardRecord) {
+    if (batchIds.includes(storyboard.id)) return
+    if (batchIds.length >= 4) {
+      onNotice('一条组合视频最多放入 4 个分镜', 'error')
       return
     }
     const episodeKey = storyboard.episodeId || 'unassigned'
     if (batchEpisode && batchEpisode.key !== episodeKey) {
-      setBatchIds([storyboard.id])
+      onNotice('组合区只能放入同一集的分镜', 'error')
       return
     }
     setBatchIds((current) => [...current, storyboard.id])
   }
 
-  function toggleReadyStoryboards(group: (typeof episodeGroups)[number]) {
-    const readyIds = group.storyboards
-      .filter((storyboard) => (
-        Boolean(storyboard.videoPrompt?.trim())
-        && storyboard.assets.some((asset) => asset.hasSelectedImage)
-        && !activeVideoStoryboardIds.has(storyboard.id)
-      ))
-      .map((storyboard) => storyboard.id)
-    const allSelected = readyIds.length > 0 && readyIds.every((id) => batchIds.includes(id))
-    setBatchIds(allSelected ? [] : readyIds)
+  function toggleStoryboard(storyboard: StoryboardRecord) {
+    if (batchIds.includes(storyboard.id)) {
+      setBatchIds((current) => current.filter((id) => id !== storyboard.id))
+      return
+    }
+    addStoryboardToBatch(storyboard)
+  }
+
+  function dropStoryboard(event: DragEvent<HTMLDivElement>) {
+    event.preventDefault()
+    setDropActive(false)
+    const storyboardId = event.dataTransfer.getData('application/x-storyboard-id')
+      || event.dataTransfer.getData('text/plain')
+    const storyboard = storyboards.find((item) => item.id === storyboardId)
+    if (storyboard) addStoryboardToBatch(storyboard)
   }
 
   async function generateBatch() {
-    if (!selectedBatchModel || plannedVideoGroups.length === 0 || unsupportedRatioCount > 0 || batchValidationError) return
+    if (!selectedBatchModel || batchStoryboards.length === 0 || unsupportedRatioCount > 0 || batchValidationError) return
     setBatchSubmitting(true)
-    let submitted = 0
-    let coveredStoryboards = 0
-    for (const group of plannedVideoGroups) {
-      const task = group.length === 1
-        ? await onGenerate(group[0], {
-            duration: group[0].duration,
-            aspectRatio: group[0].aspectRatio,
-            resolution: batchResolution,
-            generateAudio: selectedBatchModel.supportsAudio && group[0].generateAudio,
-            model: selectedBatchModel.id,
-          }, true)
-        : await onGenerateGroup(group.map((storyboard) => storyboard.id), {
-            resolution: batchResolution,
-            generateAudio: selectedBatchModel.supportsAudio && group.some((storyboard) => storyboard.generateAudio),
-            model: selectedBatchModel.id,
-          }, true)
-      if (task) {
-        submitted += 1
-        coveredStoryboards += group.length
-      }
-    }
+    const task = batchStoryboards.length === 1
+      ? await onGenerate(batchStoryboards[0], {
+          duration: effectiveBatchDuration,
+          aspectRatio: batchStoryboards[0].aspectRatio,
+          resolution: batchResolution,
+          generateAudio: selectedBatchModel.supportsAudio && batchStoryboards[0].generateAudio,
+          model: selectedBatchModel.id,
+        }, true)
+      : await onGenerateGroup(batchStoryboards.map((storyboard) => storyboard.id), {
+          duration: effectiveBatchDuration,
+          resolution: batchResolution,
+          generateAudio: selectedBatchModel.supportsAudio && batchStoryboards.some((storyboard) => storyboard.generateAudio),
+          model: selectedBatchModel.id,
+        }, true)
     setBatchSubmitting(false)
-    if (submitted > 0) {
+    if (task) {
       setBatchIds([])
-      onNotice(`已加入 ${submitted} 条视频任务，共覆盖 ${coveredStoryboards} 个分镜`)
+      onNotice(`已提交 1 条组合视频，共包含 ${batchStoryboards.length} 个分镜`)
     } else {
       onNotice('所选视频任务未能加入队列，请检查资产主图和提示词', 'error')
     }
@@ -2584,81 +2584,139 @@ function StoryboardWorkspace({
 
   return (
     <section className="storyboardWorkspace">
-      <div className="batchVideoBar" aria-label="批量视频生成">
-        <div className="batchVideoSummary">
-          <strong>组合生成视频</strong>
-          <small>{batchEpisode?.label || '请在同一集内勾选分镜'} · 已选 {batchStoryboards.length} 镜 → 生成 {plannedVideoGroups.length} 条</small>
-        </div>
-        <div className="storyboardsPerVideoControl">
-          <span>每条包含</span>
-          <div className="ratioControl" aria-label="每条视频包含的分镜数">
-            {([1, 2, 3, 4] as StoryboardVideoGroupSize[]).map((count) => (
-              <button
-                key={count}
-                type="button"
-                className={storyboardsPerVideo === count ? 'active' : ''}
-                onClick={() => setStoryboardsPerVideo(count)}
-              >{count} 镜</button>
-            ))}
+      <div className="batchVideoBar" aria-label="分镜组合视频生成">
+        <div className="batchComposer">
+          <div className="batchVideoSummary">
+            <span><ListVideo size={17} /><strong>分镜组合区</strong></span>
+            <small>{batchEpisode?.label || '从下方拖入分镜'} · {batchStoryboards.length}/4 镜</small>
           </div>
-          <small>建议每条 3-4 镜；相邻镜头会按比例压入最长 {selectedBatchModel?.maximumDuration || 15} 秒</small>
+          <div
+            className={`storyboardDropzone ${dropActive ? 'dragOver' : ''} ${batchStoryboards.length >= 4 ? 'full' : ''}`}
+            onDragEnter={(event) => {
+              event.preventDefault()
+              setDropActive(true)
+            }}
+            onDragOver={(event) => {
+              event.preventDefault()
+              event.dataTransfer.dropEffect = 'copy'
+              setDropActive(true)
+            }}
+            onDragLeave={() => setDropActive(false)}
+            onDrop={dropStoryboard}
+          >
+            {batchStoryboards.length === 0 ? (
+              <div className="dropzoneEmpty">
+                <GripVertical size={22} />
+                <span><strong>把分镜拖到这里</strong><small>同一集内最多 4 个连续分镜</small></span>
+              </div>
+            ) : (
+              <div className="batchStoryboardTokens">
+                {batchStoryboards.map((storyboard) => (
+                  <div className="batchStoryboardToken" key={storyboard.id}>
+                    <GripVertical size={15} />
+                    <span>
+                      <strong>分镜 {String(storyboard.episodeSceneNumber || storyboard.sceneNumber).padStart(2, '0')}</strong>
+                      <small title={storyboard.title}>{storyboard.title}</small>
+                    </span>
+                    <button
+                      type="button"
+                      title="移出组合区"
+                      aria-label={`移出分镜 ${storyboard.episodeSceneNumber || storyboard.sceneNumber}`}
+                      onClick={() => setBatchIds((current) => current.filter((id) => id !== storyboard.id))}
+                    ><X size={14} /></button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <span className="batchSlotCount">{batchStoryboards.length}/4</span>
+          </div>
         </div>
-        <div className="batchModelControl">
-          <label>
-            视频模型
-            <select value={batchModel} onChange={(event) => setBatchModel(event.target.value)}>
-              {videoModels.length === 0 ? <option value={batchModel}>正在读取模型…</option> : null}
-              {videoModels.map((model) => (
-                <option key={model.id} value={model.id} disabled={model.available === false}>
-                  {model.label} · {model.priceLabel}{model.available === false ? '（不可用）' : ''}
-                </option>
+
+        <div className="batchSettingsGrid">
+          <div className="batchModelControl">
+            <label>
+              视频模型
+              <select value={batchModel} onChange={(event) => setBatchModel(event.target.value)}>
+                {videoModels.length === 0 ? <option value={batchModel}>正在读取模型…</option> : null}
+                {videoModels.map((model) => (
+                  <option key={model.id} value={model.id} disabled={model.available === false}>
+                    {model.label} · {model.priceLabel}{model.available === false ? '（不可用）' : ''}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <button
+              className="iconButton modelRefreshButton"
+              type="button"
+              title="立即刷新可用模型与价格"
+              aria-label="立即刷新可用模型与价格"
+              disabled={videoModelsRefreshing}
+              onClick={onRefreshVideoModels}
+            >
+              <RefreshCw className={videoModelsRefreshing ? 'spin' : ''} size={15} />
+            </button>
+            <small title={videoPriceNotice}>
+              {selectedBatchModel?.priceSource === 'live' ? '实时价' : '参考价'} · {formatModelRefreshTime(videoModelsRefreshedAt)}
+            </small>
+          </div>
+
+          <div className="batchDurationControl">
+            <span>成片时长 <strong>{effectiveBatchDuration}s</strong></span>
+            {selectedBatchModel?.supportedDurations?.length ? (
+              <div className="ratioControl" aria-label="组合视频时长">
+                {selectedBatchModel.supportedDurations.map((duration) => (
+                  <button
+                    key={duration}
+                    type="button"
+                    className={batchDuration === duration ? 'active' : ''}
+                    onClick={() => setBatchDuration(duration)}
+                  >{duration}s</button>
+                ))}
+              </div>
+            ) : (
+              <input
+                type="range"
+                min={selectedBatchModel?.minimumDuration || 4}
+                max={selectedBatchModel?.maximumDuration || 15}
+                value={batchDuration}
+                onChange={(event) => setBatchDuration(Number(event.target.value))}
+              />
+            )}
+          </div>
+
+          <label className="batchResolutionControl">
+            清晰度
+            <select
+              value={batchResolution}
+              onChange={(event) => setBatchResolution(event.target.value as VideoResolution)}
+            >
+              {(selectedBatchModel?.resolutions || [batchResolution]).map((resolution) => (
+                <option key={resolution} value={resolution}>{resolution === '720p' ? 'HD 720p' : '标准 480p'}</option>
               ))}
             </select>
           </label>
+
+          <div className="batchVideoEstimate" aria-live="polite">
+            <strong>预计 ¥{batchPrice.toFixed(2)}</strong>
+            <small>{batchStoryboards.length > 0
+              ? formatMinuteRange(batchTime.minimum, batchTime.maximum)
+              : '放入分镜后生成'}</small>
+          </div>
+
           <button
-            className="iconButton modelRefreshButton"
+            className="primaryButton compact batchGenerateButton"
             type="button"
-            title="立即刷新可用模型与价格"
-            aria-label="立即刷新可用模型与价格"
-            disabled={videoModelsRefreshing}
-            onClick={onRefreshVideoModels}
+            disabled={batchSubmitting
+              || batchStoryboards.length === 0
+              || !selectedBatchModel
+              || selectedBatchModel.available === false
+              || Boolean(batchActionError)}
+            onClick={() => void generateBatch()}
           >
-            <RefreshCw className={videoModelsRefreshing ? 'spin' : ''} size={15} />
+            {batchSubmitting ? <Loader2 className="spin" size={16} /> : <ListVideo size={16} />}
+            {batchSubmitting ? '正在加入队列' : '生成组合视频'}
           </button>
-          <small title={videoPriceNotice}>
-            {selectedBatchModel?.priceSource === 'live' ? '实时价' : '参考价'} · {formatModelRefreshTime(videoModelsRefreshedAt)}
-          </small>
         </div>
-        <label>
-          清晰度
-          <select
-            value={batchResolution}
-            onChange={(event) => setBatchResolution(event.target.value as VideoResolution)}
-          >
-            {(selectedBatchModel?.resolutions || [batchResolution]).map((resolution) => (
-              <option key={resolution} value={resolution}>{resolution === '720p' ? 'HD 720p' : '标准 480p'}</option>
-            ))}
-          </select>
-        </label>
-        <div className="batchVideoEstimate" aria-live="polite">
-          <strong>预计 ¥{batchPrice.toFixed(2)}</strong>
-          <small>{batchStoryboards.length > 0
-            ? `串行耗时 ${formatMinuteRange(batchTime.minimum, batchTime.maximum)}`
-            : '勾选分镜后计算'}</small>
-        </div>
-        <button
-          className="primaryButton compact"
-          type="button"
-          disabled={batchSubmitting
-            || plannedVideoGroups.length === 0
-            || !selectedBatchModel
-            || selectedBatchModel.available === false
-            || Boolean(batchActionError)}
-          onClick={() => void generateBatch()}
-        >
-          {batchSubmitting ? <Loader2 className="spin" size={16} /> : <ListVideo size={16} />}
-          {batchSubmitting ? '正在加入队列' : `生成 ${plannedVideoGroups.length || 0} 条视频`}
-        </button>
         {batchActionError ? <small className="batchVideoError">{batchActionError}</small> : null}
       </div>
 
@@ -2672,14 +2730,7 @@ function StoryboardWorkspace({
         <div className="episodeAccordion">
           {episodeGroups.map((group) => {
             const open = openEpisodeKeys.includes(group.key)
-            const readyStoryboards = group.storyboards.filter((storyboard) => (
-              Boolean(storyboard.videoPrompt?.trim())
-              && storyboard.assets.some((asset) => asset.hasSelectedImage)
-              && !activeVideoStoryboardIds.has(storyboard.id)
-            ))
             const selectedCount = group.storyboards.filter((storyboard) => batchIds.includes(storyboard.id)).length
-            const allReadySelected = readyStoryboards.length > 0
-              && readyStoryboards.every((storyboard) => batchIds.includes(storyboard.id))
             const contentId = `episode-storyboards-${group.key}`
             return (
               <section className={`episodeGroup ${open ? 'open' : ''}`} key={group.key}>
@@ -2700,16 +2751,10 @@ function StoryboardWorkspace({
                 {open ? (
                   <div className="episodeStoryboardList" id={contentId}>
                     <div className="batchSelectionRow">
-                      <label title="选择本集内已保存提示词且已有资产主图的分镜">
-                        <input
-                          type="checkbox"
-                          checked={allReadySelected}
-                          disabled={readyStoryboards.length === 0}
-                          onChange={() => toggleReadyStoryboards(group)}
-                        />
-                        选择本集可生成镜头
-                      </label>
-                      <span>{selectedCount}/{group.storyboards.length}</span>
+                      <span><GripVertical size={14} />拖动分镜到上方组合区，也可以勾选加入</span>
+                      {selectedCount > 0 ? (
+                        <button className="quietButton compact" type="button" onClick={() => setBatchIds([])}>清空组合</button>
+                      ) : <span>最多 4 镜</span>}
                     </div>
                     <div className="sceneList">
                       {group.storyboards.map((storyboard) => {
@@ -2727,7 +2772,24 @@ function StoryboardWorkspace({
                           ? '请先填写并保存视频提示词'
                           : !hasReference ? '请先为已识别资产选择主图' : active ? '该分镜已在生成队列中' : ''
                         return (
-                          <div className={`sceneRow ${batchIds.includes(storyboard.id) ? 'checked' : ''}`} key={storyboard.id}>
+                          <div
+                            className={`sceneRow ${batchIds.includes(storyboard.id) ? 'checked' : ''} ${draggingStoryboardId === storyboard.id ? 'dragging' : ''}`}
+                            key={storyboard.id}
+                            draggable={selectable}
+                            onDragStart={(event) => {
+                              event.dataTransfer.effectAllowed = 'copy'
+                              event.dataTransfer.setData('application/x-storyboard-id', storyboard.id)
+                              event.dataTransfer.setData('text/plain', storyboard.id)
+                              setDraggingStoryboardId(storyboard.id)
+                            }}
+                            onDragEnd={() => {
+                              setDraggingStoryboardId(null)
+                              setDropActive(false)
+                            }}
+                          >
+                            <span className={`sceneDragHandle ${selectable ? '' : 'disabled'}`} title={unavailableReason || '拖到上方组合区'}>
+                              <GripVertical size={15} />
+                            </span>
                             <label className="sceneBatchCheck" title={unavailableReason || '加入组合视频队列'}>
                               <input
                                 type="checkbox"

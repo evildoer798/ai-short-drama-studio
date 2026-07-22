@@ -39,6 +39,7 @@ export const generateStoryboardVideoSchema = z.object({
 export const generateStoryboardVideoGroupSchema = z.object({
   storyboardIds: z.array(z.string().min(1)).min(2).max(4)
     .refine((ids) => new Set(ids).size === ids.length, '组合分镜不能重复'),
+  duration: z.coerce.number().int().min(4).max(15).optional(),
   resolution: storyboardVideoResolutionSchema.optional(),
   generateAudio: z.boolean().optional(),
   model: z.string().trim().min(1).max(120).optional(),

@@ -79,6 +79,7 @@ export function fitVideoGroupDurations(
   maximumDuration = 15,
   supportedDurations: number[] | null = null,
   minimumDuration = 1,
+  requestedDuration?: number,
 ) {
   const sourceDurations = durations.map((duration) => Math.max(0.1, duration))
   const sourceDuration = sourceDurations.reduce((total, duration) => total + duration, 0)
@@ -87,7 +88,7 @@ export function fitVideoGroupDurations(
   }
 
   const duration = normalizeVideoDuration(
-    sourceDuration,
+    requestedDuration ?? sourceDuration,
     minimumDuration,
     maximumDuration,
     supportedDurations,
