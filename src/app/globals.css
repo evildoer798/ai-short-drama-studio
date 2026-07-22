@@ -2894,6 +2894,7 @@ textarea:focus {
 }
 
 .videoLibraryPreview {
+  position: relative;
   width: 100%;
   aspect-ratio: 16 / 9;
   display: grid;
@@ -2912,6 +2913,20 @@ textarea:focus {
 .videoLibraryPreview.portrait video {
   width: auto;
   max-width: 100%;
+}
+
+.videoBufferingOverlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  pointer-events: none;
+  background: oklch(0.18 0.02 220 / 0.72);
+  color: white;
+  font-size: 12px;
+  font-weight: 650;
 }
 
 .videoLibraryDetails {

@@ -1,6 +1,6 @@
 'use client'
 
-import { FormEvent, useEffect, useMemo, useRef, useState } from 'react'
+import { FormEvent, SyntheticEvent, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ArrowRight,
   BookOpenText,
@@ -325,6 +325,97 @@ function videoTaskErrorMessage(value: string | null | undefined) {
     return 'Grok 仅支持 6、10 或 15 秒。系统现已自动调整时长，请重新点击生成；本次失败未进入视频生成阶段。'
   }
   return error || '视频生成失败'
+}
+
+function directVideoUrl(source: string) {
+  return `${source}${source.includes('?') ? '&' : '?'}direct=1`
+}
+
+function BufferedVideo({
+  source,
+  playsInline = false,
+}: {
+  source: string
+  playsInline?: boolean
+}) {
+  const videoRef = useRef<HTMLVideoElement>(null)
+  const objectUrlRef = useRef<string | null>(null)
+  const directReadyRef = useRef(false)
+  const loadingRef = useRef(false)
+  const fallbackRef = useRef(false)
+  const resumeAtRef = useRef(0)
+  const [playbackSource, setPlaybackSource] = useState(source)
+  const [loading, setLoading] = useState(false)
+
+  useEffect(() => {
+    directReadyRef.current = false
+    loadingRef.current = false
+    fallbackRef.current = false
+    setLoading(false)
+    setPlaybackSource(source)
+    if (objectUrlRef.current) {
+      URL.revokeObjectURL(objectUrlRef.current)
+      objectUrlRef.current = null
+    }
+  }, [source])
+
+  useEffect(() => () => {
+    if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current)
+  }, [])
+
+  async function prepareDirectPlayback(event: SyntheticEvent<HTMLVideoElement>) {
+    if (directReadyRef.current || loadingRef.current || fallbackRef.current) return
+    const video = event.currentTarget
+    resumeAtRef.current = video.currentTime
+    video.pause()
+    loadingRef.current = true
+    setLoading(true)
+
+    try {
+      const response = await fetch(directVideoUrl(source), {
+        credentials: 'same-origin',
+        cache: 'no-store',
+      })
+      if (!response.ok) throw new Error(`VIDEO_BUFFER_HTTP_${response.status}`)
+      const objectUrl = URL.createObjectURL(await response.blob())
+      if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current)
+      objectUrlRef.current = objectUrl
+      directReadyRef.current = true
+      setPlaybackSource(objectUrl)
+    } catch {
+      fallbackRef.current = true
+      window.requestAnimationFrame(() => void video.play())
+    } finally {
+      loadingRef.current = false
+      setLoading(false)
+    }
+  }
+
+  function resumeDirectPlayback() {
+    if (!directReadyRef.current || !videoRef.current) return
+    videoRef.current.currentTime = Math.min(resumeAtRef.current, videoRef.current.duration || 0)
+    void videoRef.current.play()
+  }
+
+  return (
+    <>
+      <video
+        ref={videoRef}
+        src={playbackSource}
+        controls
+        playsInline={playsInline}
+        preload="metadata"
+        onPlay={(event) => void prepareDirectPlayback(event)}
+        onLoadedMetadata={resumeDirectPlayback}
+      />
+      {loading ? (
+        <div className="videoBufferingOverlay" aria-live="polite">
+          <Loader2 className="spin" size={20} />
+          <span>正在加载视频</span>
+        </div>
+      ) : null}
+    </>
+  )
 }
 
 function HighlightedStoryboardPrompt({
@@ -1821,7 +1912,7 @@ function VideoLibraryItem({
   return (
     <article className="videoLibraryItem">
       <div className={`videoLibraryPreview ${previewClass}`}>
-        <video src={video.url} controls playsInline preload="metadata" />
+        <BufferedVideo source={video.url} playsInline />
       </div>
       <div className="videoLibraryDetails">
         <div className="videoSourceHeading">
@@ -2964,7 +3055,7 @@ function StoryboardEditor({
           style={{ aspectRatio: draft.aspectRatio.replace(':', ' / ') }}
         >
           {selectedVideo ? (
-            <video key={selectedVideo.id} src={selectedVideo.url} controls preload="metadata" />
+            <BufferedVideo key={selectedVideo.id} source={selectedVideo.url} playsInline />
           ) : (
             <div className="videoPlaceholder"><Clapperboard size={36} /><span>暂无视频</span></div>
           )}

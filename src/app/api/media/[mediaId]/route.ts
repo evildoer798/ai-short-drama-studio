@@ -69,10 +69,10 @@ export async function GET(
       displayName: render?.title?.trim() || storyboardVideoName || `媒体-${media.id}`,
       extension,
     }) : undefined
-    if (media.mimeType.startsWith('video/')) {
+    const direct = _request.nextUrl.searchParams.get('direct') === '1'
+    if (media.mimeType.startsWith('video/') && (direct || download)) {
       const location = await signedMediaUrl(media.storageKey, {
         downloadFilename,
-        mimeType: media.mimeType,
       })
       return NextResponse.redirect(location, {
         status: 307,
