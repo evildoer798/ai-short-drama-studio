@@ -1,3 +1,5 @@
+import { normalizeVideoDuration } from './video-batch'
+
 export type VideoApiMode = 'openai' | 'sub2api-grok' | 'newapi-grok'
 export type VideoGenerationResolution = '480p' | '720p'
 export type VideoGenerationAspectRatio = '16:9' | '9:16' | '1:1' | '21:9' | '3:4' | '4:3'
@@ -210,6 +212,7 @@ export async function submitVideoGeneration(
     const aspectRatio = input.aspectRatio || inferred.aspectRatio
     const resolution = input.resolution || inferred.resolution
     const references = (input.referenceImageUrls || []).slice(0, 7)
+    const seconds = normalizeVideoDuration(input.seconds || 6, 6, 15, [6, 10, 15])
     response = await fetchImpl(`${root}/videos`, {
       method: 'POST',
       headers: {
@@ -219,7 +222,7 @@ export async function submitVideoGeneration(
       body: JSON.stringify({
         model: capability.model,
         prompt: input.prompt,
-        seconds: input.seconds || 8,
+        seconds,
         aspect_ratio: aspectRatio,
         resolution,
         ...(references.length > 0 ? { image_urls: references } : {}),

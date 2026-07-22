@@ -3,6 +3,7 @@ import {
   estimateSequentialVideoBatchSeconds,
   fitVideoGroupDurations,
   groupSingleEpisodeVideoBatch,
+  normalizeVideoDuration,
   orderSingleEpisodeVideoBatch,
 } from '@/lib/video-batch'
 
@@ -71,6 +72,23 @@ describe('sequential video batches', () => {
     expect(fitted.sourceDuration).toBe(16)
     expect(fitted.timelineDurations).toEqual([3.75, 3.75, 3.75, 3.75])
     expect(fitted.timelineDurations.reduce((total, duration) => total + duration, 0)).toBe(15)
+  })
+
+  it('uses the next supported duration and stretches the combined timeline', () => {
+    const fitted = fitVideoGroupDurations([4, 4, 4], 15, [6, 10, 15], 6)
+
+    expect(fitted.duration).toBe(15)
+    expect(fitted.sourceDuration).toBe(12)
+    expect(fitted.timelineDurations).toEqual([5, 5, 5])
+    expect(normalizeVideoDuration(4, 6, 15, [6, 10, 15])).toBe(6)
+    expect(normalizeVideoDuration(12, 6, 15, [6, 10, 15])).toBe(15)
+  })
+
+  it('keeps continuous Seedance durations unchanged', () => {
+    expect(fitVideoGroupDurations([4, 4, 4], 15, null, 4)).toMatchObject({
+      duration: 12,
+      timelineDurations: [4, 4, 4],
+    })
   })
 
   it('starts a new video when selected shots are not adjacent', () => {

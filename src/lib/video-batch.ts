@@ -7,6 +7,26 @@ export type SequentialVideoBatchItem = {
 
 export type StoryboardVideoGroupSize = 1 | 2 | 3 | 4
 
+export function normalizeVideoDuration(
+  requestedDuration: number,
+  minimumDuration = 1,
+  maximumDuration = 15,
+  supportedDurations: number[] | null = null,
+) {
+  const minimum = Math.max(1, Math.round(minimumDuration))
+  const maximum = Math.max(minimum, Math.round(maximumDuration))
+  const requested = Number.isFinite(requestedDuration)
+    ? Math.min(maximum, Math.max(minimum, Math.ceil(requestedDuration)))
+    : minimum
+  const options = [...new Set(supportedDurations || [])]
+    .map((duration) => Math.round(duration))
+    .filter((duration) => duration >= minimum && duration <= maximum)
+    .sort((left, right) => left - right)
+
+  if (options.length === 0) return requested
+  return options.find((duration) => duration >= requested) || options.at(-1)!
+}
+
 function storyboardOrder(item: SequentialVideoBatchItem) {
   return item.episodeSceneNumber || item.sceneNumber
 }
@@ -54,15 +74,25 @@ export function groupSingleEpisodeVideoBatch<T extends SequentialVideoBatchItem>
   return groups
 }
 
-export function fitVideoGroupDurations(durations: number[], maximumDuration = 15) {
+export function fitVideoGroupDurations(
+  durations: number[],
+  maximumDuration = 15,
+  supportedDurations: number[] | null = null,
+  minimumDuration = 1,
+) {
   const sourceDurations = durations.map((duration) => Math.max(0.1, duration))
   const sourceDuration = sourceDurations.reduce((total, duration) => total + duration, 0)
   if (sourceDuration === 0) {
     return { duration: 0, sourceDuration: 0, timelineDurations: [] as number[] }
   }
 
-  const duration = Math.min(Math.max(1, Math.floor(maximumDuration)), Math.ceil(sourceDuration))
-  if (sourceDuration <= duration) {
+  const duration = normalizeVideoDuration(
+    sourceDuration,
+    minimumDuration,
+    maximumDuration,
+    supportedDurations,
+  )
+  if (Math.abs(sourceDuration - duration) < 0.001) {
     return { duration, sourceDuration, timelineDurations: sourceDurations }
   }
 

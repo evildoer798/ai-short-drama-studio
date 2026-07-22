@@ -67,7 +67,7 @@ describe('submitVideoGeneration', () => {
       { mode: 'openai', model: 'seedance-2.0-mini' },
       {
         prompt: 'use @image1 and @image2',
-        seconds: 15,
+        seconds: 12,
         size: '1280x720',
         aspectRatio: '3:4',
         resolution: '480p',
@@ -85,7 +85,7 @@ describe('submitVideoGeneration', () => {
 
     expect(submittedBody).toMatchObject({
       model: 'seedance-2.0-mini',
-      duration: 15,
+      duration: 12,
       aspect_ratio: '3:4',
       resolution: '480p',
       audio: true,
@@ -164,7 +164,7 @@ describe('submitVideoGeneration', () => {
       { mode: 'newapi-grok', model: 'grok-video' },
       {
         prompt: 'faceless mannequin action preview',
-        seconds: 15,
+        seconds: 12,
         size: '854x480',
         referenceImageUrls: ['data:image/jpeg;base64,AAA'],
       },

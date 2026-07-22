@@ -12,6 +12,7 @@ import {
   generateStoryboardVideoSchema,
   syncStoryboardAssetLinks,
 } from '@/lib/storyboards'
+import { normalizeVideoDuration } from '@/lib/video-batch'
 import { resolveVideoModelDefinition, videoModelPromptBudget } from '@/lib/video-models'
 
 export async function POST(
@@ -59,7 +60,7 @@ export async function POST(
 
     await syncStoryboardAssetLinks(storyboardId)
     const storyboard = await requireStoryboardAccess(storyboardId, user.id)
-    const duration = body.duration ?? storyboard.duration
+    const requestedDuration = body.duration ?? storyboard.duration
     const aspectRatio = body.aspectRatio ?? storyboard.aspectRatio
     const generateAudio = body.generateAudio ?? storyboard.generateAudio
     const model = body.model || env.videoModel() || 'seedance-2.0-mini'
@@ -67,6 +68,12 @@ export async function POST(
     if (!modelDefinition) {
       throw new HttpError(400, 'VIDEO_MODEL_NOT_ALLOWED', '该模型当前不可用，请刷新模型列表后重新选择')
     }
+    const duration = normalizeVideoDuration(
+      requestedDuration,
+      modelDefinition.minimumDuration,
+      modelDefinition.maximumDuration,
+      modelDefinition.supportedDurations,
+    )
     const matchedAssets = storyboard.assetLinks
     const references = matchedAssets
       .filter((link) => (

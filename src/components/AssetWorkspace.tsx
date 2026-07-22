@@ -41,6 +41,7 @@ import {
   estimateVideoGenerationSeconds,
   fitVideoGroupDurations,
   groupSingleEpisodeVideoBatch,
+  normalizeVideoDuration,
   type StoryboardVideoGroupSize,
 } from '@/lib/video-batch'
 import { PreproductionWorkspace, type PreproductionSummary } from './PreproductionWorkspace'
@@ -126,6 +127,7 @@ type VideoModelOption = {
   startingAt: boolean
   minimumDuration: number
   maximumDuration: number
+  supportedDurations: number[] | null
   maximumReferenceImages: number
   maximumPromptCharacters: number
   supportsAudio: boolean
@@ -318,6 +320,9 @@ function videoTaskErrorMessage(value: string | null | undefined) {
   }
   if (/model grok-video not found/iu.test(error)) {
     return '当前线路暂未提供所选 Grok 模型，请刷新模型列表后重新选择可用模型。'
+  }
+  if (/seconds must be one of:\s*6,\s*10,\s*15/iu.test(error)) {
+    return 'Grok 仅支持 6、10 或 15 秒。系统现已自动调整时长，请重新点击生成；本次失败未进入视频生成阶段。'
   }
   return error || '视频生成失败'
 }
@@ -2403,6 +2408,8 @@ function StoryboardWorkspace({
     duration: fitVideoGroupDurations(
       group.map((storyboard) => storyboard.duration),
       selectedBatchModel?.maximumDuration || 15,
+      selectedBatchModel?.supportedDurations || null,
+      selectedBatchModel?.minimumDuration || 1,
     ).duration,
   }))
   const batchPrice = selectedBatchModel
@@ -2755,9 +2762,11 @@ function StoryboardEditor({
       const aspectRatio = usableModel.aspectRatios.includes(current.aspectRatio)
         ? current.aspectRatio
         : usableModel.aspectRatios[0]
-      const duration = Math.min(
+      const duration = normalizeVideoDuration(
+        current.duration,
+        usableModel.minimumDuration,
         usableModel.maximumDuration,
-        Math.max(usableModel.minimumDuration, current.duration),
+        usableModel.supportedDurations,
       )
       const generateAudio = usableModel.supportsAudio && current.generateAudio
       if (usableModel.id === current.model
@@ -2891,16 +2900,29 @@ function StoryboardEditor({
               )}
             </div>
           </div>
-          <label className="durationControl">
+          <div className="durationControl">
             <span>时长 <strong>{draft.duration}s</strong></span>
-            <input
-              type="range"
-              min={selectedModel?.minimumDuration || 4}
-              max={selectedModel?.maximumDuration || 15}
-              value={draft.duration}
-              onChange={(event) => setDraft((current) => ({ ...current, duration: Number(event.target.value) }))}
-            />
-          </label>
+            {selectedModel?.supportedDurations?.length ? (
+              <div className="ratioControl durationOptions" aria-label="视频时长">
+                {selectedModel.supportedDurations.map((duration) => (
+                  <button
+                    key={duration}
+                    type="button"
+                    className={draft.duration === duration ? 'active' : ''}
+                    onClick={() => setDraft((current) => ({ ...current, duration }))}
+                  >{duration}s</button>
+                ))}
+              </div>
+            ) : (
+              <input
+                type="range"
+                min={selectedModel?.minimumDuration || 4}
+                max={selectedModel?.maximumDuration || 15}
+                value={draft.duration}
+                onChange={(event) => setDraft((current) => ({ ...current, duration: Number(event.target.value) }))}
+              />
+            )}
+          </div>
           <div className="settingControl">
             <span>清晰度</span>
             <div className="ratioControl" aria-label="清晰度">

@@ -122,6 +122,8 @@ export async function POST(request: NextRequest) {
     const fittedTimeline = fitVideoGroupDurations(
       storyboards.map((storyboard) => storyboard.duration),
       modelDefinition.maximumDuration,
+      modelDefinition.supportedDurations,
+      modelDefinition.minimumDuration,
     )
     const duration = fittedTimeline.duration
     if (duration < modelDefinition.minimumDuration || duration > modelDefinition.maximumDuration) {

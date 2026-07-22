@@ -2235,6 +2235,16 @@ textarea:focus {
   accent-color: var(--accent-strong);
 }
 
+.durationOptions {
+  width: fit-content;
+}
+
+.durationOptions button {
+  min-width: 50px;
+  min-height: 30px;
+  padding-inline: 9px;
+}
+
 .settingControl {
   display: grid;
   gap: 6px;

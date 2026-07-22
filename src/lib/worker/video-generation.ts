@@ -8,6 +8,8 @@ import {
   retrieveVideoJob,
   submitVideoGeneration,
 } from '@/lib/openai-video'
+import { normalizeVideoDuration } from '@/lib/video-batch'
+import { resolveVideoModelDefinition } from '@/lib/video-models'
 import {
   buildStoryboardStorageKey,
   downloadBuffer,
@@ -137,7 +139,8 @@ export async function processVideoGenerationTask(
 
   try {
     const storyboard = task.storyboard
-    const duration = Number(payload.duration || storyboard.duration)
+    const requestedDuration = Number(payload.duration || storyboard.duration)
+    let duration = requestedDuration
     const aspectRatio = normalizeAspectRatio(payload.aspectRatio || storyboard.aspectRatio)
     const resolution = normalizeResolution(payload.resolution, task.model)
     const dimensions = requestedVideoDimensions(aspectRatio, resolution)
@@ -195,6 +198,13 @@ export async function processVideoGenerationTask(
     if (!capability) {
       throw new Error(`VIDEO_MODEL_UNAVAILABLE: ${task.model}`)
     }
+    const modelDefinition = await resolveVideoModelDefinition(task.model).catch(() => null)
+    duration = normalizeVideoDuration(
+      requestedDuration,
+      modelDefinition?.minimumDuration ?? (capability.mode === 'newapi-grok' ? 6 : 4),
+      modelDefinition?.maximumDuration ?? 15,
+      modelDefinition?.supportedDurations ?? (capability.mode === 'newapi-grok' ? [6, 10, 15] : null),
+    )
     const prompt = task.prompt.trim()
     if (!prompt) throw new Error('VIDEO_PROMPT_REQUIRED: 视频提示词不能为空')
 
@@ -213,6 +223,7 @@ export async function processVideoGenerationTask(
           generateAudio,
         })
     Object.assign(payload, {
+      duration,
       aspectRatio,
       resolution,
       providerJobId: submitted.id,

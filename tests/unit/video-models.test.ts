@@ -13,6 +13,7 @@ describe('video model pricing', () => {
     expect(estimateVideoModelPrice(model!, 15)).toBe(0.8)
     expect(model?.priceLabel).toBe('¥0.80/条')
     expect(model?.maximumPromptCharacters).toBe(4096)
+    expect(model?.supportedDurations).toEqual([6, 10, 15])
     expect(videoModelPromptBudget(model!)).toBe(4000)
   })
 
@@ -74,7 +75,7 @@ describe('video model pricing', () => {
           video_ui_params: {
             referenceLimits: { images: 1 },
             params: {
-              duration: { min: 4, max: 15 },
+              duration: { min: 4, max: 15, options: [{ value: 6 }, { value: 10 }, { value: 15 }] },
               generateAudio: { enabled: false },
               resolution: { options: [{ value: '480p' }, { value: '720p' }] },
               ratio: { options: [{ value: '16:9' }, { value: '9:16' }] },
@@ -115,6 +116,8 @@ describe('video model pricing', () => {
       priceLabel: '¥1.10/条',
       maximumReferenceImages: 1,
       maximumPromptCharacters: 4096,
+      minimumDuration: 6,
+      supportedDurations: [6, 10, 15],
     })
   })
 })

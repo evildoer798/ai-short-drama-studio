@@ -18,6 +18,7 @@ export type VideoModelOption = {
   startingAt: boolean
   minimumDuration: number
   maximumDuration: number
+  supportedDurations: number[] | null
   maximumReferenceImages: number
   maximumPromptCharacters: number
   supportsAudio: boolean
@@ -56,8 +57,9 @@ const fallbackVideoModelCatalog: VideoModelDefinition[] = [
     priceSource: 'reference',
     unitPrice: 0.8,
     startingAt: false,
-    minimumDuration: 4,
+    minimumDuration: 6,
     maximumDuration: 15,
+    supportedDurations: [6, 10, 15],
     maximumReferenceImages: 4,
     maximumPromptCharacters: 4096,
     supportsAudio: false,
@@ -75,8 +77,9 @@ const fallbackVideoModelCatalog: VideoModelDefinition[] = [
     priceSource: 'reference',
     unitPrice: 1.1,
     startingAt: false,
-    minimumDuration: 4,
+    minimumDuration: 6,
     maximumDuration: 15,
+    supportedDurations: [6, 10, 15],
     maximumReferenceImages: 1,
     maximumPromptCharacters: 4096,
     supportsAudio: false,
@@ -96,6 +99,7 @@ const fallbackVideoModelCatalog: VideoModelDefinition[] = [
     startingAt: false,
     minimumDuration: 4,
     maximumDuration: 15,
+    supportedDurations: null,
     maximumReferenceImages: 4,
     maximumPromptCharacters: 5000,
     supportsAudio: true,
@@ -115,6 +119,7 @@ const fallbackVideoModelCatalog: VideoModelDefinition[] = [
     startingAt: false,
     minimumDuration: 4,
     maximumDuration: 15,
+    supportedDurations: null,
     maximumReferenceImages: 4,
     maximumPromptCharacters: 5000,
     supportsAudio: false,
@@ -134,6 +139,7 @@ const fallbackVideoModelCatalog: VideoModelDefinition[] = [
     startingAt: false,
     minimumDuration: 4,
     maximumDuration: 15,
+    supportedDurations: null,
     maximumReferenceImages: 4,
     maximumPromptCharacters: 5000,
     supportsAudio: false,
@@ -192,6 +198,19 @@ function optionValues(value: unknown) {
   })
 }
 
+function durationOptionValues(value: unknown) {
+  const options = Array.isArray(record(value).options) ? record(value).options as unknown[] : []
+  return [...new Set(options.flatMap((option) => {
+    const rawValue = typeof option === 'object' && option !== null
+      ? record(option).value
+      : option
+    const match = String(rawValue ?? '').match(/\d+(?:\.\d+)?/)
+    if (!match) return []
+    const duration = Math.round(Number(match[0]))
+    return Number.isFinite(duration) && duration >= 4 && duration <= 15 ? [duration] : []
+  }))].sort((left, right) => left - right)
+}
+
 function modelResolutions(modelId: string, resolutionConfig: unknown) {
   const config = record(resolutionConfig)
   const candidates = optionValues(config)
@@ -226,8 +245,14 @@ export function parseVideoPricingCatalog(payload: unknown): VideoModelDefinition
     const resolutions = modelResolutions(id, params.resolution)
     if (resolutions.length === 0) return []
     const duration = record(params.duration)
-    const minimumDuration = Math.max(4, Math.round(Number(duration.min) || 4))
-    const maximumDuration = Math.min(15, Math.max(minimumDuration, Math.round(Number(duration.max) || 15)))
+    const liveDurationOptions = durationOptionValues(duration)
+    const supportedDurations = liveDurationOptions.length > 0
+      ? liveDurationOptions
+      : family === 'Grok' ? [6, 10, 15] : null
+    const minimumDuration = supportedDurations?.[0]
+      ?? Math.max(4, Math.round(Number(duration.min) || 4))
+    const maximumDuration = supportedDurations?.at(-1)
+      ?? Math.min(15, Math.max(minimumDuration, Math.round(Number(duration.max) || 15)))
     const priceMode: VideoModelPriceMode = item.billing_mode === 'per_second' ? 'per_second' : 'flat'
     const generateAudio = record(params.generateAudio)
     const referenceLimits = record(record(item.video_ui_params).referenceLimits)
@@ -250,6 +275,7 @@ export function parseVideoPricingCatalog(payload: unknown): VideoModelDefinition
       startingAt: false,
       minimumDuration,
       maximumDuration,
+      supportedDurations,
       maximumReferenceImages,
       maximumPromptCharacters,
       supportsAudio: generateAudio.enabled !== false,
