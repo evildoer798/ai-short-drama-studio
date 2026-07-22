@@ -19,6 +19,7 @@ export type VideoModelOption = {
   minimumDuration: number
   maximumDuration: number
   maximumReferenceImages: number
+  maximumPromptCharacters: number
   supportsAudio: boolean
   resolutions: VideoResolution[]
   defaultResolution: VideoResolution
@@ -58,6 +59,7 @@ const fallbackVideoModelCatalog: VideoModelDefinition[] = [
     minimumDuration: 4,
     maximumDuration: 15,
     maximumReferenceImages: 4,
+    maximumPromptCharacters: 4096,
     supportsAudio: false,
     resolutions: ['480p'],
     defaultResolution: '480p',
@@ -76,6 +78,7 @@ const fallbackVideoModelCatalog: VideoModelDefinition[] = [
     minimumDuration: 4,
     maximumDuration: 15,
     maximumReferenceImages: 1,
+    maximumPromptCharacters: 4096,
     supportsAudio: false,
     resolutions: ['480p'],
     defaultResolution: '480p',
@@ -94,6 +97,7 @@ const fallbackVideoModelCatalog: VideoModelDefinition[] = [
     minimumDuration: 4,
     maximumDuration: 15,
     maximumReferenceImages: 4,
+    maximumPromptCharacters: 5000,
     supportsAudio: true,
     resolutions: ['480p', '720p'],
     defaultResolution: '720p',
@@ -112,6 +116,7 @@ const fallbackVideoModelCatalog: VideoModelDefinition[] = [
     minimumDuration: 4,
     maximumDuration: 15,
     maximumReferenceImages: 4,
+    maximumPromptCharacters: 5000,
     supportsAudio: false,
     resolutions: ['720p'],
     defaultResolution: '720p',
@@ -130,6 +135,7 @@ const fallbackVideoModelCatalog: VideoModelDefinition[] = [
     minimumDuration: 4,
     maximumDuration: 15,
     maximumReferenceImages: 4,
+    maximumPromptCharacters: 5000,
     supportsAudio: false,
     resolutions: ['720p'],
     defaultResolution: '720p',
@@ -227,6 +233,7 @@ export function parseVideoPricingCatalog(payload: unknown): VideoModelDefinition
     const referenceLimits = record(record(item.video_ui_params).referenceLimits)
     const maximumReferenceImages = Math.max(1, Math.min(4, Math.round(Number(referenceLimits.images) || 4)))
     const providerLabel = pricingProviderLabel(item, id)
+    const maximumPromptCharacters = family === 'Grok' ? 4096 : 5000
     const defaultResolution = /(?:^|-)480p(?:-|$)/i.test(id)
       ? '480p'
       : resolutions.includes('720p') ? '720p' : resolutions[0]
@@ -244,6 +251,7 @@ export function parseVideoPricingCatalog(payload: unknown): VideoModelDefinition
       minimumDuration,
       maximumDuration,
       maximumReferenceImages,
+      maximumPromptCharacters,
       supportsAudio: generateAudio.enabled !== false,
       resolutions,
       defaultResolution,
@@ -274,6 +282,10 @@ export function estimateVideoModelPrice(model: VideoModelDefinition, duration: n
   return model.priceMode === 'per_second'
     ? model.unitPrice * duration
     : model.unitPrice
+}
+
+export function videoModelPromptBudget(model: Pick<VideoModelDefinition, 'maximumPromptCharacters'>) {
+  return Math.max(1600, model.maximumPromptCharacters - 96)
 }
 
 async function fetchLivePricingCatalog() {

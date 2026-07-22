@@ -275,7 +275,7 @@ describe('storyboard video prompt', () => {
     expect(prompt).toContain('物体不穿透')
   })
 
-  it('keeps Seedance prompts within the API limit while preserving critical sections', () => {
+  it('keeps long prompts within the Grok API limit while preserving critical sections', () => {
     const longPrompt = [
       '【分镜1】',
       `时间地点：${'夜晚，翡翠山庄别墅客厅。'.repeat(80)}`,
@@ -295,7 +295,7 @@ describe('storyboard video prompt', () => {
       videoPrompt: longPrompt,
       visualStyle: VisualStyle.photorealistic,
       scriptSceneContext: '夜晚，翡翠山庄别墅客厅，暖黄落地灯照亮沙发一角。',
-      maxLength: 4900,
+      maxLength: 4000,
       references: [
         { referenceOrder: 1, type: AssetType.character, name: '苏文菁' },
         { referenceOrder: 2, type: AssetType.character, name: '陈蕊' },
@@ -303,7 +303,7 @@ describe('storyboard video prompt', () => {
       ],
     })
 
-    expect(prompt.length).toBeLessThanOrEqual(4900)
+    expect(prompt.length).toBeLessThanOrEqual(4000)
     expect(prompt).toContain('动作顺序：')
     expect(prompt).toContain('动作物理：')
     expect(prompt).toContain('动作对白：')

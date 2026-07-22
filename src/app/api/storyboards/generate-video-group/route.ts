@@ -13,7 +13,7 @@ import {
   syncStoryboardAssetLinks,
 } from '@/lib/storyboards'
 import { fitVideoGroupDurations, orderSingleEpisodeVideoBatch } from '@/lib/video-batch'
-import { resolveVideoModelDefinition } from '@/lib/video-models'
+import { resolveVideoModelDefinition, videoModelPromptBudget } from '@/lib/video-models'
 
 function payloadRecord(value: unknown) {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -143,7 +143,7 @@ export async function POST(request: NextRequest) {
     const prompt = buildCombinedStoryboardVideoPrompt({
       visualStyle: first.project.visualStyle,
       customStylePrompt: first.project.customStylePrompt,
-      maxLength: /^(?:sd5-)?seedance-2\.0(?:-|$)/i.test(model) ? 4900 : 12000,
+      maxLength: videoModelPromptBudget(modelDefinition),
       aspectRatio,
       references: referenceLinks.map((link, index) => ({
         referenceOrder: index + 1,
@@ -163,6 +163,13 @@ export async function POST(request: NextRequest) {
         }),
       })),
     })
+    if (prompt.length > modelDefinition.maximumPromptCharacters) {
+      throw new HttpError(
+        422,
+        'VIDEO_PROMPT_TOO_LONG',
+        `当前模型提示词最多 ${modelDefinition.maximumPromptCharacters} 字符，压缩后仍为 ${prompt.length} 字符`,
+      )
+    }
     const generateAudio = modelDefinition.supportsAudio && (body.generateAudio
       ?? storyboards.some((storyboard) => storyboard.generateAudio))
     const anchor = storyboards[0]

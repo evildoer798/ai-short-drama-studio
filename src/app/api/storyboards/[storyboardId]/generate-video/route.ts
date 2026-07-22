@@ -12,7 +12,7 @@ import {
   generateStoryboardVideoSchema,
   syncStoryboardAssetLinks,
 } from '@/lib/storyboards'
-import { resolveVideoModelDefinition } from '@/lib/video-models'
+import { resolveVideoModelDefinition, videoModelPromptBudget } from '@/lib/video-models'
 
 export async function POST(
   request: NextRequest,
@@ -111,7 +111,7 @@ export async function POST(
       }),
       visualStyle: storyboard.project.visualStyle,
       customStylePrompt: storyboard.project.customStylePrompt,
-      maxLength: /^(?:sd5-)?seedance-2\.0(?:-|$)/i.test(model) ? 4900 : 12000,
+      maxLength: videoModelPromptBudget(modelDefinition),
       duration,
       aspectRatio,
       references: references.map((link) => ({
@@ -120,8 +120,12 @@ export async function POST(
         name: link.asset.name,
       })),
     })
-    if (/^(?:sd5-)?seedance-2\.0(?:-|$)/i.test(model) && prompt.length > 5000) {
-      throw new HttpError(422, 'VIDEO_PROMPT_TOO_LONG', `Seedance 提示词最多 5000 字符，当前为 ${prompt.length} 字符`)
+    if (prompt.length > modelDefinition.maximumPromptCharacters) {
+      throw new HttpError(
+        422,
+        'VIDEO_PROMPT_TOO_LONG',
+        `当前模型提示词最多 ${modelDefinition.maximumPromptCharacters} 字符，压缩后仍为 ${prompt.length} 字符`,
+      )
     }
 
     const task = await prisma.generationTask.create({

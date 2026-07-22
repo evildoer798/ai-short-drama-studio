@@ -129,6 +129,7 @@ type VideoModelOption = {
   minimumDuration: number
   maximumDuration: number
   maximumReferenceImages: number
+  maximumPromptCharacters: number
   supportsAudio: boolean
   resolutions: VideoResolution[]
   defaultResolution: VideoResolution
@@ -326,6 +327,17 @@ function formatModelRefreshTime(value: string | null) {
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return '尚未同步'
   return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+}
+
+function videoTaskErrorMessage(value: string | null | undefined) {
+  const error = value?.trim() || ''
+  if (/invalid_prompt[\s\S]*maximum length of 4096|Prompt exceeds the maximum length of 4096/iu.test(error)) {
+    return '视频提示词超过当前模型的 4096 字符限制。系统已更新自动压缩规则，请重新点击生成。失败请求没有进入生成阶段。'
+  }
+  if (/model grok-video not found/iu.test(error)) {
+    return '当前线路暂未提供所选 Grok 模型，请刷新模型列表后重新选择可用模型。'
+  }
+  return error || '视频生成失败'
 }
 
 function HighlightedStoryboardPrompt({
@@ -3046,10 +3058,12 @@ function StoryboardEditor({
           disabled={saving || generating || !draft.videoPrompt.trim() || !draft.model || selectedModel?.available === false}
         >
           {generating ? <Loader2 className="spin" size={17} /> : <Clapperboard size={17} />}
-          {generating ? `${selectedModel?.family || '视频'} 生成中` : `生成 ${draft.duration}s · ${draft.resolution} 视频`}
+          {generating
+            ? `${selectedModel?.family || '视频'} 生成中`
+            : `使用 ${selectedModel?.label || '所选模型'} 生成 ${draft.duration}s · ${draft.resolution}`}
         </button>
 
-        {selectedTask?.status === 'failed' ? <p className="errorText">{selectedTask.error || '视频生成失败'}</p> : null}
+        {selectedTask?.status === 'failed' ? <p className="errorText">{videoTaskErrorMessage(selectedTask.error)}</p> : null}
 
         <div className="videoVersions">
           <div className="sectionLabel"><strong>视频版本</strong><span>{storyboard?.videos.length || 0}</span></div>

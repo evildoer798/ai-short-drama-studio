@@ -3,6 +3,7 @@ import {
   estimateVideoModelPrice,
   getVideoModelDefinition,
   parseVideoPricingCatalog,
+  videoModelPromptBudget,
 } from '@/lib/video-models'
 
 describe('video model pricing', () => {
@@ -11,6 +12,8 @@ describe('video model pricing', () => {
     expect(model).not.toBeNull()
     expect(estimateVideoModelPrice(model!, 15)).toBe(0.8)
     expect(model?.priceLabel).toBe('¥0.80/条')
+    expect(model?.maximumPromptCharacters).toBe(4096)
+    expect(videoModelPromptBudget(model!)).toBe(4000)
   })
 
   it('calculates flat Seedance Mini pricing for either resolution', () => {
@@ -111,6 +114,7 @@ describe('video model pricing', () => {
       family: 'Grok',
       priceLabel: '¥1.10/条',
       maximumReferenceImages: 1,
+      maximumPromptCharacters: 4096,
     })
   })
 })
