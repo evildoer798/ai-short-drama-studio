@@ -3,9 +3,16 @@ import {
   attachmentContentDisposition,
   buildStorageKey,
   extensionForMime,
+  publicStorageEndpoint,
 } from '@/lib/storage'
 
 describe('storage helpers', () => {
+  it('uses the public OSS endpoint for browser media delivery', () => {
+    expect(publicStorageEndpoint('https://s3.oss-cn-hangzhou-internal.aliyuncs.com'))
+      .toBe('https://s3.oss-cn-hangzhou.aliyuncs.com')
+    expect(publicStorageEndpoint('https://s3.example.com')).toBe('https://s3.example.com')
+  })
+
   it('maps image mime types to stable extensions', () => {
     expect(extensionForMime('image/jpeg')).toBe('jpg')
     expect(extensionForMime('image/webp')).toBe('webp')

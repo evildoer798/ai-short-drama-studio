@@ -11,6 +11,7 @@ import { randomUUID } from 'node:crypto'
 import { env } from './env'
 
 let client: S3Client | null = null
+let publicClient: S3Client | null = null
 let bucketReady = false
 
 export function getS3Client() {
@@ -24,6 +25,23 @@ export function getS3Client() {
     },
   })
   return client
+}
+
+export function publicStorageEndpoint(endpoint: string) {
+  return endpoint.replace(/-internal(?=\.)/i, '')
+}
+
+function getS3PublicClient() {
+  publicClient ??= new S3Client({
+    region: env.s3Region(),
+    endpoint: publicStorageEndpoint(env.s3Endpoint()),
+    forcePathStyle: env.s3ForcePathStyle(),
+    credentials: {
+      accessKeyId: env.s3AccessKeyId(),
+      secretAccessKey: env.s3SecretAccessKey(),
+    },
+  })
+  return publicClient
 }
 
 async function ensureBucket() {
@@ -140,7 +158,7 @@ export async function signedMediaUrl(storageKey: string, options?: {
   mimeType?: string
 }) {
   return getSignedUrl(
-    getS3Client(),
+    getS3PublicClient(),
     new GetObjectCommand({
       Bucket: env.s3Bucket(),
       Key: storageKey,

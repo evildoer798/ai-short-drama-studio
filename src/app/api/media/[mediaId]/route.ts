@@ -6,6 +6,7 @@ import { requireProjectAccess } from '@/lib/permissions'
 import {
   attachmentContentDisposition,
   extensionForMime,
+  signedMediaUrl,
   streamStorageObject,
 } from '@/lib/storage'
 import {
@@ -68,6 +69,16 @@ export async function GET(
       displayName: render?.title?.trim() || storyboardVideoName || `媒体-${media.id}`,
       extension,
     }) : undefined
+    if (media.mimeType.startsWith('video/')) {
+      const location = await signedMediaUrl(media.storageKey, {
+        downloadFilename,
+        mimeType: media.mimeType,
+      })
+      return NextResponse.redirect(location, {
+        status: 307,
+        headers: { 'Cache-Control': 'private, no-store, max-age=0' },
+      })
+    }
     const range = _request.headers.get('range') || undefined
     const object = await streamStorageObject(media.storageKey, range)
     const headers = new Headers({
