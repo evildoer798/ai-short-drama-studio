@@ -399,6 +399,21 @@ textarea:focus {
   font-size: 13px;
 }
 
+.preproductionLoading > span {
+  max-width: 52ch;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+.preproductionLoadError {
+  color: var(--danger);
+}
+
+.preproductionLoadError .primaryButton {
+  margin-top: 4px;
+}
+
 .textTaskBar {
   min-height: 48px;
   flex: 0 0 auto;

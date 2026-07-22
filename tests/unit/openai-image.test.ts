@@ -4,15 +4,30 @@ import {
   extractImageOutputs,
   extractImageOutputFromSSEText,
   generateImageViaOpenAICompat,
+  isUnrecoverableImageGenerationError,
   resolveOpenAICompatAsyncImageEndpoint,
   resolveOpenAICompatImageEndpoint,
   resolveOpenAICompatImageTaskEndpoint,
   resolveOpenAICompatResponsesEndpoint,
+  shouldDiscardImageProviderCheckpoint,
 } from '@/lib/openai-image'
 
 afterEach(() => {
   vi.useRealTimers()
   vi.unstubAllGlobals()
+})
+
+describe('image failure recovery', () => {
+  it('does not queue-retry terminal policy and permission failures', () => {
+    expect(isUnrecoverableImageGenerationError(new Error('IMAGE_CONTENT_POLICY: request rejected'))).toBe(true)
+    expect(isUnrecoverableImageGenerationError(new Error('IMAGE_API_FAILED: 403 forbidden'))).toBe(true)
+    expect(isUnrecoverableImageGenerationError(new Error('IMAGE_API_FAILED: 429 busy'))).toBe(false)
+  })
+
+  it('discards terminal provider task checkpoints before retrying', () => {
+    expect(shouldDiscardImageProviderCheckpoint(new Error('IMAGE_ASYNC_FAILED: GENERATION_FAILED'))).toBe(true)
+    expect(shouldDiscardImageProviderCheckpoint(new Error('fetch failed'))).toBe(false)
+  })
 })
 
 describe('buildImagesGenerationRequestBody', () => {

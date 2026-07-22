@@ -179,11 +179,22 @@ function TypeIcon({ type, size = 15 }: { type: AssetType; size?: number }) {
   return <Box size={size} />
 }
 
-async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init)
-  const payload = await response.json().catch(() => null) as { error?: { message?: string } } | null
-  if (!response.ok) throw new Error(payload?.error?.message || `请求失败 (${response.status})`)
-  return payload as T
+async function requestJson<T>(url: string, init?: RequestInit, timeoutMs = 30_000): Promise<T> {
+  const controller = new AbortController()
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const response = await fetch(url, { ...init, signal: controller.signal })
+    const payload = await response.json().catch(() => null) as { error?: { message?: string } } | null
+    if (!response.ok) throw new Error(payload?.error?.message || `请求失败 (${response.status})`)
+    return payload as T
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      throw new Error(`服务器在 ${Math.round(timeoutMs / 1000)} 秒内没有完整返回数据`)
+    }
+    throw error
+  } finally {
+    window.clearTimeout(timer)
+  }
 }
 
 function taskProgressLabel(task: TextTask) {
@@ -249,23 +260,54 @@ export function PreproductionWorkspace({
 }) {
   const [data, setData] = useState<PreproductionData | null>(null)
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
+  const [loadHint, setLoadHint] = useState('')
+  const loadRequestId = useRef(0)
 
   async function refreshData() {
     if (!projectId) return
-    try {
-      const next = await requestJson<PreproductionData>(`/api/projects/${projectId}/preproduction`)
-      setData(next)
-    } catch (error) {
-      onNotice(error instanceof Error ? error.message : '前期制作数据加载失败', 'error')
-    } finally {
-      setLoading(false)
+    const requestId = ++loadRequestId.current
+    setLoadError('')
+    setLoadHint('')
+    setLoading((current) => current || !data)
+    let lastError = '前期制作数据加载失败'
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const next = await requestJson<PreproductionData>(
+          `/api/projects/${projectId}/preproduction`,
+          undefined,
+          15_000,
+        )
+        if (requestId !== loadRequestId.current) return
+        setData(next)
+        setLoadError('')
+        setLoadHint('')
+        setLoading(false)
+        return
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : '前期制作数据加载失败'
+        if (requestId !== loadRequestId.current) return
+        if (attempt < 2) {
+          setLoadHint('首次读取没有完成，正在自动重试…')
+          await new Promise((resolve) => window.setTimeout(resolve, 800))
+        }
+      }
     }
+
+    if (requestId !== loadRequestId.current) return
+    setLoading(false)
+    setLoadError(lastError)
+    onNotice(`${lastError}，请点击重新读取。`, 'error')
   }
 
   useEffect(() => {
     setLoading(true)
     setData(null)
+    setLoadError('')
+    setLoadHint('')
     void refreshData()
+    return () => { loadRequestId.current += 1 }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId])
 
@@ -334,11 +376,25 @@ export function PreproductionWorkspace({
     setData((current) => current ? { ...current, tasks: [task, ...current.tasks] } : current)
   }
 
-  if (loading || !data) {
+  if (!data && loading) {
     return (
       <section className="preproductionLoading">
         <Loader2 className="spin" size={24} />
         <strong>正在读取前期制作数据</strong>
+        <span>{loadHint || '通常几秒内完成，请保持当前页面打开。'}</span>
+      </section>
+    )
+  }
+
+  if (!data) {
+    return (
+      <section className="preproductionLoading preproductionLoadError" role="alert">
+        <CircleAlert size={26} />
+        <strong>前期制作数据没有完整载入</strong>
+        <span>{loadError || '网络连接中断或服务器响应不完整。'}</span>
+        <button className="primaryButton compact" type="button" onClick={() => void refreshData()}>
+          <RefreshCw size={16} />重新读取
+        </button>
       </section>
     )
   }

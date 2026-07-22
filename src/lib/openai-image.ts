@@ -135,6 +135,23 @@ export function isImageContentPolicyError(error: unknown) {
   return IMAGE_CONTENT_POLICY_PATTERN.test(message)
 }
 
+export function isUnrecoverableImageGenerationError(error: unknown) {
+  if (isImageContentPolicyError(error)) return true
+  const status = imageErrorStatus(error)
+  return status !== null
+    && status >= 400
+    && status < 500
+    && status !== 408
+    && status !== 409
+    && status !== 429
+}
+
+export function shouldDiscardImageProviderCheckpoint(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error)
+  return isImageContentPolicyError(error)
+    || /IMAGE_ASYNC_(?:FAILED|EMPTY_RESPONSE)|RESPONSES_IMAGE_(?:API_FAILED_STATUS|DATA_URL_INVALID)/iu.test(message)
+}
+
 export function extractImageOutputs(response: unknown): ImageOutput[] {
   return extractImageOutputsWithMimeType(response, 'image/png')
 }

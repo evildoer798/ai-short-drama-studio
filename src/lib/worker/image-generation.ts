@@ -1,12 +1,19 @@
+import { UnrecoverableError } from 'bullmq'
 import { Prisma, TaskStatus } from '@prisma/client'
 import { prisma } from '@/lib/db'
 import { buildDefaultPrompt } from '@/lib/assets'
 import { env } from '@/lib/env'
-import { prepareAssetImagePrompt } from '@/lib/image-prompt-safety'
+import {
+  prepareAssetImagePrompt,
+  prepareImagePolicyRetryPrompt,
+} from '@/lib/image-prompt-safety'
 import {
   generateImageViaOpenAICompat,
   imageOutputToBuffer,
+  isImageContentPolicyError,
+  isUnrecoverableImageGenerationError,
   readableImageGenerationError,
+  shouldDiscardImageProviderCheckpoint,
 } from '@/lib/openai-image'
 import { buildStorageKey, uploadBuffer } from '@/lib/storage'
 
@@ -113,6 +120,29 @@ export async function processImageGenerationTask(
     taskPayloadState = { ...taskPayloadState, imageProviderTasks: providerTasks }
   }
 
+  const closeSubmittedProviderCheckpoints = async (error: unknown) => {
+    const now = new Date().toISOString()
+    const message = error instanceof Error ? error.message : String(error)
+    let changed = false
+    providerTasks.forEach((checkpoint, index) => {
+      if (checkpoint.status !== 'submitted') return
+      changed = true
+      providerTasks[index] = {
+        ...checkpoint,
+        status: 'failed',
+        updatedAt: now,
+        error: message.slice(0, 500),
+      }
+    })
+    resumeProviderTask = undefined
+    if (!changed) return
+    taskPayloadState = { ...taskPayloadState, imageProviderTasks: providerTasks }
+    await prisma.generationTask.update({
+      where: { id: taskId },
+      data: { payload: taskPayloadState as Prisma.InputJsonObject },
+    })
+  }
+
   await prisma.generationTask.update({
     where: { id: taskId },
     data: {
@@ -130,6 +160,15 @@ export async function processImageGenerationTask(
       assetName: task.asset.name,
       assetType: task.asset.type,
     })
+    let generationPrompt = preparedPrompt.prompt
+    let policyRetryUsed = taskPayloadState.policyRetryUsed === true
+    if (policyRetryUsed) {
+      generationPrompt = prepareImagePolicyRetryPrompt({
+        prompt,
+        assetName: task.asset.name,
+        assetType: task.asset.type,
+      })
+    }
     const checkpointImageIds = payloadStringArray(taskPayloadState.imageIds)
     const checkpointImages = checkpointImageIds.length > 0
       ? await prisma.assetImage.findMany({
@@ -149,8 +188,8 @@ export async function processImageGenerationTask(
     let nextVariant = (latestVariant._max.variant || 0) + 1
 
     for (let index = createdImages.length; index < task.requestedCount; index++) {
-      const output = await generateImageViaOpenAICompat({
-        prompt: preparedPrompt.prompt,
+      const requestImage = (activePrompt: string, resume = resumeProviderTask) => generateImageViaOpenAICompat({
+        prompt: activePrompt,
         model: task.model,
         baseUrl: env.openAICompatBaseUrl(),
         apiKey: env.openAICompatApiKey(),
@@ -163,7 +202,7 @@ export async function processImageGenerationTask(
         stream: env.imageStream(),
         useAsync: env.imageAsync(),
         providerTimeoutRetries: env.imageProviderTimeoutRetries(),
-        resumeProviderTask: index === 0 ? resumeProviderTask : undefined,
+        resumeProviderTask: index === 0 ? resume : undefined,
         onProviderTaskUpdate: updateProviderCheckpoint,
         onRetry: async ({ attempt, maxAttempts, delayMs, message }) => {
           const seconds = Math.max(1, Math.ceil(delayMs / 1000))
@@ -177,6 +216,35 @@ export async function processImageGenerationTask(
           })
         },
       })
+      let output: Awaited<ReturnType<typeof generateImageViaOpenAICompat>>
+      try {
+        output = await requestImage(generationPrompt)
+      } catch (error) {
+        if (!isImageContentPolicyError(error) || policyRetryUsed) throw error
+        await closeSubmittedProviderCheckpoints(error)
+        policyRetryUsed = true
+        generationPrompt = prepareImagePolicyRetryPrompt({
+          prompt,
+          assetName: task.asset.name,
+          assetType: task.asset.type,
+        })
+        taskPayloadState = {
+          ...taskPayloadState,
+          imageProviderTasks: providerTasks,
+          policyRetryUsed: true,
+          policyRetryAt: new Date().toISOString(),
+        }
+        await prisma.generationTask.update({
+          where: { id: taskId },
+          data: {
+            status: TaskStatus.processing,
+            progress: 20,
+            error: '图片服务首次审核误判，系统已自动简化提示词并重新提交。',
+            payload: taskPayloadState as Prisma.InputJsonObject,
+          },
+        })
+        output = await requestImage(generationPrompt, undefined)
+      }
       resumeProviderTask = undefined
       await prisma.generationTask.update({
         where: { id: taskId },
@@ -267,6 +335,7 @@ export async function processImageGenerationTask(
           mediaIds: createdImages.map((image) => image.mediaId),
           promptAdjusted: preparedPrompt.adjusted,
           removedPromptSegments: preparedPrompt.removedSegments,
+          policyRetryUsed,
         },
       },
     })
@@ -278,7 +347,11 @@ export async function processImageGenerationTask(
       mediaIds: createdImages.map((image) => image.mediaId),
     }
   } catch (error) {
-    const willRetry = options.willRetryOnFailure === true
+    if (shouldDiscardImageProviderCheckpoint(error)) {
+      await closeSubmittedProviderCheckpoints(error)
+    }
+    const unrecoverable = isUnrecoverableImageGenerationError(error)
+    const willRetry = options.willRetryOnFailure === true && !unrecoverable
     await prisma.generationTask.update({
       where: { id: taskId },
       data: {
@@ -288,6 +361,9 @@ export async function processImageGenerationTask(
         payload: taskPayloadState as Prisma.InputJsonObject,
       },
     })
+    if (unrecoverable) {
+      throw new UnrecoverableError(error instanceof Error ? error.message : String(error))
+    }
     throw error
   }
 }
