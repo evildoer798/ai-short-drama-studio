@@ -128,6 +128,7 @@ type VideoModelOption = {
   startingAt: boolean
   minimumDuration: number
   maximumDuration: number
+  maximumReferenceImages: number
   supportsAudio: boolean
   resolutions: VideoResolution[]
   defaultResolution: VideoResolution
@@ -2470,14 +2471,16 @@ function StoryboardWorkspace({
   const tooManyReferencesGroupCount = plannedVideoGroups.filter((group) => (
     new Set(group.flatMap((storyboard) => storyboard.assets
       .filter((asset) => asset.hasSelectedImage && asset.type !== 'prop')
-      .map((asset) => asset.id))).size > 4
+      .map((asset) => asset.id))).size > (selectedBatchModel?.maximumReferenceImages || 4)
   )).length
   const unsupportedRatioCount = selectedBatchModel
     ? batchStoryboards.filter((storyboard) => !selectedBatchModel.aspectRatios.includes(storyboard.aspectRatio)).length
     : 0
   const batchValidationError = groupingError
     || (mixedRatioGroupCount > 0 ? '同一条组合视频中的分镜必须使用相同画幅' : '')
-    || (tooManyReferencesGroupCount > 0 ? '某条组合视频需要超过 4 张人物或场景参考图，请减少每条包含的分镜数' : '')
+    || (tooManyReferencesGroupCount > 0
+      ? `当前模型最多接收 ${selectedBatchModel?.maximumReferenceImages || 4} 张人物或场景参考图，请减少每条包含的分镜数或更换模型`
+      : '')
   const plannedDurations = plannedVideoGroups.map((group) => ({
     duration: fitVideoGroupDurations(
       group.map((storyboard) => storyboard.duration),
@@ -2922,7 +2925,7 @@ function StoryboardEditor({
         <div className="referenceSection">
           <div className="sectionLabel">
             <strong>已识别人物与场景</strong>
-            <span>{storyboard?.assets.length || 0}/4 参考图</span>
+            <span>{storyboard?.assets.length || 0}/{selectedModel?.maximumReferenceImages || 4} 参考图</span>
           </div>
           {storyboard?.assets.length ? (
             <div className="referenceStrip">

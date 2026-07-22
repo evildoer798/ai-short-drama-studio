@@ -107,14 +107,17 @@ export async function POST(request: NextRequest) {
     if (referenceLinks.length === 0) {
       throw new HttpError(422, 'STORYBOARD_REFERENCE_REQUIRED', '组合分镜没有匹配到已设置主图的人物或场景')
     }
-    if (referenceLinks.length > 4) {
-      throw new HttpError(422, 'VIDEO_GROUP_REFERENCE_LIMIT', `组合分镜共需要 ${referenceLinks.length} 张人物或场景主图，视频模型最多支持 4 张，请减少组合数量`)
-    }
-
     const model = body.model || env.videoModel() || 'seedance-2.0-mini'
     const modelDefinition = await resolveVideoModelDefinition(model)
     if (!modelDefinition) {
       throw new HttpError(400, 'VIDEO_MODEL_NOT_ALLOWED', '该模型当前不可用，请刷新模型列表后重新选择')
+    }
+    if (referenceLinks.length > modelDefinition.maximumReferenceImages) {
+      throw new HttpError(
+        422,
+        'VIDEO_GROUP_REFERENCE_LIMIT',
+        `组合分镜共需要 ${referenceLinks.length} 张人物或场景主图，当前模型最多支持 ${modelDefinition.maximumReferenceImages} 张，请减少组合数量或更换模型`,
+      )
     }
     const fittedTimeline = fitVideoGroupDurations(
       storyboards.map((storyboard) => storyboard.duration),

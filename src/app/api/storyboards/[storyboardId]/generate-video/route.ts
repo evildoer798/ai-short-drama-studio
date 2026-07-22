@@ -59,13 +59,21 @@ export async function POST(
 
     await syncStoryboardAssetLinks(storyboardId)
     const storyboard = await requireStoryboardAccess(storyboardId, user.id)
+    const duration = body.duration ?? storyboard.duration
+    const aspectRatio = body.aspectRatio ?? storyboard.aspectRatio
+    const generateAudio = body.generateAudio ?? storyboard.generateAudio
+    const model = body.model || env.videoModel() || 'seedance-2.0-mini'
+    const modelDefinition = await resolveVideoModelDefinition(model)
+    if (!modelDefinition) {
+      throw new HttpError(400, 'VIDEO_MODEL_NOT_ALLOWED', '该模型当前不可用，请刷新模型列表后重新选择')
+    }
     const matchedAssets = storyboard.assetLinks
     const references = matchedAssets
       .filter((link) => (
         (link.asset.type === AssetType.character || link.asset.type === AssetType.location)
         && link.asset.selectedImage?.media
       ))
-      .slice(0, 4)
+      .slice(0, modelDefinition.maximumReferenceImages)
 
     if (references.length === 0) {
       const missing = matchedAssets.map((link) => link.asset.name).join('、')
@@ -76,15 +84,6 @@ export async function POST(
           ? `已识别资产但尚未设置主图：${missing}`
           : '分镜提示词未识别到资产，请在资产名称或标签中使用与分镜一致的名称',
       )
-    }
-
-    const duration = body.duration ?? storyboard.duration
-    const aspectRatio = body.aspectRatio ?? storyboard.aspectRatio
-    const generateAudio = body.generateAudio ?? storyboard.generateAudio
-    const model = body.model || env.videoModel() || 'seedance-2.0-mini'
-    const modelDefinition = await resolveVideoModelDefinition(model)
-    if (!modelDefinition) {
-      throw new HttpError(400, 'VIDEO_MODEL_NOT_ALLOWED', '该模型当前不可用，请刷新模型列表后重新选择')
     }
     if (duration < modelDefinition.minimumDuration || duration > modelDefinition.maximumDuration) {
       throw new HttpError(

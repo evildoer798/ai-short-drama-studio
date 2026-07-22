@@ -9,16 +9,16 @@ describe('video model pricing', () => {
   it('calculates flat Grok pricing', () => {
     const model = getVideoModelDefinition('grok-video')
     expect(model).not.toBeNull()
-    expect(estimateVideoModelPrice(model!, 15)).toBe(0.3)
-    expect(model?.priceLabel).toBe('¥0.30/条')
+    expect(estimateVideoModelPrice(model!, 15)).toBe(0.8)
+    expect(model?.priceLabel).toBe('¥0.80/条')
   })
 
   it('calculates flat Seedance Mini pricing for either resolution', () => {
     const model = getVideoModelDefinition('seedance-2.0-mini')
     expect(model).not.toBeNull()
-    expect(estimateVideoModelPrice(model!, 4)).toBe(1.9)
-    expect(estimateVideoModelPrice(model!, 15)).toBe(1.9)
-    expect(model?.priceLabel).toBe('¥1.90/条')
+    expect(estimateVideoModelPrice(model!, 4)).toBe(2.9)
+    expect(estimateVideoModelPrice(model!, 15)).toBe(2.9)
+    expect(model?.priceLabel).toBe('¥2.90/条')
     expect(model?.startingAt).toBe(false)
     expect(model?.resolutions).toEqual(['480p', '720p'])
     expect(model?.aspectRatios).toContain('21:9')
@@ -36,6 +36,7 @@ describe('video model pricing', () => {
           model_name: 'seedance-2.0-mini-480p',
           description: 'Seedance Mini 480p',
           model_price: 0.3,
+          vendor_id: 12,
           billing_mode: 'per_second',
           video_ui_params: {
             params: {
@@ -50,11 +51,28 @@ describe('video model pricing', () => {
           model_name: 'seedance-2.0-mini',
           description: 'Seedance Mini',
           model_price: 2.9,
+          vendor_id: 4,
           billing_mode: 'per_request',
           video_ui_params: {
             params: {
               duration: { min: 4, max: 15 },
               generateAudio: { enabled: true },
+              resolution: { options: [{ value: '480p' }, { value: '720p' }] },
+              ratio: { options: [{ value: '16:9' }, { value: '9:16' }] },
+            },
+          },
+        },
+        {
+          model_name: 'grok-video-1.5',
+          description: 'Grok 1.5 单图生视频',
+          model_price: 1.1,
+          vendor_id: 10,
+          billing_mode: 'per_request',
+          video_ui_params: {
+            referenceLimits: { images: 1 },
+            params: {
+              duration: { min: 4, max: 15 },
+              generateAudio: { enabled: false },
               resolution: { options: [{ value: '480p' }, { value: '720p' }] },
               ratio: { options: [{ value: '16:9' }, { value: '9:16' }] },
             },
@@ -73,6 +91,7 @@ describe('video model pricing', () => {
     expect(catalog.map((model) => model.id)).toEqual([
       'seedance-2.0-mini-480p',
       'seedance-2.0-mini',
+      'grok-video-1.5',
     ])
     expect(catalog[0]).toMatchObject({
       priceLabel: '¥0.30/秒',
@@ -86,6 +105,12 @@ describe('video model pricing', () => {
       priceLabel: '¥2.90/条',
       unitPrice: 2.9,
       defaultResolution: '720p',
+    })
+    expect(catalog[2]).toMatchObject({
+      label: 'xAI · Grok Video 1.5',
+      family: 'Grok',
+      priceLabel: '¥1.10/条',
+      maximumReferenceImages: 1,
     })
   })
 })

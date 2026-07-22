@@ -18,6 +18,7 @@ export type VideoModelOption = {
   startingAt: boolean
   minimumDuration: number
   maximumDuration: number
+  maximumReferenceImages: number
   supportsAudio: boolean
   resolutions: VideoResolution[]
   defaultResolution: VideoResolution
@@ -41,20 +42,22 @@ type VideoModelOptionsResult = {
 const supportedResolutions = new Set<VideoResolution>(['480p', '720p'])
 const supportedAspectRatios = new Set<VideoAspectRatio>(['16:9', '9:16', '1:1', '21:9', '3:4', '4:3'])
 const refreshIntervalMilliseconds = 30_000
+const publicPricingPageUrl = 'https://ai.cangyuansuanli.cn/pricing'
 
 const fallbackVideoModelCatalog: VideoModelDefinition[] = [
   {
     id: 'grok-video',
-    label: 'Grok Video',
+    label: 'xAI · Grok Video',
     family: 'Grok',
     description: '适合低成本动作预演，也支持使用资产参考图。',
-    priceLabel: '¥0.30/条',
+    priceLabel: '¥0.80/条',
     priceMode: 'flat',
     priceSource: 'reference',
-    unitPrice: 0.3,
+    unitPrice: 0.8,
     startingAt: false,
     minimumDuration: 4,
     maximumDuration: 15,
+    maximumReferenceImages: 4,
     supportsAudio: false,
     resolutions: ['480p'],
     defaultResolution: '480p',
@@ -62,16 +65,17 @@ const fallbackVideoModelCatalog: VideoModelDefinition[] = [
   },
   {
     id: 'grok-video-1.5',
-    label: 'Grok Video 1.5',
+    label: 'xAI · Grok Video 1.5',
     family: 'Grok',
     description: 'Grok 新版本，适合先做低成本镜头验证。',
-    priceLabel: '¥0.30/条',
+    priceLabel: '¥1.10/条',
     priceMode: 'flat',
     priceSource: 'reference',
-    unitPrice: 0.3,
+    unitPrice: 1.1,
     startingAt: false,
     minimumDuration: 4,
     maximumDuration: 15,
+    maximumReferenceImages: 1,
     supportsAudio: false,
     resolutions: ['480p'],
     defaultResolution: '480p',
@@ -79,16 +83,17 @@ const fallbackVideoModelCatalog: VideoModelDefinition[] = [
   },
   {
     id: 'seedance-2.0-mini',
-    label: 'Seedance 2.0 Mini（异步）',
+    label: '即梦 · Seedance 2.0 Mini',
     family: 'Seedance',
     description: '4–15 秒，最多 4 张资产参考图，支持标准 480p 与 HD 720p。',
-    priceLabel: '¥1.90/条',
+    priceLabel: '¥2.90/条',
     priceMode: 'flat',
     priceSource: 'reference',
-    unitPrice: 1.9,
+    unitPrice: 2.9,
     startingAt: false,
     minimumDuration: 4,
     maximumDuration: 15,
+    maximumReferenceImages: 4,
     supportsAudio: true,
     resolutions: ['480p', '720p'],
     defaultResolution: '720p',
@@ -96,16 +101,17 @@ const fallbackVideoModelCatalog: VideoModelDefinition[] = [
   },
   {
     id: 'seedance-2.0-fast-720p',
-    label: 'Seedance 2.0 Fast 720p',
+    label: '字节跳动 · Seedance 2.0 Fast 720p',
     family: 'Seedance',
     description: '快速档，最高支持 15 秒。',
-    priceLabel: '¥2.60/条',
-    priceMode: 'flat',
+    priceLabel: '¥0.75/秒',
+    priceMode: 'per_second',
     priceSource: 'reference',
-    unitPrice: 2.6,
+    unitPrice: 0.75,
     startingAt: false,
     minimumDuration: 4,
     maximumDuration: 15,
+    maximumReferenceImages: 4,
     supportsAudio: false,
     resolutions: ['720p'],
     defaultResolution: '720p',
@@ -113,16 +119,17 @@ const fallbackVideoModelCatalog: VideoModelDefinition[] = [
   },
   {
     id: 'seedance-2.0-720p',
-    label: 'Seedance 2.0 720p',
+    label: '字节跳动 · Seedance 2.0 720p',
     family: 'Seedance',
     description: '质量优先档，适合确认后的正式分镜视频。',
-    priceLabel: '¥3.85/条',
-    priceMode: 'flat',
+    priceLabel: '¥0.975/秒',
+    priceMode: 'per_second',
     priceSource: 'reference',
-    unitPrice: 3.85,
+    unitPrice: 0.975,
     startingAt: false,
     minimumDuration: 4,
     maximumDuration: 15,
+    maximumReferenceImages: 4,
     supportsAudio: false,
     resolutions: ['720p'],
     defaultResolution: '720p',
@@ -146,20 +153,29 @@ function formatPriceLabel(price: number, mode: VideoModelPriceMode) {
   return `¥${price.toFixed(decimals)}/${mode === 'per_second' ? '秒' : '条'}`
 }
 
-function liveModelLabel(modelId: string) {
-  const faceLocked = modelId.startsWith('sd5-')
-  const normalized = modelId.replace(/^sd5-/, '')
-  const label = normalized
-    .replace(/^seedance-2\.0/i, 'Seedance 2.0')
-    .replace(/-mini/gi, ' Mini')
-    .replace(/-fast/gi, ' Fast')
-    .replace(/-(480p|720p)$/i, ' $1')
-    .replace(/-8s$/i, ' 8s')
-  return `${label}${faceLocked ? '（卡人脸）' : ''}`
+function pricingProviderLabel(item: Record<string, unknown>, modelId: string) {
+  const vendorId = Number(item.vendor_id)
+  if (vendorId === 10 || /^grok-video(?:-|$)/i.test(modelId)) return 'xAI'
+  if (vendorId === 12) return '字节跳动'
+  return '即梦'
 }
 
-function pricingApiUrl(baseUrl: string) {
-  return new URL('/api/pricing', baseUrl).toString()
+function liveModelLabel(modelId: string, providerLabel: string) {
+  const faceLocked = modelId.startsWith('sd5-')
+  const normalized = modelId.replace(/^sd5-/, '')
+  const label = /^grok-video(?:-|$)/i.test(normalized)
+    ? normalized.replace(/^grok-video/i, 'Grok Video').replace(/-1\.5$/i, ' 1.5')
+    : normalized
+        .replace(/^seedance-2\.0/i, 'Seedance 2.0')
+        .replace(/-mini/gi, ' Mini')
+        .replace(/-fast/gi, ' Fast')
+        .replace(/-(480p|720p)$/i, ' $1')
+        .replace(/-8s$/i, ' 8s')
+  return `${providerLabel} · ${label}${faceLocked ? '（卡人脸）' : ''}`
+}
+
+function pricingApiUrl() {
+  return new URL('/api/pricing', publicPricingPageUrl).toString()
 }
 
 function optionValues(value: unknown) {
@@ -193,7 +209,10 @@ export function parseVideoPricingCatalog(payload: unknown): VideoModelDefinition
   return data.flatMap((rawItem) => {
     const item = record(rawItem)
     const id = String(item.model_name || '').trim()
-    if (!/^(?:sd5-)?seedance-2\.0(?:-|$)/i.test(id)) return []
+    const family = /^grok-video(?:-|$)/i.test(id)
+      ? 'Grok' as const
+      : /^(?:sd5-)?seedance-2\.0(?:-|$)/i.test(id) ? 'Seedance' as const : null
+    if (!family) return []
 
     const price = Number(item.model_price)
     if (!Number.isFinite(price) || price < 0) return []
@@ -205,15 +224,18 @@ export function parseVideoPricingCatalog(payload: unknown): VideoModelDefinition
     const maximumDuration = Math.min(15, Math.max(minimumDuration, Math.round(Number(duration.max) || 15)))
     const priceMode: VideoModelPriceMode = item.billing_mode === 'per_second' ? 'per_second' : 'flat'
     const generateAudio = record(params.generateAudio)
+    const referenceLimits = record(record(item.video_ui_params).referenceLimits)
+    const maximumReferenceImages = Math.max(1, Math.min(4, Math.round(Number(referenceLimits.images) || 4)))
+    const providerLabel = pricingProviderLabel(item, id)
     const defaultResolution = /(?:^|-)480p(?:-|$)/i.test(id)
       ? '480p'
       : resolutions.includes('720p') ? '720p' : resolutions[0]
 
     return [{
       id,
-      label: liveModelLabel(id),
-      family: 'Seedance' as const,
-      description: String(item.description || 'Seedance 视频生成模型。').trim(),
+      label: liveModelLabel(id, providerLabel),
+      family,
+      description: String(item.description || `${providerLabel} 视频生成模型。`).trim(),
       priceLabel: formatPriceLabel(price, priceMode),
       priceMode,
       priceSource: 'live' as const,
@@ -221,6 +243,7 @@ export function parseVideoPricingCatalog(payload: unknown): VideoModelDefinition
       startingAt: false,
       minimumDuration,
       maximumDuration,
+      maximumReferenceImages,
       supportsAudio: generateAudio.enabled !== false,
       resolutions,
       defaultResolution,
@@ -254,7 +277,7 @@ export function estimateVideoModelPrice(model: VideoModelDefinition, duration: n
 }
 
 async function fetchLivePricingCatalog() {
-  const response = await fetch(pricingApiUrl(env.videoApiBaseUrl()), {
+  const response = await fetch(pricingApiUrl(), {
     headers: { Accept: 'application/json' },
     cache: 'no-store',
     signal: AbortSignal.timeout(10_000),
@@ -323,7 +346,7 @@ export async function getVideoModelOptions(options: { forceRefresh?: boolean } =
     defaultModel,
     warning: warningParts.join(' ') || null,
     priceNotice: lastPriceUpdate
-      ? `Seedance 价格来自沧元模型广场实时接口。${hasReferencePrices ? 'Grok 未公开实时价，标记为参考价格。' : ''}`
+      ? `字节跳动、xAI 与即梦视频价格实时读取自沧元模型广场。${hasReferencePrices ? '未被实时目录覆盖的模型标记为参考价格。' : ''}`
       : '当前显示本地参考价格，实际扣费以沧元模型广场为准。',
     refreshedAt: new Date(now).toISOString(),
     priceUpdatedAt: lastPriceUpdate ? new Date(lastPriceUpdate).toISOString() : null,
