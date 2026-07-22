@@ -302,6 +302,7 @@ model StoryboardVideo {
   storyboardId  String
   sourceStoryboardIds String[] @default([])
   mediaId       String
+  name          String?
   prompt        String      @db.Text
   model         String
   providerJobId String?

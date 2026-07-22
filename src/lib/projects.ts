@@ -22,9 +22,9 @@ export function deriveProjectStage(input: {
   episodeCount: number
   storyboardCount: number
   assetCount: number
-  renderCount: number
+  videoCount: number
 }): ProjectStage {
-  if (input.renderCount > 0) return { index: 5, label: '成片剪辑' }
+  if (input.videoCount > 0) return { index: 5, label: '视频库' }
   if (input.assetCount > 0) return { index: 4, label: '资产与视频' }
   if (input.storyboardCount > 0) return { index: 3, label: '分镜拆解' }
   if (input.episodeCount > 0) return { index: 2, label: '剧本改编' }
@@ -59,7 +59,7 @@ export type ProjectHubProject = {
   episodeCount: number
   assetCount: number
   storyboardCount: number
-  renderCount: number
+  videoCount: number
   activeTask: boolean
   lastActivityAt: string
 }

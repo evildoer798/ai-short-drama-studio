@@ -3,14 +3,12 @@ import { TaskStatus } from '@prisma/client'
 import { prisma } from '@/lib/db'
 import {
   IMAGE_QUEUE_NAME,
-  RENDER_QUEUE_NAME,
   TEXT_QUEUE_NAME,
   VIDEO_QUEUE_NAME,
   getRedisConnectionOptions,
 } from '@/lib/queue'
 import { processImageGenerationTask } from './image-generation'
 import { processVideoGenerationTask } from './video-generation'
-import { processProjectRenderTask } from './project-render'
 import { processTextGenerationTask } from './text-generation'
 
 const textWorker = new Worker(
@@ -142,30 +140,4 @@ videoWorker.on('failed', (job, error) => {
   console.error(`video task failed: ${job?.id}`, error)
 })
 
-const renderWorker = new Worker(
-  RENDER_QUEUE_NAME,
-  async (job) => {
-    const taskId = job.data?.taskId
-    if (typeof taskId !== 'string' || !taskId) {
-      throw new Error('Worker job missing taskId')
-    }
-    const attempts = Math.max(1, Number(job.opts.attempts || 1))
-    const willRetryOnFailure = job.attemptsMade + 1 < attempts
-    return processProjectRenderTask(taskId, { willRetryOnFailure })
-  },
-  {
-    connection: getRedisConnectionOptions(),
-    concurrency: Number(process.env.RENDER_WORKER_CONCURRENCY || 1),
-    lockDuration: 5 * 60_000,
-  },
-)
-
-renderWorker.on('completed', (job) => {
-  console.log(`project render completed: ${job.id}`)
-})
-
-renderWorker.on('failed', (job, error) => {
-  console.error(`project render failed: ${job?.id}`, error)
-})
-
-console.log(`Workers listening on ${TEXT_QUEUE_NAME}, ${IMAGE_QUEUE_NAME}, ${VIDEO_QUEUE_NAME}, and ${RENDER_QUEUE_NAME}`)
+console.log(`Workers listening on ${TEXT_QUEUE_NAME}, ${IMAGE_QUEUE_NAME}, and ${VIDEO_QUEUE_NAME}`)

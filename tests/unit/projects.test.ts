@@ -56,8 +56,8 @@ describe('project stage summary', () => {
       episodeCount: 15,
       storyboardCount: 120,
       assetCount: 24,
-      renderCount: 1,
-    })).toEqual({ index: 5, label: '成片剪辑' })
+      videoCount: 1,
+    })).toEqual({ index: 5, label: '视频库' })
   })
 
   it('keeps a new project at the import stage', () => {
@@ -66,7 +66,7 @@ describe('project stage summary', () => {
       episodeCount: 0,
       storyboardCount: 0,
       assetCount: 0,
-      renderCount: 0,
+      videoCount: 0,
     })).toEqual({ index: 0, label: '等待导入' })
   })
 })

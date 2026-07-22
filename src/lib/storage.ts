@@ -77,19 +77,6 @@ export function buildStorageKey(input: {
   ].join('/')
 }
 
-export function buildProjectRenderStorageKey(input: {
-  projectId: string
-  mimeType: string
-}) {
-  const ext = extensionForMime(input.mimeType)
-  return [
-    'projects',
-    input.projectId,
-    'renders',
-    `${Date.now()}-${randomUUID()}.${ext}`,
-  ].join('/')
-}
-
 export async function uploadBuffer(input: {
   key: string
   body: Buffer

@@ -8,6 +8,10 @@ import {
   extensionForMime,
   streamStorageObject,
 } from '@/lib/storage'
+import {
+  buildStoryboardVideoDisplayName,
+  buildStoryboardVideoDownloadFilename,
+} from '@/lib/storyboard-video-names'
 
 export async function GET(
   _request: NextRequest,
@@ -24,7 +28,11 @@ export async function GET(
           take: 1,
         },
         storyboardVideos: {
-          include: { storyboard: true },
+          include: {
+            storyboard: {
+              include: { episode: { select: { episodeNumber: true } } },
+            },
+          },
           take: 1,
         },
         projectRenders: {
@@ -44,10 +52,22 @@ export async function GET(
     await requireProjectAccess(projectId, user.id)
     const download = _request.nextUrl.searchParams.get('download') === '1'
     const render = media.projectRenders[0]
+    const storyboardVideo = media.storyboardVideos[0]
     const extension = extensionForMime(media.mimeType)
-    const downloadFilename = download
-      ? `${render?.title?.trim() || 'AI短剧成片'}.${extension}`
-      : undefined
+    const storyboardVideoName = storyboardVideo
+      ? buildStoryboardVideoDisplayName({
+        customName: storyboardVideo.name,
+        episodeNumber: storyboardVideo.storyboard.episode?.episodeNumber,
+        storyboardNumber: storyboardVideo.storyboard.episodeSceneNumber || storyboardVideo.storyboard.sceneNumber,
+        storyboardTitle: storyboardVideo.storyboard.title,
+        sourceCount: storyboardVideo.sourceStoryboardIds.length || 1,
+        createdAt: storyboardVideo.createdAt,
+      })
+      : null
+    const downloadFilename = download ? buildStoryboardVideoDownloadFilename({
+      displayName: render?.title?.trim() || storyboardVideoName || `媒体-${media.id}`,
+      extension,
+    }) : undefined
     const range = _request.headers.get('range') || undefined
     const object = await streamStorageObject(media.storageKey, range)
     const headers = new Headers({

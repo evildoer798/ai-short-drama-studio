@@ -1,12 +1,12 @@
 # AI Short Drama Studio
 
-AI Short Drama Studio 是一个面向小型创作团队的私有化 AI 短剧生产工作台。它将小说或长文本逐步转换为可编辑的分集剧本、电影级分镜、角色与场景资产、分镜视频以及最终合成影片，并通过后台任务、检查点和多线路模型容灾降低长任务中断带来的损失。
+AI Short Drama Studio 是一个面向小型创作团队的私有化 AI 短剧生产工作台。它将小说或长文本逐步转换为可编辑的分集剧本、电影级分镜、角色与场景资产及分镜视频，并通过后台任务、检查点和多线路模型容灾降低长任务中断带来的损失。
 
 本项目适合三类使用方式：
 
 - 编剧与导演共同审阅小说改编结果，逐集确认内容后继续制作。
 - 美术人员维护角色、场景和核心道具资产，统一项目视觉风格。
-- 小团队在一台云服务器上协作生成图片、视频和合成成片。
+- 小团队在一台云服务器上协作生成、审阅和下载图片与视频。
 
 > 安全说明：仓库不包含任何真实 API Key、对象存储密钥、服务器密码或生产环境配置。所有敏感配置只应写入已被 Git 忽略的 `.env` 和 `.env.production`。
 
@@ -17,7 +17,7 @@ AI Short Drama Studio 是一个面向小型创作团队的私有化 AI 短剧生
 1. **项目管理**
    - 从项目首页新建项目并自定义名称。
    - 在多个小说或剧本项目之间切换。
-   - 每个项目独立保存原文、剧本、分镜、资产、视频和成片。
+   - 每个项目独立保存原文、剧本、分镜、资产和视频。
 
 2. **小说改编**
    - 粘贴小说内容或上传 TXT 文件。
@@ -55,10 +55,10 @@ AI Short Drama Studio 是一个面向小型创作团队的私有化 AI 短剧生
    - 模型选择器展示模型名称、时长、分辨率和价格说明。
    - 视频异步提交、轮询、下载并保存到对象存储。
 
-7. **成片剪辑**
-   - 按时间线整理各分镜视频。
-   - 使用 FFmpeg 合并片段。
-   - 保存多个合成版本、选择主版本并下载 MP4 成片。
+7. **视频库**
+   - 按分集查看当前项目生成的全部视频版本。
+   - 支持逐条预览、搜索和跳转回来源分镜。
+   - 支持修改视频名称，并使用保存后的名称下载 MP4 文件。
 
 ## 一致性与质量控制
 
@@ -113,7 +113,7 @@ Next.js Web/API
    |                          用户、项目、剧本、分镜、任务、媒体索引
    |
    |-----------------------> S3-compatible Object Storage
-   |                          资产图片、分镜视频、合成成片
+   |                          资产图片、分镜视频
    |
    v
 Redis + BullMQ
@@ -122,8 +122,7 @@ Redis + BullMQ
 Background Worker
    |---- Text providers
    |---- Image provider
-   |---- Video provider
-   `---- FFmpeg renderer
+   `---- Video provider
 ```
 
 ### 技术栈
@@ -134,7 +133,6 @@ Background Worker
 | 数据库 | PostgreSQL、Prisma |
 | 任务队列 | Redis、BullMQ |
 | 对象存储 | S3 兼容接口，可使用 MinIO、OSS、R2 等 |
-| 视频合成 | FFmpeg |
 | 部署 | Docker Compose、反向代理 |
 | 测试 | Vitest |
 
@@ -166,7 +164,7 @@ ai-short-drama-studio/
 - 至少 2 核 CPU、2 GB 内存用于三人轻量测试
 - 生产环境建议使用独立对象存储，避免图片和视频占满系统盘
 
-2 核 2 GB 服务器可以运行三人内测，但应限制 Worker 并发。视频生成本身由外部模型服务完成，本机主要承担任务调度、文件传输、数据库和 FFmpeg 合并。
+2 核 2 GB 服务器可以运行三人内测，但应限制 Worker 并发。视频生成本身由外部模型服务完成，本机主要承担任务调度、文件传输和数据库读写。
 
 ## 本地启动
 
@@ -306,7 +304,7 @@ npm run configure:deepseek-api
 - 角色、场景和道具图片
 - 用户上传的资产参考图
 - AI 生成的分镜视频
-- 合并后的 MP4 成片
+- AI 生成并可独立下载的 MP4 分镜视频
 
 PostgreSQL 只保存对象 Key、媒体类型、版本关系和业务关联。这样可以更换 MinIO、OSS 或其他 S3 兼容服务，而不必重写剧本和分镜数据。
 
@@ -399,16 +397,15 @@ npm run provision:users
 - `POST /api/assets/:assetId/select-image`
 - `POST /api/projects/:projectId/generate-asset-images`
 
-### 分镜、视频与成片
+### 分镜与视频
 
 - `GET/POST /api/storyboards`
 - `PATCH/DELETE /api/storyboards/:storyboardId`
 - `POST /api/storyboards/:storyboardId/generate-video`
 - `POST /api/storyboards/generate-video-group`
 - `POST /api/storyboards/:storyboardId/select-video`
+- `PATCH /api/storyboard-videos/:videoId`
 - `GET /api/video-models`
-- `POST /api/projects/:projectId/render`
-- `POST /api/projects/:projectId/select-render`
 
 ### 任务与媒体
 
@@ -433,7 +430,7 @@ npm run build
 - DeepSeek 文字线路连通且结构化 JSON 测试通过。
 - Worker 可以从失败检查点恢复任务。
 - 手机上可以正常加载对象存储图片。
-- 合成成片可以从公网入口下载。
+- 视频库中的视频可以从公网入口按保存名称下载。
 
 ## 常见问题
 
@@ -455,7 +452,7 @@ npm run build
 
 ### 服务器内存不足
 
-降低 Worker 并发，限制容器内存，并把图片和视频放到外部对象存储。2 GB 内存环境不适合在本机执行高并发 FFmpeg 合成。
+降低 Worker 并发，限制容器内存，并把图片和视频放到外部对象存储。2 GB 内存环境应避免同时执行大量文件上传和下载。
 
 ## 安全清单
 

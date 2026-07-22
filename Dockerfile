@@ -1,9 +1,5 @@
 FROM node:24-alpine AS base
 
-ENV FFMPEG_BIN=/usr/bin/ffmpeg
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories \
-  && apk add --no-cache ffmpeg
-
 FROM base AS dependencies
 
 WORKDIR /app

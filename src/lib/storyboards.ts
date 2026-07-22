@@ -1,7 +1,8 @@
 import { AssetType, VisualStyle } from '@prisma/client'
 import { z } from 'zod'
 import { prisma } from './db'
-import { assetImageUrl } from './assets'
+import { assetImageUrl, mediaDownloadUrl } from './assets'
+import { buildStoryboardVideoDisplayName } from './storyboard-video-names'
 import { buildStyleLock } from './visual-styles'
 
 export const storyboardAspectRatioSchema = z.enum(['16:9', '9:16', '1:1', '21:9', '3:4', '4:3'])
@@ -609,24 +610,36 @@ export async function getProjectStoryboards(projectId: string) {
         ? assetImageUrl(link.asset.selectedImage.media.id)
         : null,
       })),
-    videos: storyboard.videos.map((video) => ({
-      id: video.id,
-      mediaId: video.mediaId,
-      url: assetImageUrl(video.mediaId),
-      prompt: video.prompt,
-      model: video.model,
-      duration: video.duration,
-      sourceStoryboardIds: video.sourceStoryboardIds?.length > 0
+    videos: storyboard.videos.map((video) => {
+      const sourceStoryboardIds = video.sourceStoryboardIds?.length > 0
         ? video.sourceStoryboardIds
-        : [storyboard.id],
-      aspectRatio: video.aspectRatio,
-      resolution: Math.min(video.media.width || 0, video.media.height || 0) > 0
-        && Math.min(video.media.width || 0, video.media.height || 0) <= 540
-        ? '480p' as const
-        : '720p' as const,
-      isSelected: video.isSelected,
-      createdAt: video.createdAt.toISOString(),
-    })),
+        : [storyboard.id]
+      return {
+        id: video.id,
+        mediaId: video.mediaId,
+        name: buildStoryboardVideoDisplayName({
+          customName: video.name,
+          episodeNumber: storyboard.episode?.episodeNumber,
+          storyboardNumber: storyboard.episodeSceneNumber || storyboard.sceneNumber,
+          storyboardTitle: storyboard.title,
+          sourceCount: sourceStoryboardIds.length,
+          createdAt: video.createdAt,
+        }),
+        url: assetImageUrl(video.mediaId),
+        downloadUrl: mediaDownloadUrl(video.mediaId),
+        prompt: video.prompt,
+        model: video.model,
+        duration: video.duration,
+        sourceStoryboardIds,
+        aspectRatio: video.aspectRatio,
+        resolution: Math.min(video.media.width || 0, video.media.height || 0) > 0
+          && Math.min(video.media.width || 0, video.media.height || 0) <= 540
+          ? '480p' as const
+          : '720p' as const,
+        isSelected: video.isSelected,
+        createdAt: video.createdAt.toISOString(),
+      }
+    }),
     latestTask: storyboard.tasks[0]
       ? {
         id: storyboard.tasks[0].id,

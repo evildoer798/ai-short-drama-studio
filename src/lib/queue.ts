@@ -4,12 +4,10 @@ import { env } from './env'
 export const IMAGE_QUEUE_NAME = 'shortdrama-image-generation'
 export const TEXT_QUEUE_NAME = 'shortdrama-text-generation'
 export const VIDEO_QUEUE_NAME = 'shortdrama-video-generation'
-export const RENDER_QUEUE_NAME = 'shortdrama-project-render'
 
 let imageQueue: Queue | null = null
 let textQueue: Queue | null = null
 let videoQueue: Queue | null = null
-let renderQueue: Queue | null = null
 
 export function getRedisConnectionOptions() {
   return {
@@ -91,24 +89,4 @@ export function getVideoQueue() {
 
 export async function enqueueVideoGenerationTask(taskId: string) {
   await getVideoQueue().add('generate-video', { taskId }, { jobId: taskId })
-}
-
-export function getRenderQueue() {
-  renderQueue ??= new Queue(RENDER_QUEUE_NAME, {
-    connection: getRedisConnectionOptions(),
-    defaultJobOptions: {
-      attempts: 2,
-      backoff: {
-        type: 'exponential',
-        delay: 10_000,
-      },
-      removeOnComplete: 100,
-      removeOnFail: 300,
-    },
-  })
-  return renderQueue
-}
-
-export async function enqueueProjectRenderTask(taskId: string) {
-  await getRenderQueue().add('render-project', { taskId }, { jobId: taskId })
 }

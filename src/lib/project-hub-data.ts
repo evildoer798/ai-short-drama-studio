@@ -36,7 +36,6 @@ export async function getProjectHubData(userId: string): Promise<ProjectHubData>
             assets: true,
             storyboards: true,
             scriptEpisodes: true,
-            renders: true,
           },
         },
         assets: {
@@ -58,11 +57,6 @@ export async function getProjectHubData(userId: string): Promise<ProjectHubData>
           take: 1,
           select: { updatedAt: true },
         },
-        renders: {
-          orderBy: { createdAt: 'desc' },
-          take: 1,
-          select: { createdAt: true },
-        },
         tasks: {
           orderBy: { updatedAt: 'desc' },
           take: 1,
@@ -72,14 +66,31 @@ export async function getProjectHubData(userId: string): Promise<ProjectHubData>
     }),
   ])
 
+  const videoRows = projects.length > 0 ? await prisma.storyboardVideo.findMany({
+    where: { storyboard: { projectId: { in: projects.map((project) => project.id) } } },
+    select: {
+      createdAt: true,
+      storyboard: { select: { projectId: true } },
+    },
+  }) : []
+  const videoStats = new Map<string, { count: number; latestAt: Date | null }>()
+  videoRows.forEach((video) => {
+    const projectId = video.storyboard.projectId
+    const current = videoStats.get(projectId) || { count: 0, latestAt: null }
+    current.count += 1
+    if (!current.latestAt || video.createdAt > current.latestAt) current.latestAt = video.createdAt
+    videoStats.set(projectId, current)
+  })
+
   const projectItems = projects.map((project) => {
     const cover = project.assets[0]?.selectedImage
+    const projectVideoStats = videoStats.get(project.id) || { count: 0, latestAt: null }
     const stage = deriveProjectStage({
       hasNovel: Boolean(project.novelSource),
       episodeCount: project._count.scriptEpisodes,
       storyboardCount: project._count.storyboards,
       assetCount: project._count.assets,
-      renderCount: project._count.renders,
+      videoCount: projectVideoStats.count,
     })
     const lastActivityAt = latestDate([
       project.updatedAt,
@@ -87,7 +98,7 @@ export async function getProjectHubData(userId: string): Promise<ProjectHubData>
       project.assets[0]?.updatedAt,
       project.scriptEpisodes[0]?.updatedAt,
       project.storyboards[0]?.updatedAt,
-      project.renders[0]?.createdAt,
+      projectVideoStats.latestAt,
       project.tasks[0]?.updatedAt,
     ])
 
@@ -103,7 +114,7 @@ export async function getProjectHubData(userId: string): Promise<ProjectHubData>
       episodeCount: project._count.scriptEpisodes,
       assetCount: project._count.assets,
       storyboardCount: project._count.storyboards,
-      renderCount: project._count.renders,
+      videoCount: projectVideoStats.count,
       activeTask: project.tasks[0]?.status === 'queued' || project.tasks[0]?.status === 'processing',
       lastActivityAt: lastActivityAt.toISOString(),
     }

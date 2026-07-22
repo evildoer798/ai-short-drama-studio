@@ -10,7 +10,6 @@ import {
   Clock3,
   ExternalLink,
   Film,
-  FolderOpen,
   ImageIcon,
   ListVideo,
   Loader2,
@@ -362,7 +361,7 @@ export function ProjectHub({ user, initialData }: { user: User, initialData: Pro
                         <div><dt><BookOpenText size={14} />分集</dt><dd>{project.episodeCount}</dd></div>
                         <div><dt><ImageIcon size={14} />资产</dt><dd>{project.assetCount}</dd></div>
                         <div><dt><ListVideo size={14} />分镜</dt><dd>{project.storyboardCount}</dd></div>
-                        <div><dt><FolderOpen size={14} />成片</dt><dd>{project.renderCount}</dd></div>
+                        <div><dt><Film size={14} />视频</dt><dd>{project.videoCount}</dd></div>
                       </dl>
 
                       <div className="projectCardFooter">

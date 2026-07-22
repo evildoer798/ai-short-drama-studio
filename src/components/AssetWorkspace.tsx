@@ -7,7 +7,6 @@ import {
   Box,
   Boxes,
   Check,
-  ChevronLeft,
   ChevronRight,
   CircleAlert,
   Clapperboard,
@@ -24,7 +23,6 @@ import {
   Plus,
   RefreshCw,
   Save,
-  Scissors,
   Search,
   Settings2,
   Sparkles,
@@ -50,7 +48,7 @@ import { PreproductionWorkspace, type PreproductionSummary } from './Preproducti
 type AssetType = 'character' | 'location' | 'prop'
 type VisualStyle = 'photorealistic' | 'anime_2d' | 'anime_3d' | 'chibi'
 type TaskStatus = 'queued' | 'processing' | 'completed' | 'failed'
-type WorkspaceView = 'script' | 'assetPlan' | 'shotPlan' | 'assets' | 'storyboards' | 'edits'
+type WorkspaceView = 'script' | 'assetPlan' | 'shotPlan' | 'assets' | 'storyboards' | 'videos'
 
 type StyleOption = {
   id: VisualStyle
@@ -162,7 +160,9 @@ type StoryboardAssetReference = {
 type StoryboardVideo = {
   id: string
   mediaId: string
+  name: string
   url: string
+  downloadUrl: string
   prompt: string
   model: string
   duration: number
@@ -195,27 +195,11 @@ type StoryboardRecord = {
   latestTask: TaskRecord | null
 }
 
-type ProjectRenderRecord = {
-  id: string
-  mediaId: string
-  title: string
-  url: string
-  downloadUrl: string
-  duration: number
-  aspectRatio: '16:9' | '9:16'
-  clipCount: number
-  sourceVideoIds: string[]
-  isSelected: boolean
-  createdAt: string
-}
-
 type WorkspaceData = {
   projects: ProjectOption[]
   activeProjectId: string | null
   assets: AssetRecord[]
   storyboards: StoryboardRecord[]
-  renders: ProjectRenderRecord[]
-  latestRenderTask: TaskRecord | null
   styleOptions: StyleOption[]
 }
 
@@ -245,9 +229,7 @@ type JenniferAction =
   | 'focus_storyboard_prompt'
   | 'focus_video_generation'
   | 'review_video'
-  | 'open_editor'
-  | 'focus_render'
-  | 'review_final'
+  | 'open_video_library'
 
 type JenniferGuidance = {
   key: string
@@ -390,8 +372,6 @@ function buildJenniferGuidance(input: {
   storyboardTask?: TaskRecord | null
   creatingStoryboard: boolean
   styleLabel: string
-  renders: ProjectRenderRecord[]
-  renderTask?: TaskRecord | null
 }): JenniferGuidance {
   const styleWarning = `当前是${input.styleLabel}。切换画风只影响之后生成的内容，已有图片和视频不会自动重做。`
 
@@ -634,54 +614,19 @@ function buildJenniferGuidance(input: {
     }
   }
 
-  if (input.view === 'edits') {
-    const renderRunning = input.renderTask?.status === 'queued' || input.renderTask?.status === 'processing'
-    if (renderRunning) {
-      return {
-        key: `render-running-${input.renderTask?.id}`,
-        title: '正在把分镜合成为完整成片',
-        detail: `当前进度 ${input.renderTask?.progress || 0}%。系统会统一画幅和音轨，并按时间线顺序输出 MP4。`,
-        warnings: ['合成期间不要重复提交，避免产生多个相同版本。', '可以留在当前页面等待，任务会在后台继续。'],
-      }
-    }
-
-    if (input.renderTask?.status === 'failed') {
-      return {
-        key: `render-failed-${input.renderTask.id}`,
-        title: '检查缺失镜头后重新合成',
-        detail: input.renderTask.error || '某条分镜视频无法读取，请确认每条分镜都已选中可播放的视频版本。',
-        warnings: ['重新合成不会再次调用视频生成模型。', '原始分镜视频不会被修改。'],
-        action: { id: 'focus_render', label: '检查时间线' },
-      }
-    }
-
-    const missing = input.storyboards.filter((storyboard) => !storyboard.selectedVideoId)
-    if (missing.length > 0) {
-      return {
-        key: `render-missing-${missing.map((storyboard) => storyboard.id).join('-')}`,
-        title: `还差 ${missing.length} 条分镜视频`,
-        detail: `先回到分镜视频，为「${missing[0].title}」生成并选中一个版本。全部就绪后才能合成。`,
-        warnings: ['只有每条分镜当前选中的版本会进入时间线。', '更换选中版本后，之后的成片会使用新版本。'],
-        action: { id: 'focus_video_generation', label: '补齐分镜视频', storyboardId: missing[0].id },
-      }
-    }
-
-    if (input.renders.length === 0) {
-      return {
-        key: 'render-ready',
-        title: '镜头已就绪，确认顺序后生成成片',
-        detail: '按剧情顺序检查时间线，可用左右箭头调整镜头，再选择横屏或竖屏输出。',
-        warnings: ['首版使用硬切，不会自动添加转场或背景音乐。', '合成只做本地媒体处理，不消耗视频模型额度。'],
-        action: { id: 'focus_render', label: '检查并生成成片' },
-      }
-    }
-
-    return {
-      key: `review-final-${input.renders[0].id}`,
-      title: '播放完整成片并做最终检查',
-      detail: '检查镜头顺序、画幅、声音衔接和角色连续性；需要修改时，回到对应分镜换版本再重新合成。',
-      warnings: ['重新合成会保留旧成片版本。', '确认后可直接下载当前成片 MP4。'],
-      action: { id: 'review_final', label: '播放当前成片' },
+  if (input.view === 'videos') {
+    const videoCount = input.storyboards.reduce((total, storyboard) => total + storyboard.videos.length, 0)
+    return videoCount > 0 ? {
+      key: `video-library-${videoCount}`,
+      title: `视频库中共有 ${videoCount} 条视频`,
+      detail: '可以逐条预览、修改名称并直接下载，所有历史生成版本都会保留。',
+      warnings: ['重命名不会修改视频内容。', '下载文件会使用当前保存的名称。'],
+    } : {
+      key: 'video-library-empty',
+      title: '先生成第一条分镜视频',
+      detail: '视频生成完成后会自动进入这里，不需要额外合成或导入。',
+      warnings: ['视频库只展示当前项目的内容。', styleWarning],
+      action: { id: 'open_storyboards', label: '进入分镜视频' },
     }
   }
 
@@ -755,18 +700,18 @@ function buildJenniferGuidance(input: {
   if (allStoryboardsReady) {
     return {
       key: 'all-storyboards-ready',
-      title: '所有分镜都已选片，进入成片剪辑',
-      detail: '下一步把各分镜的当前版本排入时间线，确认顺序后一次合成为完整 MP4。',
-      warnings: ['成片只会使用每条分镜当前选中的版本。', '先播放检查本镜，再进入剪辑能减少返工。'],
-      action: { id: 'open_editor', label: '进入成片剪辑' },
+      title: '所有分镜都已选片，可以集中检查视频',
+      detail: '视频库会按分集整理所有生成版本，可逐条预览、重命名和下载。',
+      warnings: ['旧版本不会被覆盖。', '先播放检查本镜，再下载能减少返工。'],
+      action: { id: 'open_video_library', label: '打开视频库' },
     }
   }
 
   return {
     key: `review-video-${storyboard.id}-${storyboard.selectedVideoId || ''}`,
-    title: '播放成片并检查连续性',
+    title: '播放视频并检查连续性',
     detail: '重点检查人物脸型、发型、固定服装、道具外观、场景布局、口型和对白是否跨镜一致。',
-    warnings: ['发现漂移时，先调整资产主图或提示词，再生成新版本。', '选中的视频版本会作为当前分镜成片保留。'],
+    warnings: ['发现漂移时，先调整资产主图或提示词，再生成新版本。', '选中的版本会作为当前分镜的默认视频保留。'],
     action: { id: 'review_video', label: '播放当前版本' },
   }
 }
@@ -871,7 +816,6 @@ export function AssetWorkspace({
   const [activeProjectId, setActiveProjectId] = useState(initialData.activeProjectId)
   const [assets, setAssets] = useState(initialData.assets)
   const [storyboards, setStoryboards] = useState(initialData.storyboards)
-  const [renders, setRenders] = useState(initialData.renders)
   const [filterType, setFilterType] = useState<AssetType | 'all'>('all')
   const [query, setQuery] = useState('')
   const [selectedAssetId, setSelectedAssetId] = useState(initialData.assets[0]?.id || '')
@@ -885,9 +829,6 @@ export function AssetWorkspace({
     initialData.assets.forEach((asset) => {
       if (asset.latestTask) initialTasks[asset.latestTask.id] = asset.latestTask
     })
-    if (initialData.latestRenderTask) {
-      initialTasks[initialData.latestRenderTask.id] = initialData.latestRenderTask
-    }
     return initialTasks
   })
   const [loading, setLoading] = useState(false)
@@ -981,7 +922,6 @@ export function AssetWorkspace({
       setActiveProjectId(data.activeProjectId)
       setAssets(data.assets)
       setStoryboards(data.storyboards)
-      setRenders(data.renders)
       setTasks((current) => {
         const nextTasks = { ...current }
         data.storyboards.forEach((storyboard) => {
@@ -990,7 +930,6 @@ export function AssetWorkspace({
         data.assets.forEach((asset) => {
           if (asset.latestTask) nextTasks[asset.latestTask.id] = asset.latestTask
         })
-        if (data.latestRenderTask) nextTasks[data.latestRenderTask.id] = data.latestRenderTask
         return nextTasks
       })
       if (data.assets.length > 0 && !data.assets.some((asset) => asset.id === selectedAssetId)) {
@@ -1282,37 +1221,27 @@ export function AssetWorkspace({
     }
   }
 
-  async function renderProject(input: {
-    title: string
-    aspectRatio: '16:9' | '9:16'
-    sourceVideoIds: string[]
-  }) {
-    if (!activeProjectId) return
+  async function renameVideo(video: StoryboardVideo, name: string) {
     try {
-      const payload = await requestJson<{ task: TaskRecord }>(`/api/projects/${activeProjectId}/render`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(input),
-      })
-      setTasks((current) => ({ ...current, [payload.task.id]: payload.task }))
-      showMessage('成片合成任务已提交')
+      const payload = await requestJson<{ video: { id: string; name: string } }>(
+        `/api/storyboard-videos/${video.id}`,
+        {
+          method: 'PATCH',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ name }),
+        },
+      )
+      setStoryboards((current) => current.map((storyboard) => ({
+        ...storyboard,
+        videos: storyboard.videos.map((item) => (
+          item.id === payload.video.id ? { ...item, name: payload.video.name } : item
+        )),
+      })))
+      showMessage('视频名称已保存')
+      return payload.video.name
     } catch (error) {
-      showMessage(error instanceof Error ? error.message : '成片任务提交失败', 'error')
-    }
-  }
-
-  async function selectRender(render: ProjectRenderRecord) {
-    if (!activeProjectId) return
-    try {
-      await requestJson(`/api/projects/${activeProjectId}/select-render`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ renderId: render.id }),
-      })
-      await refresh()
-      showMessage('当前成片版本已更新')
-    } catch (error) {
-      showMessage(error instanceof Error ? error.message : '选择成片失败', 'error')
+      showMessage(error instanceof Error ? error.message : '视频重命名失败', 'error')
+      return null
     }
   }
 
@@ -1333,9 +1262,6 @@ export function AssetWorkspace({
     .filter((task) => task.type === 'video_generation'
       && (task.status === 'queued' || task.status === 'processing'))
     .flatMap(sourceStoryboardIdsForTask))
-  const selectedRenderTask = Object.values(tasks)
-    .filter((task) => task.type === 'project_render' && task.projectId === activeProjectId)
-    .sort((a, b) => (b.createdAt || b.id).localeCompare(a.createdAt || a.id))[0]
   const activeStyleLabel = initialData.styleOptions.find((option) => option.id === activeProject?.visualStyle)?.label
     || '当前画风'
   const assistantGuidance = buildJenniferGuidance({
@@ -1349,8 +1275,6 @@ export function AssetWorkspace({
     storyboardTask: selectedStoryboardTask,
     creatingStoryboard,
     styleLabel: activeStyleLabel,
-    renders,
-    renderTask: selectedRenderTask,
   })
 
   function setJenniferOpen(open: boolean) {
@@ -1446,14 +1370,9 @@ export function AssetWorkspace({
       focusAssistantTarget('.videoStage video')
       return
     }
-    if (action.id === 'open_editor' || action.id === 'focus_render') {
-      setView('edits')
-      focusAssistantTarget('[data-assistant-target="project-render"]')
-      return
-    }
-    if (action.id === 'review_final') {
-      setView('edits')
-      focusAssistantTarget('.finalStage video')
+    if (action.id === 'open_video_library') {
+      setView('videos')
+      focusAssistantTarget('.videoLibraryWorkspace')
     }
   }
 
@@ -1514,10 +1433,10 @@ export function AssetWorkspace({
           </button>
           <button
             type="button"
-            className={view === 'edits' ? 'active' : ''}
-            onClick={() => setView('edits')}
+            className={view === 'videos' ? 'active' : ''}
+            onClick={() => setView('videos')}
           >
-            <Scissors size={16} />成片剪辑
+            <ListVideo size={16} />视频库
           </button>
         </nav>
 
@@ -1679,14 +1598,10 @@ export function AssetWorkspace({
           onSelectVideo={selectVideo}
           onNotice={showMessage}
         />
-      ) : view === 'edits' ? (
-        <FinalEditWorkspace
-          projectName={activeProject?.name || '项目'}
+      ) : view === 'videos' ? (
+        <VideoLibrary
           storyboards={storyboards}
-          renders={renders}
-          selectedTask={selectedRenderTask}
-          onRender={renderProject}
-          onSelectRender={selectRender}
+          onRename={renameVideo}
           onOpenStoryboard={(storyboardId) => {
             setSelectedStoryboardId(storyboardId)
             setCreatingStoryboard(!storyboardId)
@@ -1709,265 +1624,256 @@ function formatSeconds(value: number) {
   return minutes > 0 ? `${minutes}:${String(remainder).padStart(2, '0')}` : `${remainder}s`
 }
 
-function FinalEditWorkspace({
-  projectName,
+function VideoLibrary({
   storyboards,
-  renders,
-  selectedTask,
-  onRender,
-  onSelectRender,
+  onRename,
   onOpenStoryboard,
 }: {
-  projectName: string
   storyboards: StoryboardRecord[]
-  renders: ProjectRenderRecord[]
-  selectedTask?: TaskRecord | null
-  onRender: (input: {
-    title: string
-    aspectRatio: '16:9' | '9:16'
-    sourceVideoIds: string[]
-  }) => Promise<void>
-  onSelectRender: (render: ProjectRenderRecord) => Promise<void>
+  onRename: (video: StoryboardVideo, name: string) => Promise<string | null>
   onOpenStoryboard: (storyboardId: string) => void
 }) {
-  const canonicalClips = useMemo(() => {
-    const orderedStoryboards = [...storyboards].sort((left, right) => (
-      (left.episode?.episodeNumber ?? Number.MAX_SAFE_INTEGER)
-        - (right.episode?.episodeNumber ?? Number.MAX_SAFE_INTEGER)
-      || (left.episodeSceneNumber || left.sceneNumber) - (right.episodeSceneNumber || right.sceneNumber)
-    ))
-    const storyboardsById = new Map(orderedStoryboards.map((storyboard) => [storyboard.id, storyboard]))
-    const coveredStoryboardIds = new Set<string>()
-    const clips: Array<{
-      storyboard: StoryboardRecord
-      sourceStoryboards: StoryboardRecord[]
-      video: StoryboardVideo
-    }> = []
-    for (const storyboard of orderedStoryboards) {
-      if (coveredStoryboardIds.has(storyboard.id)) continue
-      const video = storyboard.videos.find((item) => item.id === storyboard.selectedVideoId)
-      if (!video) continue
-      const sourceIds = video.sourceStoryboardIds?.length ? video.sourceStoryboardIds : [storyboard.id]
-      const sourceStoryboards = sourceIds.flatMap((id) => {
-        const source = storyboardsById.get(id)
-        return source ? [source] : []
-      })
-      const normalizedSources = sourceStoryboards.length > 0 ? sourceStoryboards : [storyboard]
-      normalizedSources.forEach((source) => coveredStoryboardIds.add(source.id))
-      clips.push({ storyboard, sourceStoryboards: normalizedSources, video })
+  const [query, setQuery] = useState('')
+  const storyboardById = useMemo(
+    () => new Map(storyboards.map((storyboard) => [storyboard.id, storyboard])),
+    [storyboards],
+  )
+  const allEntries = useMemo(() => storyboards.flatMap((storyboard) => (
+    storyboard.videos.map((video) => ({ storyboard, video }))
+  )), [storyboards])
+  const normalizedQuery = query.trim().toLocaleLowerCase()
+  const filteredEntries = normalizedQuery ? allEntries.filter(({ storyboard, video }) => (
+    [
+      video.name,
+      video.model,
+      storyboard.title,
+      storyboard.episode?.title,
+      storyboard.episode?.episodeNumber ? `第${storyboard.episode.episodeNumber}集` : '',
+    ].some((value) => value?.toLocaleLowerCase().includes(normalizedQuery))
+  )) : allEntries
+  const groups = useMemo(() => {
+    const grouped = new Map<string, {
+      key: string
+      episodeNumber: number | null
+      title: string
+      entries: Array<{ storyboard: StoryboardRecord; video: StoryboardVideo }>
+    }>()
+    for (const entry of filteredEntries) {
+      const episode = entry.storyboard.episode
+      const key = episode?.id || 'unassigned'
+      const existing = grouped.get(key) || {
+        key,
+        episodeNumber: episode?.episodeNumber || null,
+        title: episode?.title || '未分集视频',
+        entries: [],
+      }
+      existing.entries.push(entry)
+      grouped.set(key, existing)
     }
-    return clips
-  }, [storyboards])
-  const canonicalKey = canonicalClips.map((clip) => clip.video.id).join('|')
-  const [timelineIds, setTimelineIds] = useState<string[]>([])
-  const [title, setTitle] = useState(`${projectName} 成片`)
-  const [aspectRatio, setAspectRatio] = useState<'16:9' | '9:16'>('16:9')
-
-  useEffect(() => {
-    setTimelineIds(canonicalKey ? canonicalKey.split('|') : [])
-  }, [canonicalKey])
-
-  useEffect(() => {
-    setTitle(`${projectName} 成片`)
-  }, [projectName])
-
-  const clipsById = useMemo(() => new Map(
-    canonicalClips.map((clip) => [clip.video.id, clip]),
-  ), [canonicalClips])
-  const timelineClips = timelineIds.flatMap((id) => {
-    const clip = clipsById.get(id)
-    return clip ? [clip] : []
-  })
-  const coveredStoryboardIds = new Set(canonicalClips.flatMap((clip) => (
-    clip.sourceStoryboards.map((storyboard) => storyboard.id)
-  )))
-  const missingStoryboards = storyboards.filter((storyboard) => !coveredStoryboardIds.has(storyboard.id))
-  const totalDuration = timelineClips.reduce((total, clip) => total + clip.video.duration, 0)
-  const rendering = selectedTask?.status === 'queued' || selectedTask?.status === 'processing'
-  const selectedRender = renders.find((render) => render.isSelected) || renders[0] || null
-  const ready = storyboards.length > 0
-    && missingStoryboards.length === 0
-    && timelineIds.length === canonicalClips.length
-
-  function moveClip(index: number, direction: -1 | 1) {
-    const target = index + direction
-    if (target < 0 || target >= timelineIds.length) return
-    setTimelineIds((current) => {
-      const next = [...current]
-      ;[next[index], next[target]] = [next[target], next[index]]
-      return next
-    })
-  }
+    return [...grouped.values()]
+      .sort((left, right) => (
+        (left.episodeNumber ?? Number.MAX_SAFE_INTEGER) - (right.episodeNumber ?? Number.MAX_SAFE_INTEGER)
+      ))
+      .map((group) => ({
+        ...group,
+        entries: group.entries.sort((left, right) => (
+          (left.storyboard.episodeSceneNumber || left.storyboard.sceneNumber)
+            - (right.storyboard.episodeSceneNumber || right.storyboard.sceneNumber)
+          || right.video.createdAt.localeCompare(left.video.createdAt)
+        )),
+      }))
+  }, [filteredEntries])
+  const totalDuration = allEntries.reduce((total, entry) => total + entry.video.duration, 0)
 
   return (
-    <section className="editWorkspace">
-      <section className="editMain">
-        <div className="editHeader">
-          <span><Scissors size={18} /><strong>成片时间线</strong></span>
-          <span className="editStats"><b>{timelineClips.length}</b> 个镜头 · <b>{formatSeconds(totalDuration)}</b></span>
+    <section className="videoLibraryWorkspace" tabIndex={-1}>
+      <header className="videoLibraryHeader">
+        <div>
+          <span><ListVideo size={19} /><strong>视频库</strong></span>
+          <small>{allEntries.length} 条视频 · 总时长 {formatSeconds(totalDuration)}</small>
         </div>
-
-        <div className="editControls">
-          <label>
-            成片名称
-            <input value={title} maxLength={120} onChange={(event) => setTitle(event.target.value)} />
-          </label>
-          <div className="outputRatio">
-            <span>输出画幅</span>
-            <div className="ratioControl" aria-label="输出画幅">
-              {(['16:9', '9:16'] as const).map((ratio) => (
-                <button
-                  key={ratio}
-                  type="button"
-                  className={aspectRatio === ratio ? 'active' : ''}
-                  onClick={() => setAspectRatio(ratio)}
-                >{ratio}</button>
-              ))}
-            </div>
-          </div>
-        </div>
-
-        {storyboards.length === 0 ? (
-          <div className="editEmpty">
-            <Film size={34} />
-            <strong>还没有可剪辑的分镜</strong>
-            <button className="quietButton" type="button" onClick={() => onOpenStoryboard('')}>创建分镜</button>
-          </div>
-        ) : null}
-
-        {missingStoryboards.length > 0 ? (
-          <div className="missingClips" role="alert">
-            <div><CircleAlert size={18} /><span><strong>缺少选片</strong><small>补齐后才能生成完整成片</small></span></div>
-            <div className="missingClipList">
-              {missingStoryboards.map((storyboard) => (
-                <button key={storyboard.id} type="button" onClick={() => onOpenStoryboard(storyboard.id)}>
-                  <span>分镜 {String(storyboard.sceneNumber).padStart(2, '0')} · {storyboard.title}</span>
-                  <ArrowRight size={15} />
-                </button>
-              ))}
-            </div>
-          </div>
-        ) : null}
-
-        {timelineClips.length > 0 ? (
-          <div className="timelineSection" data-assistant-target="project-render" tabIndex={-1}>
-            <div className="timelineTrack" aria-label="成片镜头顺序">
-              {timelineClips.map(({ storyboard, sourceStoryboards, video }, index) => (
-                <article className="timelineClip" key={video.id}>
-                  <div className="clipPreview">
-                    <video
-                      src={video.url}
-                      muted
-                      playsInline
-                      preload="metadata"
-                      onLoadedMetadata={(event) => {
-                        if (event.currentTarget.duration > 0.1) event.currentTarget.currentTime = 0.05
-                      }}
-                    />
-                    <span>{String(index + 1).padStart(2, '0')}</span>
-                  </div>
-                  <div className="clipInfo">
-                    <strong>{sourceStoryboards.length > 1 ? `${storyboard.title} · 组合 ${sourceStoryboards.length} 镜` : storyboard.title}</strong>
-                    <small>{sourceStoryboards.length > 1
-                      ? `分镜 ${sourceStoryboards.map((source) => source.episodeSceneNumber || source.sceneNumber).join('、')} · ${video.duration}s · ${video.aspectRatio}`
-                      : `分镜 ${String(storyboard.episodeSceneNumber || storyboard.sceneNumber).padStart(2, '0')} · ${video.duration}s · ${video.aspectRatio}`}</small>
-                  </div>
-                  <div className="clipMoveControls">
-                    <button
-                      type="button"
-                      title="向前移动"
-                      disabled={index === 0}
-                      onClick={() => moveClip(index, -1)}
-                    ><ChevronLeft size={16} /></button>
-                    <button
-                      type="button"
-                      title="向后移动"
-                      disabled={index === timelineClips.length - 1}
-                      onClick={() => moveClip(index, 1)}
-                    ><ChevronRight size={16} /></button>
-                  </div>
-                </article>
-              ))}
-            </div>
-          </div>
-        ) : null}
-
-        <div className="editFooter">
-          <span className={ready ? 'ready' : 'waiting'}>
-            {ready ? <Check size={15} /> : <CircleAlert size={15} />}
-            {ready ? '全部分镜已进入时间线' : '等待分镜选片完成'}
-          </span>
-          <small>硬切 · H.264 MP4 · AAC 音频</small>
-        </div>
-      </section>
-
-      <aside className="finalPanel">
-        <div className="panelHeading">
-          <span><Clapperboard size={17} /><strong>成片预览</strong></span>
-          {selectedRender ? <small>{formatSeconds(selectedRender.duration)}</small> : null}
-        </div>
-        <div className={`videoStage finalStage ${aspectRatio === '9:16' ? 'portrait' : ''}`}>
-          {selectedRender ? (
-            <video key={selectedRender.id} src={selectedRender.url} controls preload="metadata" />
-          ) : (
-            <div className="videoPlaceholder"><Scissors size={34} /><span>等待生成成片</span></div>
-          )}
-          {rendering ? (
-            <div className="renderOverlay">
-              <Loader2 className="spin" size={25} />
-              <strong>{selectedTask?.status === 'queued' ? '等待合成' : '正在合成成片'}</strong>
-              <div className="progressTrack"><span style={{ width: `${selectedTask?.progress || 2}%` }} /></div>
-              <small>{selectedTask?.progress || 0}%</small>
-            </div>
-          ) : null}
-        </div>
-
-        <button
-          className="primaryButton renderProjectButton"
-          type="button"
-          data-assistant-target="project-render"
-          disabled={!ready || rendering || !title.trim()}
-          onClick={() => void onRender({ title: title.trim(), aspectRatio, sourceVideoIds: timelineIds })}
-        >
-          {rendering ? <Loader2 className="spin" size={17} /> : <Scissors size={17} />}
-          {rendering ? '成片合成中' : '生成完整成片'}
-        </button>
-
-        {selectedTask?.status === 'failed' ? (
-          <p className="errorText">{selectedTask.error || '成片合成失败'}</p>
-        ) : null}
-
-        {selectedRender ? (
-          <a
-            className="quietButton downloadButton"
-            href={selectedRender.downloadUrl}
-            download={`${selectedRender.title || 'AI短剧成片'}.mp4`}
-          >
-            <Download size={16} />下载当前 MP4
-          </a>
-        ) : null}
-
-        <div className="renderVersions">
-          <div className="sectionLabel"><strong>成片版本</strong><span>{renders.length}</span></div>
-          {renders.length === 0 ? <div className="versionEmpty">尚未生成成片</div> : null}
-          {renders.map((render, index) => (
-            <button
-              key={render.id}
-              type="button"
-              className={render.id === selectedRender?.id ? 'active' : ''}
-              onClick={() => void onSelectRender(render)}
-            >
-              <Film size={16} />
-              <span>
-                <strong>{render.title || `成片 ${renders.length - index}`}</strong>
-                <small>{render.clipCount} 镜 · {formatSeconds(render.duration)} · {render.aspectRatio}</small>
-              </span>
-              {render.id === selectedRender?.id ? <Check size={16} /> : null}
+        <label className="videoLibrarySearch">
+          <Search size={16} aria-hidden="true" />
+          <input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="搜索视频名称、分镜或模型"
+            aria-label="搜索视频"
+          />
+          {query ? (
+            <button type="button" onClick={() => setQuery('')} title="清除搜索" aria-label="清除搜索">
+              <X size={15} />
             </button>
+          ) : null}
+        </label>
+      </header>
+
+      {allEntries.length === 0 ? (
+        <div className="videoLibraryEmpty">
+          <Film size={32} />
+          <strong>当前项目还没有生成视频</strong>
+          <span>完成任意分镜视频任务后，视频会自动保存在这里。</span>
+          <button className="primaryButton compact" type="button" onClick={() => onOpenStoryboard('')}>
+            <Film size={16} />进入分镜视频
+          </button>
+        </div>
+      ) : groups.length === 0 ? (
+        <div className="videoLibraryEmpty compact">
+          <Search size={28} />
+          <strong>没有匹配的视频</strong>
+          <button className="quietButton compact" type="button" onClick={() => setQuery('')}>清除搜索</button>
+        </div>
+      ) : (
+        <div className="videoEpisodeGroups">
+          {groups.map((group, groupIndex) => (
+            <details className="videoEpisodeGroup" key={group.key} open={groupIndex === 0}>
+              <summary>
+                <ChevronRight size={17} />
+                <span>
+                  <strong>{group.episodeNumber ? `第 ${group.episodeNumber} 集` : '未分集'}</strong>
+                  <small>{group.title}</small>
+                </span>
+                <b>{group.entries.length} 条</b>
+              </summary>
+              <div className="videoLibraryList">
+                {group.entries.map(({ storyboard, video }) => (
+                  <VideoLibraryItem
+                    key={video.id}
+                    storyboard={storyboard}
+                    video={video}
+                    storyboardById={storyboardById}
+                    onRename={onRename}
+                    onOpenStoryboard={onOpenStoryboard}
+                  />
+                ))}
+              </div>
+            </details>
           ))}
         </div>
-      </aside>
+      )}
     </section>
+  )
+}
+
+function VideoLibraryItem({
+  storyboard,
+  video,
+  storyboardById,
+  onRename,
+  onOpenStoryboard,
+}: {
+  storyboard: StoryboardRecord
+  video: StoryboardVideo
+  storyboardById: Map<string, StoryboardRecord>
+  onRename: (video: StoryboardVideo, name: string) => Promise<string | null>
+  onOpenStoryboard: (storyboardId: string) => void
+}) {
+  const [draft, setDraft] = useState(video.name)
+  const [saving, setSaving] = useState(false)
+  const cleanDraft = draft.trim()
+  const invalidName = /[\\/:*?"<>|\u0000-\u001f\u007f]/u.test(cleanDraft)
+  const nameError = !cleanDraft
+    ? '名称不能为空'
+    : invalidName ? '名称不能包含 \\ / : * ? " < > |' : ''
+  const changed = cleanDraft !== video.name
+  const sourceStoryboards = video.sourceStoryboardIds.flatMap((id) => {
+    const source = storyboardById.get(id)
+    return source ? [source] : []
+  })
+  const sourceNumbers = (sourceStoryboards.length ? sourceStoryboards : [storyboard])
+    .map((source) => source.episodeSceneNumber || source.sceneNumber)
+    .join('、')
+  const createdAt = new Date(video.createdAt)
+  const createdLabel = Number.isNaN(createdAt.getTime())
+    ? ''
+    : createdAt.toLocaleString('zh-CN', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+    })
+
+  useEffect(() => {
+    setDraft(video.name)
+  }, [video.name])
+
+  async function saveName() {
+    if (!changed || nameError || saving) return
+    setSaving(true)
+    const savedName = await onRename(video, cleanDraft)
+    if (savedName) setDraft(savedName)
+    setSaving(false)
+  }
+
+  const previewClass = video.aspectRatio === '9:16' || video.aspectRatio === '3:4'
+    ? 'portrait'
+    : video.aspectRatio === '1:1' ? 'square' : 'landscape'
+  const downloadName = video.name.toLocaleLowerCase().endsWith('.mp4')
+    ? video.name
+    : `${video.name}.mp4`
+
+  return (
+    <article className="videoLibraryItem">
+      <div className={`videoLibraryPreview ${previewClass}`}>
+        <video src={video.url} controls playsInline preload="metadata" />
+      </div>
+      <div className="videoLibraryDetails">
+        <div className="videoSourceHeading">
+          <span>
+            <strong>分镜 {String(storyboard.episodeSceneNumber || storyboard.sceneNumber).padStart(2, '0')} · {storyboard.title}</strong>
+            <small>{video.sourceStoryboardIds.length > 1 ? `组合分镜 ${sourceNumbers}` : `来源分镜 ${sourceNumbers}`}</small>
+          </span>
+          {video.isSelected ? <em><Check size={13} />当前选用</em> : null}
+        </div>
+
+        <label className="videoNameField">
+          视频名称
+          <span>
+            <input
+              value={draft}
+              maxLength={120}
+              onChange={(event) => setDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  event.preventDefault()
+                  void saveName()
+                }
+              }}
+              aria-invalid={Boolean(nameError)}
+            />
+            <button
+              className="iconButton"
+              type="button"
+              onClick={() => void saveName()}
+              disabled={!changed || Boolean(nameError) || saving}
+              title="保存视频名称"
+              aria-label="保存视频名称"
+            >
+              {saving ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
+            </button>
+          </span>
+          {nameError ? <small className="fieldError">{nameError}</small> : null}
+        </label>
+
+        <div className="videoMetadata">
+          <span>{formatSeconds(video.duration)}</span>
+          <span>{video.resolution}</span>
+          <span>{video.aspectRatio}</span>
+          <span title={video.model}>{video.model}</span>
+          {createdLabel ? <span>{createdLabel}</span> : null}
+        </div>
+
+        <div className="videoLibraryActions">
+          <button className="quietButton compact" type="button" onClick={() => onOpenStoryboard(storyboard.id)}>
+            <Film size={15} />查看分镜
+          </button>
+          <a className="primaryButton compact" href={video.downloadUrl} download={downloadName}>
+            <Download size={16} />下载视频
+          </a>
+        </div>
+      </div>
+    </article>
   )
 }
 

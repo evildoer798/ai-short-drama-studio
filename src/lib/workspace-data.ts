@@ -1,6 +1,6 @@
 import { AssetType } from '@prisma/client'
 import { prisma } from './db'
-import { assetImageUrl, mediaDownloadUrl } from './assets'
+import { assetImageUrl } from './assets'
 import { getProjectStoryboards } from './storyboards'
 import { visualStyleOptions } from './visual-styles'
 
@@ -32,8 +32,6 @@ export async function getWorkspaceData(userId: string, input?: {
       activeProjectId: null,
       assets: [],
       storyboards: [],
-      renders: [],
-      latestRenderTask: null,
       styleOptions: visualStyleOptions(),
     }
   }
@@ -77,19 +75,7 @@ export async function getWorkspaceData(userId: string, input?: {
     orderBy: { updatedAt: 'desc' },
   })
 
-  const [storyboards, renders, latestRenderTask] = await Promise.all([
-    getProjectStoryboards(activeProjectId),
-    prisma.projectRender.findMany({
-      where: { projectId: activeProjectId },
-      include: { media: true },
-      orderBy: { createdAt: 'desc' },
-    }),
-    prisma.generationTask.findFirst({
-      where: { projectId: activeProjectId, type: 'project_render' },
-      orderBy: { createdAt: 'desc' },
-    }),
-  ])
-  const selectedRenderId = projects.find((project) => project.id === activeProjectId)?.selectedRenderId
+  const storyboards = await getProjectStoryboards(activeProjectId)
 
   return {
     projects: projects.map((project) => ({
@@ -102,30 +88,6 @@ export async function getWorkspaceData(userId: string, input?: {
     activeProjectId,
     styleOptions: visualStyleOptions(),
     storyboards,
-    renders: renders.map((render) => ({
-      id: render.id,
-      mediaId: render.mediaId,
-      title: render.title,
-      url: assetImageUrl(render.mediaId),
-      downloadUrl: mediaDownloadUrl(render.mediaId),
-      duration: render.duration,
-      aspectRatio: render.aspectRatio === '9:16' ? '9:16' as const : '16:9' as const,
-      clipCount: render.clipCount,
-      sourceVideoIds: render.sourceVideoIds,
-      isSelected: render.id === selectedRenderId,
-      createdAt: render.createdAt.toISOString(),
-    })),
-    latestRenderTask: latestRenderTask
-      ? {
-        id: latestRenderTask.id,
-        type: latestRenderTask.type,
-        status: latestRenderTask.status,
-        progress: latestRenderTask.progress,
-        error: latestRenderTask.error,
-        projectId: latestRenderTask.projectId,
-        createdAt: latestRenderTask.createdAt.toISOString(),
-      }
-      : null,
     assets: assets.map((asset) => ({
       id: asset.id,
       projectId: asset.projectId,

@@ -2704,6 +2704,308 @@ textarea:focus {
   font-size: 11px;
 }
 
+.videoLibraryWorkspace {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  background: var(--canvas);
+  padding: 18px;
+}
+
+.videoLibraryHeader {
+  position: sticky;
+  z-index: var(--z-sticky);
+  top: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  border-bottom: 1px solid var(--line);
+  background: var(--canvas);
+  padding: 0 0 14px;
+  margin-bottom: 14px;
+}
+
+.videoLibraryHeader > div,
+.videoLibraryHeader > div > span,
+.videoSourceHeading > span {
+  min-width: 0;
+  display: flex;
+}
+
+.videoLibraryHeader > div {
+  align-items: flex-start;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.videoLibraryHeader > div > span {
+  align-items: center;
+  gap: 8px;
+}
+
+.videoLibraryHeader strong {
+  font-size: 16px;
+}
+
+.videoLibraryHeader small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.videoLibrarySearch {
+  position: relative;
+  width: min(380px, 44vw);
+  display: block;
+}
+
+.videoLibrarySearch > svg {
+  position: absolute;
+  z-index: 1;
+  left: 11px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--muted);
+  pointer-events: none;
+}
+
+.videoLibrarySearch input {
+  padding-left: 35px;
+  padding-right: 38px;
+}
+
+.videoLibrarySearch button {
+  position: absolute;
+  right: 4px;
+  top: 4px;
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+}
+
+.videoEpisodeGroups {
+  max-width: 1440px;
+  display: grid;
+  gap: 12px;
+  margin: 0 auto;
+}
+
+.videoEpisodeGroup {
+  border-top: 2px solid var(--ink);
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.videoEpisodeGroup > summary {
+  min-height: 56px;
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 14px;
+  list-style: none;
+}
+
+.videoEpisodeGroup > summary::-webkit-details-marker {
+  display: none;
+}
+
+.videoEpisodeGroup > summary > svg {
+  color: var(--muted);
+  transition: transform 180ms ease;
+}
+
+.videoEpisodeGroup[open] > summary > svg {
+  transform: rotate(90deg);
+}
+
+.videoEpisodeGroup > summary > span {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.videoEpisodeGroup > summary strong,
+.videoEpisodeGroup > summary small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.videoEpisodeGroup > summary strong {
+  font-size: 13px;
+}
+
+.videoEpisodeGroup > summary small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.videoEpisodeGroup > summary > b {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.videoLibraryList {
+  border-top: 1px solid var(--line);
+}
+
+.videoLibraryItem {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(260px, 420px) minmax(0, 1fr);
+  align-items: start;
+  gap: 16px;
+  padding: 16px 14px;
+}
+
+.videoLibraryItem + .videoLibraryItem {
+  border-top: 1px solid var(--line);
+}
+
+.videoLibraryPreview {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  background: oklch(0.18 0.02 220);
+}
+
+.videoLibraryPreview video {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
+}
+
+.videoLibraryPreview.portrait video {
+  width: auto;
+  max-width: 100%;
+}
+
+.videoLibraryDetails {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 13px;
+}
+
+.videoSourceHeading {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.videoSourceHeading > span {
+  align-items: flex-start;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.videoSourceHeading strong,
+.videoSourceHeading small {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.videoSourceHeading strong {
+  font-size: 13px;
+}
+
+.videoSourceHeading small,
+.videoMetadata {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.videoSourceHeading em {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--accent-strong);
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 700;
+}
+
+.videoNameField > span {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 40px;
+  gap: 7px;
+}
+
+.videoNameField .fieldError {
+  color: var(--danger);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.videoMetadata {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 0;
+}
+
+.videoMetadata span {
+  min-width: 0;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.videoMetadata span + span::before {
+  content: "·";
+  padding: 0 7px;
+  color: var(--line-strong);
+}
+
+.videoLibraryActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.videoLibraryActions .primaryButton,
+.videoLibraryActions .quietButton {
+  text-decoration: none;
+}
+
+.videoLibraryEmpty {
+  min-height: 340px;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 10px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.videoLibraryEmpty.compact {
+  min-height: 220px;
+}
+
+.videoLibraryEmpty strong {
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.videoLibraryEmpty > span {
+  max-width: 48ch;
+  font-size: 12px;
+}
+
 .jenniferDock {
   position: fixed;
   z-index: var(--z-assistant);
@@ -4138,6 +4440,51 @@ textarea:focus {
   .toast {
     left: 10px;
     bottom: 78px;
+  }
+}
+
+@media (max-width: 900px) {
+  .videoLibraryItem {
+    grid-template-columns: 1fr;
+  }
+
+  .videoLibraryPreview {
+    max-width: 620px;
+  }
+}
+
+@media (max-width: 640px) {
+  .videoLibraryWorkspace {
+    padding: 10px;
+  }
+
+  .videoLibraryHeader {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .videoLibrarySearch {
+    width: 100%;
+  }
+
+  .videoEpisodeGroup > summary {
+    padding-inline: 10px;
+  }
+
+  .videoLibraryItem {
+    gap: 12px;
+    padding: 12px 10px;
+  }
+
+  .videoSourceHeading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .videoLibraryActions > * {
+    flex: 1;
   }
 }
 

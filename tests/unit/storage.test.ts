@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
   attachmentContentDisposition,
-  buildProjectRenderStorageKey,
   buildStorageKey,
   extensionForMime,
 } from '@/lib/storage'
@@ -22,16 +21,10 @@ describe('storage helpers', () => {
 
     expect(key).toMatch(/^projects\/project_1\/assets\/asset_1\/.+\.png$/)
   })
-
-  it('builds mp4 keys for project renders', () => {
-    const key = buildProjectRenderStorageKey({ projectId: 'project_1', mimeType: 'video/mp4' })
-    expect(key).toMatch(/^projects\/project_1\/renders\/.+\.mp4$/)
-  })
-
   it('builds a safe UTF-8 attachment filename', () => {
-    const value = attachmentContentDisposition('Demo 项目成片.mp4')
+    const value = attachmentContentDisposition('Demo 分镜视频.mp4')
     expect(value).toContain('attachment;')
     expect(value).toContain('filename="Demo ____.mp4"')
-    expect(value).toContain("filename*=UTF-8''Demo%20%E9%A1%B9%E7%9B%AE%E6%88%90%E7%89%87.mp4")
+    expect(value).toContain("filename*=UTF-8''Demo%20%E5%88%86%E9%95%9C%E8%A7%86%E9%A2%91.mp4")
   })
 })
