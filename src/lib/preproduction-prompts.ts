@@ -739,28 +739,47 @@ function normalizedScriptSceneName(value: string) {
 
 export function extractScriptSceneLocations(script: string): ScriptSceneLocation[] {
   const source = script.replace(/\r\n/g, '\n')
-  const headingPattern = /^(?:#{1,3}\s*)?(?:场次|场景)[^\n｜|]{0,24}[｜|]\s*([^｜|\n]+)[｜|]\s*([^｜|\n]+)[｜|]\s*([^\n]+)$/gmu
-  const matches = [...source.matchAll(headingPattern)]
+  const pipeHeadingPattern = /^(?:#{1,3}\s*)?(?:场次|场景)[^\n｜|]{0,24}[｜|]\s*([^｜|\n]+)[｜|]\s*([^｜|\n]+)[｜|]\s*([^\n]+)$/gmu
+  const bracketHeadingPattern = /^(?:#{1,3}\s*)?[【[]\s*(?:场次|场景)\s*[^】\]\n]*[】\]]\s*([^\n]+)$/gmu
+  const colonHeadingPattern = /^(?:#{1,3}\s*)?(?:场次|场景)\s*[^：:\n]{0,16}[：:]\s*([^\n]+)$/gmu
+  const headings = [
+    ...[...source.matchAll(pipeHeadingPattern)].map((match) => ({
+      index: match.index || 0,
+      raw: match[0],
+      name: match[3],
+      context: `${match[1].trim()}，${match[2].trim()}`,
+    })),
+    ...[...source.matchAll(bracketHeadingPattern)].map((match) => ({
+      index: match.index || 0,
+      raw: match[0],
+      name: match[1],
+      context: match[1].trim(),
+    })),
+    ...[...source.matchAll(colonHeadingPattern)].map((match) => ({
+      index: match.index || 0,
+      raw: match[0],
+      name: match[1],
+      context: match[1].trim(),
+    })),
+  ].sort((left, right) => left.index - right.index)
   const locations = new Map<string, ScriptSceneLocation>()
 
-  for (let index = 0; index < matches.length; index++) {
-    const match = matches[index]
-    const time = match[1].trim()
-    const spaceType = match[2].trim()
-    let name = match[3]
+  for (let index = 0; index < headings.length; index++) {
+    const heading = headings[index]
+    let name = heading.name
       .replace(/^[【\[]|[】\]]$/g, '')
       .replace(/[。；;]+$/g, '')
       .trim()
     if (!name) continue
     if ([...name].length < 4) name = `${name}核心场景`
 
-    const bodyStart = (match.index || 0) + match[0].length
-    const bodyEnd = matches[index + 1]?.index ?? source.length
+    const bodyStart = heading.index + heading.raw.length
+    const bodyEnd = headings[index + 1]?.index ?? source.length
     const sceneExcerpt = source.slice(bodyStart, bodyEnd)
       .replace(/\s+/g, ' ')
       .trim()
       .slice(0, 320)
-    const description = `${time}，${spaceType}。${sceneExcerpt || '空间结构、固定陈设、材质和基础光线严格依据已锁定剧本。'}`
+    const description = `${heading.context}。${sceneExcerpt || '空间结构、固定陈设、材质和基础光线严格依据已锁定剧本。'}`
     const key = normalizedScriptSceneName(name)
     const current = locations.get(key)
     if (!current || description.length > current.description.length) {

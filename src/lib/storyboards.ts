@@ -79,6 +79,13 @@ function assetAliases(asset: MatchableAsset) {
     }
   }
 
+  if (asset.type === AssetType.location) {
+    const locationParts = asset.name.split(/[·•]/u).map((part) => part.trim()).filter(Boolean)
+    if (locationParts[0] && normalizeForMatching(locationParts[0]).length >= 4) {
+      aliases.add(locationParts[0])
+    }
+  }
+
   return [...aliases]
 }
 
@@ -209,9 +216,9 @@ export function matchStoryboardVideoAssets(
     }
   }
 
-  const location = locations[0]
-  const characterLimit = Math.max(0, maximum - (location ? 1 : 0))
-  return [...characters.slice(0, characterLimit), ...(location ? [location] : [])]
+  const characterMatches = characters.slice(0, maximum)
+  const locationLimit = Math.max(0, maximum - characterMatches.length)
+  return [...characterMatches, ...locations.slice(0, locationLimit)]
     .slice(0, maximum)
     .map((match, index) => ({ ...match, referenceOrder: index + 1 }))
 }

@@ -75,6 +75,63 @@ describe('storyboard asset matching', () => {
     expect(matches.find((match) => match.id === 'room')?.reason).toContain('剧本场景一致')
   })
 
+  it('matches multiple explicitly mentioned locations while keeping four references total', () => {
+    const matches = matchStoryboardVideoAssets([
+      {
+        id: 'lin-chen',
+        type: AssetType.character,
+        name: '林晨',
+        description: '青年外卖骑手',
+        tags: [],
+        selectedImageId: 'image-lin',
+      },
+      {
+        id: 'old-chen',
+        type: AssetType.character,
+        name: '老陈',
+        description: '中餐馆老板',
+        tags: [],
+        selectedImageId: 'image-old',
+      },
+      {
+        id: 'restaurant',
+        type: AssetType.location,
+        name: '老陈中餐外·雨夜·凌晨1:17',
+        description: '油腻屋檐与湿路面',
+        tags: [],
+        selectedImageId: 'image-restaurant',
+      },
+      {
+        id: 'bridge',
+        type: AssetType.location,
+        name: '皇后大桥·雨夜',
+        description: '雨夜桥面与哈德逊河',
+        tags: [],
+        selectedImageId: 'image-bridge',
+      },
+      {
+        id: 'mansion',
+        type: AssetType.location,
+        name: '翡翠山庄34号·雨夜',
+        description: '花岗岩外墙与暖黄落地窗',
+        tags: [],
+        selectedImageId: 'image-mansion',
+      },
+    ], {
+      title: '林晨从老陈中餐外出发，骑过皇后大桥，抵达翡翠山庄34号',
+      videoPrompt: '老陈把纸袋递给林晨；林晨随后骑过皇后大桥。',
+      script: '【场次1】老陈中餐外·雨夜·凌晨1:17\n老陈把纸袋递给林晨。\n【场次2】皇后大桥·雨夜\n林晨骑车过桥。\n【场次3】翡翠山庄34号·雨夜\n林晨抵达门前。',
+    })
+
+    expect(matches.map((match) => match.id)).toEqual([
+      'lin-chen',
+      'old-chen',
+      'restaurant',
+      'bridge',
+    ])
+    expect(matches).toHaveLength(4)
+  })
+
   it('rejects a location that conflicts with the episode script', () => {
     const matches = matchStoryboardVideoAssets([
       ...assets,

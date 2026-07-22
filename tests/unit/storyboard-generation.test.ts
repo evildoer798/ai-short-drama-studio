@@ -290,6 +290,19 @@ describe('duration-aware storyboard generation', () => {
     expect(anchored.z).toContain('禁止将场景“翡翠山庄别墅客厅”替换为其他地点')
   })
 
+  it('preserves an explicit model-produced location when a plain script has no scene headings yet', () => {
+    const [anchored] = enforceStoryboardLocationAssets([
+      shot('林晨推开仓库铁门。', {
+        n: '凌晨｜唐人街货运仓库',
+        e: '水泥地面潮湿，卷帘门半开',
+      }),
+    ], [])
+
+    expect(anchored.n).toBe('凌晨｜唐人街货运仓库')
+    expect(anchored.e).toContain('卷帘门半开')
+    expect(anchored.e).not.toContain('核心场景')
+  })
+
   it('selects the exact scene asset when an episode contains multiple locations', () => {
     const [anchored] = enforceStoryboardLocationAssets([
       shot('陈蕊：哦。', { n: '深夜｜耶鲁学生宿舍卧室' }),

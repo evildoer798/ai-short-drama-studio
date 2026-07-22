@@ -2420,7 +2420,9 @@ export function enforceStoryboardLocationAssets(
   shots: CompactShotInput[],
   locations: StoryboardLocationAsset[],
 ) {
-  if (locations.length === 0) throw new Error('STORYBOARD_LOCATION_ASSET_MISSING: 当前剧本段没有可用场景资产')
+  if (locations.length === 0) {
+    return shots.map(normalizeCompactShot)
+  }
   const matchableLocations = locations.map((location, index) => ({
     id: `location-${index}`,
     type: AssetType.location,
@@ -3006,12 +3008,7 @@ async function processStoryboardGeneration(task: {
       12,
     )
     const extractedScriptLocations = extractScriptSceneLocations(episode.content)
-    const scriptLocations = extractedScriptLocations.length > 0
-      ? extractedScriptLocations
-      : [{
-          name: `第${episode.episodeNumber}集核心场景`,
-          description: `依据第 ${episode.episodeNumber} 集已锁定剧本建立的标准场景，后续资产规划必须逐字复用名称和固定环境事实。`,
-        }]
+    const scriptLocations = extractedScriptLocations
     const scriptedLocationAssets = scriptLocations.map((location, index) => ({
       id: `script-location-${episode.id}-${index}`,
       type: AssetType.location,

@@ -331,6 +331,31 @@ describe('preproduction prompt rules', () => {
     expect(prompt).toContain('后续资产规划必须复用的唯一名称')
   })
 
+  it('recognizes bracketed scene headings used by uploaded short-drama scripts', () => {
+    const script = [
+      '【第1集】',
+      '',
+      '【场次1】老陈中餐外·雨夜·凌晨1:17',
+      '纽约秋雨阴冷，屋檐下停着一辆电动车。',
+      '',
+      '【场次2】皇后大桥·雨夜',
+      '哈德逊河在桥下翻着黑色浪花。',
+      '',
+      '【场次3】翡翠山庄34号·雨夜',
+      '花岗岩外墙，落地窗透出暖黄色光。',
+    ].join('\n')
+
+    const locations = extractScriptSceneLocations(script)
+
+    expect(locations.map((location) => location.name)).toEqual([
+      '老陈中餐外·雨夜·凌晨1:17',
+      '皇后大桥·雨夜',
+      '翡翠山庄34号·雨夜',
+    ])
+    expect(locations[0].description).toContain('纽约秋雨阴冷')
+    expect(locations[0].description).not.toContain('皇后大桥')
+  })
+
   it('builds small API-only inventory prompts for one asset type at a time', () => {
     const prompt = buildAssetInventoryPrompt({
       script: '夜晚，苏文菁在别墅客厅拿起红酒杯。',
