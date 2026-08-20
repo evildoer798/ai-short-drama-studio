@@ -103,7 +103,7 @@ try {
     'docker compose --env-file .env.production -f docker-compose.production.yml -p imaideo up -d --no-build --force-recreate --no-deps web',
     'health_attempt=0; until health_status=$(docker inspect --format={{.State.Health.Status}} imaideo-web-1 2>/dev/null || true); [ "$health_status" = "healthy" ]; do health_attempt=$((health_attempt + 1)); if [ "$health_attempt" -ge 120 ]; then docker inspect --format="web status={{.State.Status}} health={{.State.Health.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}" imaideo-web-1 || true; docker logs --tail 80 imaideo-web-1 2>&1 || true; free -m || true; exit 1; fi; sleep 3; done',
     'docker compose --env-file .env.production -f docker-compose.production.yml -p imaideo up -d --no-build --force-recreate --no-deps worker',
-    "if docker ps --format '{{.Names}}' | grep -qx nginx-app; then docker network connect imaideo_default nginx-app 2>/dev/null || true; docker cp scripts/configure-nginx-proxy-manager.cjs nginx-app:/tmp/configure-imaideo-proxy.cjs; docker exec -e NPM_DOMAIN='$Domain' nginx-app node /tmp/configure-imaideo-proxy.cjs; fi",
+    'docker compose --env-file .env.production -f docker-compose.production.yml -p imaideo --profile direct up -d --no-build --force-recreate --no-deps caddy',
     'docker compose --env-file .env.production -f docker-compose.production.yml -p imaideo ps',
     "ln -sfn '$remoteRelease' '$remoteRoot/current'",
     "rm -f '/tmp/$archiveName' '/tmp/$imageArchiveName' /tmp/imaideo.env.production",
