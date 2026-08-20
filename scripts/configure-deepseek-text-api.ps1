@@ -117,7 +117,7 @@ try {
     $cangyuanKeys = Get-NumberedKeys $current 'TEXT_FALLBACK_API_KEY'
     if ($cangyuanKeys.Count -eq 0 -and $current['TEXT_FALLBACK_API_KEY']) { $cangyuanKeys.Add(([string]$current['TEXT_FALLBACK_API_KEY']).Trim()) }
   } else {
-    $cangyuanBase = if ($currentPrimaryBase -match 'cangyuansuanli') { $currentPrimaryBase } else { 'https://ai.cangyuansuanli.cn' }
+    $cangyuanBase = if ($currentPrimaryBase -match 'cangyuansuanli') { $currentPrimaryBase } else { 'http://direct-api.cangyuansuanli.cn' }
     $cangyuanModel = if ($currentPrimaryBase -match 'cangyuansuanli') { [string]$current['TEXT_MODEL'] } else { 'gpt-5.5' }
     $cangyuanMode = if ($currentPrimaryBase -match 'cangyuansuanli') { [string]$current['TEXT_API_MODE'] } else { 'chat_completions' }
     $cangyuanReasoning = if ($currentPrimaryBase -match 'cangyuansuanli') { [string]$current['TEXT_REASONING_EFFORT'] } else { 'low' }

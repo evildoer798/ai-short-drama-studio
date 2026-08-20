@@ -1,5 +1,5 @@
 param(
-  [string]$BaseUrl = "https://ai.cangyuansuanli.cn",
+  [string]$BaseUrl = "http://direct-api.cangyuansuanli.cn",
   [string]$Model = "",
   [switch]$RestartDockerServices,
   [switch]$SkipConnectionTest

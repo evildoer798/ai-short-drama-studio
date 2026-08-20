@@ -18,7 +18,8 @@ if ([string]::IsNullOrWhiteSpace($apiKey)) {
 }
 
 $settings = [ordered]@{
-  VIDEO_API_BASE_URL = "https://ai.cangyuansuanli.cn"
+  VIDEO_API_BASE_URL = "http://direct-api.cangyuansuanli.cn"
+  VIDEO_DIRECT_API_BASE_URL = "http://direct-api.cangyuansuanli.cn"
   VIDEO_API_KEY = $apiKey
   VIDEO_API_MODE = "auto"
   VIDEO_MODEL = "seedance-2.0-mini-8s"

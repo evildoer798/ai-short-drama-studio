@@ -320,8 +320,9 @@ PostgreSQL 只保存对象 Key、媒体类型、版本关系和业务关联。�
 
 1. 从模板创建 `.env.production`。
 2. 填写生产数据库、Redis、对象存储、模型和管理员配置。
-3. 确保服务器已安装 Docker，并开放 Web 所需端口。
-4. 执行部署脚本：
+3. 确保本机已安装并启动 Docker Desktop；服务器只负责运行预构建镜像。
+4. 确保服务器已安装 Docker，并开放 Web 所需端口。
+5. 在本机完成测试后执行部署脚本：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\deploy-aliyun.ps1 `
@@ -329,7 +330,11 @@ powershell -ExecutionPolicy Bypass -File .\scripts\deploy-aliyun.ps1 `
   -Domain "<your-domain>"
 ```
 
-部署脚本会创建时间戳 Release、构建容器、执行数据库同步、健康检查并切换 `current` 软链接。生产环境文件不会进入部署压缩包的 Git 历史。
+部署脚本会在本机完成 Linux `runtime` 镜像构建，将预构建镜像和时间戳 Release 上传到服务器。服务器只执行 `docker load`、`docker compose up --no-build`、数据库同步、健康检查和 `current` 软链接切换。
+
+**生产服务器禁止执行 `docker build`、`docker compose build` 或任何带 `--build` 的启动命令。** 如果本机 Docker 不可用，部署脚本会在连接服务器前停止，不会回退到服务器构建。生产环境文件不会进入部署压缩包的 Git 历史。
+
+这条限制来自 2026-07-26 的部署事故：2 核 2GB 服务器同时运行生产服务和 Next.js/Docker 构建时，Swap 接近耗尽并导致 HTTPS、SSH 与 Docker API 超时。该服务器只作为运行节点使用，不再承担镜像构建。
 
 ### 生产服务
 

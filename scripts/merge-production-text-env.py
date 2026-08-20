@@ -42,6 +42,24 @@ def main():
     target_path = os.path.abspath(sys.argv[2])
     source_values = parse_env(source_path)
     text_values = {key: value for key, value in source_values.items() if key.startswith('TEXT_')}
+    video_pool_values = {
+        key: value
+        for key, value in source_values.items()
+        if key.startswith('VIDEO_API_KEY_')
+    }
+    image_pool_values = {
+        key: value
+        for key, value in source_values.items()
+        if (
+            key.startswith('OPENAI_COMPAT_API_KEY_')
+            or key.startswith('OPENAI_COMPAT_IMAGE_MODEL_')
+        )
+    }
+    image_runtime_values = {
+        key: source_values[key]
+        for key in ('IMAGE_MODEL',)
+        if key in source_values
+    }
     missing = sorted(REQUIRED_KEYS - text_values.keys())
     if missing:
         raise SystemExit(f'source text configuration is incomplete: {", ".join(missing)}')
@@ -55,13 +73,25 @@ def main():
         handle.write('\n'.join(target_lines) + '\n')
     os.chmod(backup_path, stat.S_IRUSR | stat.S_IWUSR)
 
-    remaining = dict(text_values)
+    synchronized_values = {
+        **text_values,
+        **video_pool_values,
+        **image_pool_values,
+        **image_runtime_values,
+    }
+    remaining = dict(synchronized_values)
     output = []
     for line in target_lines:
         stripped = line.strip()
         if stripped and not stripped.startswith('#') and '=' in line:
             key = line.split('=', 1)[0].strip()
-            if key.startswith('TEXT_'):
+            if (
+                key.startswith('TEXT_')
+                or key.startswith('VIDEO_API_KEY_')
+                or key.startswith('OPENAI_COMPAT_API_KEY_')
+                or key.startswith('OPENAI_COMPAT_IMAGE_MODEL_')
+                or key in image_runtime_values
+            ):
                 if key in remaining:
                     output.append(f'{key}={quote_env(remaining.pop(key))}')
                 continue
@@ -70,7 +100,7 @@ def main():
     if remaining:
         if output and output[-1] != '':
             output.append('')
-        output.append('# Text provider failover configuration')
+        output.append('# Text and video provider failover configuration')
         for key in sorted(remaining):
             output.append(f'{key}={quote_env(remaining[key])}')
 
@@ -88,10 +118,16 @@ def main():
     primary_slots = sum(bool(text_values.get(f'TEXT_API_KEY_{index}')) for index in range(1, 11))
     fallback_slots = sum(bool(text_values.get(f'TEXT_FALLBACK_API_KEY_{index}')) for index in range(1, 11))
     tertiary_slots = sum(bool(text_values.get(f'TEXT_TERTIARY_API_KEY_{index}')) for index in range(1, 11))
+    video_slots = 1 + sum(bool(video_pool_values.get(f'VIDEO_API_KEY_{index}')) for index in range(2, 11))
+    image_slots = 1 + sum(
+        bool(image_pool_values.get(f'OPENAI_COMPAT_API_KEY_{index}'))
+        for index in range(2, 11)
+    )
     print(
         'TEXT_ENV_SYNC_OK '
         f'keys={len(text_values)} primary_slots={primary_slots} '
-        f'fallback_slots={fallback_slots} tertiary_slots={tertiary_slots}'
+        f'fallback_slots={fallback_slots} tertiary_slots={tertiary_slots} '
+        f'video_slots={video_slots} image_slots={image_slots}'
     )
 
 

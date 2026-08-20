@@ -14,7 +14,7 @@ export const saveNovelSchema = z.object({
 
 export const adaptScriptSchema = z.object({
   targetEpisodeCount: z.coerce.number().int().min(1).max(60).default(15),
-  episodeMinutes: z.coerce.number().min(0.5).max(10).multipleOf(0.5).default(1.5),
+  episodeMinutes: z.coerce.number().min(0.5).max(3).multipleOf(0.5).default(1.5),
   replaceExisting: z.boolean().default(false),
 })
 
@@ -96,7 +96,7 @@ function adaptationSettings(
       ? Math.max(1, Math.min(60, Math.round(requestedEpisodes)))
       : Math.max(1, Math.min(60, episodeCount || 15)),
     episodeMinutes: Number.isFinite(requestedMinutes)
-      ? Math.max(0.5, Math.min(10, Math.round(requestedMinutes * 2) / 2))
+      ? Math.max(0.5, Math.min(3, Math.round(requestedMinutes * 2) / 2))
       : 1.5,
     source: task ? 'task' as const : episodeCount > 0 ? 'episodes' as const : 'default' as const,
   }

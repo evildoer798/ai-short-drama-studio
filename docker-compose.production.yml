@@ -97,7 +97,11 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: "6379"
       TEXT_WORKER_CONCURRENCY: "1"
-    command: npx tsx src/lib/worker/index.ts
+      # 视频生成主要等待远程 API；并发 3 可同时生成三个普通分镜。
+      VIDEO_WORKER_CONCURRENCY: "3"
+      CANVAS_VIDEO_WORKER_CONCURRENCY: "1"
+      DIRECTOR_VIDEO_WORKER_CONCURRENCY: "1"
+    command: sh -c "npx prisma generate && npx tsx src/lib/worker/index.ts"
     depends_on:
       web:
         condition: service_healthy

@@ -244,3 +244,38 @@ export function scriptAuditPassed(audit: ScriptQualityAudit) {
     && audit.lengthIssues.length === 0
     && audit.firstEpisodeColdOpenIssue === null
 }
+
+export function scriptQualityAuditScore(audit: ScriptQualityAudit) {
+  const lengthDeviation = audit.lengthIssues.reduce((total, issue) => {
+    const distance = issue.characterCount < issue.minimum
+      ? issue.minimum - issue.characterCount
+      : issue.characterCount - issue.maximum
+    const baseline = Math.max(1, issue.minimum)
+    return total + Math.min(50, Math.ceil((distance / baseline) * 20))
+  }, 0)
+  return audit.duplicatePairs.length * 1_000
+    + (audit.firstEpisodeColdOpenIssue ? 500 : 0)
+    + audit.missingHooks.length * 100
+    + audit.lengthIssues.length * 10
+    + lengthDeviation
+}
+
+export function scriptQualityAuditWarnings(audit: ScriptQualityAudit) {
+  const warnings: string[] = []
+  if (audit.duplicatePairs.length > 0) {
+    warnings.push(`跨集重复：${audit.duplicatePairs
+      .slice(0, 6)
+      .map((item) => `${item.leftEpisode}-${item.rightEpisode}`)
+      .join('、')}`)
+  }
+  if (audit.missingHooks.length > 0) {
+    warnings.push(`结尾钩子待确认：第 ${audit.missingHooks.map((item) => item.episodeNumber).join('、')} 集`)
+  }
+  if (audit.lengthIssues.length > 0) {
+    warnings.push(`篇幅待确认：第 ${audit.lengthIssues.map((item) => item.episodeNumber).join('、')} 集`)
+  }
+  if (audit.firstEpisodeColdOpenIssue) {
+    warnings.push(`第一集开场待确认：${audit.firstEpisodeColdOpenIssue}`)
+  }
+  return warnings
+}

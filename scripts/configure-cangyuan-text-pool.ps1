@@ -1,5 +1,5 @@
 param(
-  [string]$BaseUrl = "https://ai.cangyuansuanli.cn",
+  [string]$BaseUrl = "http://direct-api.cangyuansuanli.cn",
   [string]$Model = "gpt-5.5",
   [ValidateRange(1, 10)]
   [int]$KeyCount = 10

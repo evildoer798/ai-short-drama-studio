@@ -14,6 +14,13 @@ export type GenerateTextInput = {
   disableThinking?: boolean
   timeoutMs?: number
   maxAttempts?: number
+  onUsage?: (usage: TextUsage) => void | Promise<void>
+}
+
+export type TextUsage = {
+  inputTokens: number
+  outputTokens: number
+  cachedInputTokens?: number
 }
 
 class TextApiError extends Error {
@@ -137,6 +144,47 @@ function parseResponsesSseEvents(raw: string) {
   })
 }
 
+export function extractTextUsage(payload: unknown): TextUsage | null {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null
+  const usage = (payload as { usage?: unknown }).usage
+  if (!usage || typeof usage !== 'object' || Array.isArray(usage)) return null
+  const record = usage as Record<string, unknown>
+  const inputTokens = Number(record.prompt_tokens ?? record.input_tokens ?? 0)
+  const outputTokens = Number(record.completion_tokens ?? record.output_tokens ?? 0)
+  const details = (record.prompt_tokens_details ?? record.input_tokens_details)
+  const cachedInputTokens = details && typeof details === 'object' && !Array.isArray(details)
+    ? Number((details as Record<string, unknown>).cached_tokens ?? 0)
+    : 0
+  if (!Number.isFinite(inputTokens) || !Number.isFinite(outputTokens)) return null
+  if (inputTokens <= 0 && outputTokens <= 0) return null
+  return {
+    inputTokens: Math.max(0, Math.round(inputTokens)),
+    outputTokens: Math.max(0, Math.round(outputTokens)),
+    ...(Number.isFinite(cachedInputTokens) && cachedInputTokens > 0
+      ? { cachedInputTokens: Math.max(0, Math.round(cachedInputTokens)) }
+      : {}),
+  }
+}
+
+function extractResponsesSseUsage(raw: string) {
+  for (const event of parseResponsesSseEvents(raw).reverse()) {
+    if (!event || typeof event !== 'object' || Array.isArray(event)) continue
+    const record = event as { response?: unknown }
+    const usage = extractTextUsage(record.response || event)
+    if (usage) return usage
+  }
+  return null
+}
+
+async function reportUsage(input: GenerateTextInput, usage: TextUsage | null) {
+  if (!usage || !input.onUsage) return
+  try {
+    await input.onUsage(usage)
+  } catch (error) {
+    console.error('TEXT_USAGE_REPORT_FAILED', error)
+  }
+}
+
 export function extractResponsesSseText(raw: string) {
   const deltas: string[] = []
   let finalText = ''
@@ -208,6 +256,7 @@ async function requestChat(input: GenerateTextInput) {
   )
   const text = extractChatCompletionText(parsed.payload)
   if (!text) throw new TextApiError(502, '文本模型返回了空内容')
+  await reportUsage(input, extractTextUsage(parsed.payload))
   return text
 }
 
@@ -244,6 +293,10 @@ async function requestResponses(input: GenerateTextInput) {
     ? extractResponsesText(parsed.payload)
     : extractResponsesSseText(parsed.raw)
   if (!text) throw new TextApiError(502, '文本模型返回了空内容')
+  await reportUsage(
+    input,
+    parsed.payload ? extractTextUsage(parsed.payload) : extractResponsesSseUsage(parsed.raw),
+  )
   return text
 }
 

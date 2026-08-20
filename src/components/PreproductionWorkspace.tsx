@@ -20,8 +20,10 @@ import {
   MessageSquarePlus,
   PanelLeftClose,
   PanelLeftOpen,
+  Plus,
   RefreshCw,
   Save,
+  Search,
   Sparkles,
   Trash2,
   Unlock,
@@ -32,7 +34,15 @@ import {
 import { decodeTextFile, titleFromTextFile } from '@/lib/text-file'
 import { calculateSceneConsistency } from '@/lib/scene-consistency'
 import { readableTextTaskError } from '@/lib/text-task-error'
+import {
+  MAX_EPISODE_MINUTES,
+  recommendAdaptationPlan,
+} from '@/lib/adaptation-recommendation'
 import type { TextProviderLabel } from '@/lib/text-provider-label'
+import {
+  insertStoryboardAssetMention,
+  removeStoryboardAssetMention,
+} from '@/lib/storyboard-asset-mentions'
 
 type AssetType = 'character' | 'location' | 'prop'
 type TaskStatus = 'queued' | 'processing' | 'completed' | 'failed'
@@ -49,7 +59,7 @@ type TextTask = {
   createdAt: string
   updatedAt: string
   detail: {
-    phase: 'preparing' | 'generating' | 'retrying' | 'saving' | 'finalizing'
+    phase: 'preparing' | 'generating' | 'retrying' | 'reviewing' | 'repairing' | 'verifying' | 'saving' | 'finalizing'
     completedEpisodes: number
     totalEpisodes: number
     completedSegments: number
@@ -59,6 +69,13 @@ type TextTask = {
     segmentParallelism: number
     currentSegment?: number
     currentSegmentTotal?: number
+    reviewRound?: number
+    maximumReviewRounds?: number
+    modifiedShots?: number
+    remainingIssues?: number
+    fatalIssues?: number
+    warning?: string
+    suggestions?: string[]
     activeRoutes: Array<{
       episodeNumber: number
       provider: TextProviderLabel
@@ -114,6 +131,15 @@ type PreproductionData = {
   textModel: string
 }
 
+type SaveNovelResponse = {
+  novel: NonNullable<PreproductionData['novel']>
+  changed: boolean
+}
+
+const NOVEL_SAVE_TIMEOUT_MS = 120_000
+
+const preproductionDataCache = new Map<string, PreproductionData>()
+
 type PlanningAsset = {
   id: string
   type: AssetType
@@ -127,6 +153,7 @@ type PlanningAsset = {
 
 type PlanningStoryboard = {
   id: string
+  updatedAt: string
   title: string
   sceneNumber: number
   episodeId?: string | null
@@ -134,12 +161,23 @@ type PlanningStoryboard = {
   generatedByAI?: boolean
   notes: string | null
   imagePrompt: string | null
+  directorPrompt?: string | null
   videoPrompt: string | null
   duration: number
   aspectRatio: '16:9' | '9:16' | '1:1' | '21:9' | '3:4' | '4:3'
   generateAudio: boolean
   videos: Array<{ id: string }>
-  assets: Array<{ id: string; name: string; type: AssetType; hasSelectedImage: boolean }>
+  assets: Array<{
+    id: string
+    name: string
+    type: AssetType
+    hasSelectedImage: boolean
+    referenceOrder?: number
+    matchReason?: string
+    isManual?: boolean
+    highlightTerms?: string[]
+    imageUrl?: string | null
+  }>
 }
 
 type StoryboardPromptPreview = {
@@ -197,9 +235,23 @@ async function requestJson<T>(url: string, init?: RequestInit, timeoutMs = 30_00
   }
 }
 
+function retryableNovelSaveError(error: unknown) {
+  if (error instanceof TypeError) return true
+  const message = error instanceof Error ? error.message : String(error)
+  return /服务器在 \d+ 秒内没有完整返回数据|请求失败 \((?:408|429|502|503|504)\)/u.test(message)
+}
+
 function taskProgressLabel(task: TextTask) {
-  if (task.status === 'queued') return '等待文本模型'
+  if (task.status === 'queued') return '等待后台任务队列'
   if (task.type === 'script_adaptation') {
+    if (task.detail?.phase === 'reviewing') return '正在复查整套剧本'
+    if (task.detail?.phase === 'repairing') {
+      return `正在根据检查结果返工第 ${task.detail.reviewRound || 1}/${task.detail.maximumReviewRounds || 3} 轮 · 已返工 ${task.detail.modifiedShots || 0} 次 · 剩余 ${task.detail.remainingIssues || 0} 项`
+    }
+    if (task.detail?.phase === 'verifying') {
+      return `正在验收第 ${task.detail.reviewRound || 1}/${task.detail.maximumReviewRounds || 3} 轮剧本 · 剩余 ${task.detail.remainingIssues || 0} 项`
+    }
+    if (task.detail?.phase === 'finalizing') return '正在保存返工后的最佳剧本'
     if (task.progress < 5) return '准备小说内容'
     if (task.progress < 42) return '正在分块梳理原文'
     if (task.progress < 48) return '正在规划分集'
@@ -227,6 +279,13 @@ function taskProgressLabel(task: TextTask) {
     return `${episodes} · ${reason}正在尝试 ${routeLabel || '备用线路'}${attempt}`
   }
   if (task.detail.phase === 'saving') return `${episodes}正在保存镜头`
+  if (task.detail.phase === 'reviewing') return `${episodes}正在对照锁定剧本做整集复查`
+  if (task.detail.phase === 'repairing') {
+    return `${episodes}正在根据复查结果修改第 ${task.detail.reviewRound || 1}/${task.detail.maximumReviewRounds || 3} 轮 · 已修改 ${task.detail.modifiedShots || 0} 镜 · 剩余 ${task.detail.remainingIssues || 0} 项`
+  }
+  if (task.detail.phase === 'verifying') {
+    return `${episodes}正在验收第 ${task.detail.reviewRound || 1}/${task.detail.maximumReviewRounds || 3} 轮修改结果 · 剩余 ${task.detail.remainingIssues || 0} 项`
+  }
   const mode = task.detail.parallelism > 1
     ? `${task.detail.parallelism} 集并行`
     : task.detail.segmentParallelism > 1
@@ -258,8 +317,9 @@ export function PreproductionWorkspace({
   onOpenAssetImages: () => void
   onOpenStoryboardVideos: () => void
 }) {
-  const [data, setData] = useState<PreproductionData | null>(null)
-  const [loading, setLoading] = useState(true)
+  const initialCachedData = projectId ? preproductionDataCache.get(projectId) || null : null
+  const [data, setData] = useState<PreproductionData | null>(initialCachedData)
+  const [loading, setLoading] = useState(!initialCachedData)
   const [loadError, setLoadError] = useState('')
   const [loadHint, setLoadHint] = useState('')
   const loadRequestId = useRef(0)
@@ -267,9 +327,10 @@ export function PreproductionWorkspace({
   async function refreshData() {
     if (!projectId) return
     const requestId = ++loadRequestId.current
+    const cachedData = preproductionDataCache.get(projectId) || null
     setLoadError('')
     setLoadHint('')
-    setLoading((current) => current || !data)
+    setLoading(!cachedData)
     let lastError = '前期制作数据加载失败'
 
     for (let attempt = 1; attempt <= 2; attempt++) {
@@ -277,9 +338,10 @@ export function PreproductionWorkspace({
         const next = await requestJson<PreproductionData>(
           `/api/projects/${projectId}/preproduction`,
           undefined,
-          15_000,
+          attempt === 1 ? 20_000 : 30_000,
         )
         if (requestId !== loadRequestId.current) return
+        preproductionDataCache.set(projectId, next)
         setData(next)
         setLoadError('')
         setLoadHint('')
@@ -296,14 +358,22 @@ export function PreproductionWorkspace({
     }
 
     if (requestId !== loadRequestId.current) return
+    if (cachedData) {
+      setData(cachedData)
+      setLoading(false)
+      setLoadError(lastError)
+      onNotice('网络连接不稳定，已继续显示本次会话中最近读取的数据。', 'error')
+      return
+    }
     setLoading(false)
     setLoadError(lastError)
     onNotice(`${lastError}，请点击重新读取。`, 'error')
   }
 
   useEffect(() => {
-    setLoading(true)
-    setData(null)
+    const cachedData = projectId ? preproductionDataCache.get(projectId) || null : null
+    setLoading(!cachedData)
+    setData(cachedData)
     setLoadError('')
     setLoadHint('')
     void refreshData()
@@ -331,10 +401,15 @@ export function PreproductionWorkspace({
         return previous?.status !== task.status
           && (task.status === 'completed' || task.status === 'failed')
       })
-      setData((current) => current ? {
-        ...current,
-        tasks: current.tasks.map((task) => updates.find((item) => item.id === task.id) || task),
-      } : current)
+      setData((current) => {
+        if (!current) return current
+        const next = {
+          ...current,
+          tasks: current.tasks.map((task) => updates.find((item) => item.id === task.id) || task),
+        }
+        if (projectId) preproductionDataCache.set(projectId, next)
+        return next
+      })
       if (finished) {
         await refreshData()
         await onWorkspaceChanged()
@@ -353,6 +428,18 @@ export function PreproductionWorkspace({
     ? latestRelevantTask
     : null
   const failedTask = latestRelevantTask?.status === 'failed' ? latestRelevantTask : null
+  const completedWarningTask = latestRelevantTask?.status === 'completed' && latestRelevantTask.detail?.warning
+    ? latestRelevantTask
+    : null
+  const failedEpisodeNumbers = failedTask?.type === 'storyboard_generation'
+    ? [...new Set([
+        ...(failedTask.detail?.activeEpisodeNumbers || []),
+        ...(failedTask.detail?.activeRoutes.map((route) => route.episodeNumber) || []),
+      ])].sort((left, right) => left - right)
+    : []
+  const failedTaskTitle = failedEpisodeNumbers.length > 0
+    ? `上一次第 ${failedEpisodeNumbers.join('、')} 集分镜任务未完成`
+    : '上一次任务未完成'
   const lockedCount = data?.episodes.filter((episode) => episode.locked).length || 0
   const unresolvedCommentCount = data?.episodes.reduce(
     (total, episode) => total + episode.comments.filter((comment) => !comment.resolved).length,
@@ -372,8 +459,18 @@ export function PreproductionWorkspace({
     })
   }, [activeTask, assets.length, data?.episodes.length, data?.novel, failedTask, lockedCount, onSummary, storyboards, unresolvedCommentCount])
 
+  function storeData(next: PreproductionData) {
+    if (projectId) preproductionDataCache.set(projectId, next)
+    setData(next)
+  }
+
   function addTask(task: TextTask) {
-    setData((current) => current ? { ...current, tasks: [task, ...current.tasks] } : current)
+    setData((current) => {
+      if (!current) return current
+      const next = { ...current, tasks: [task, ...current.tasks] }
+      if (projectId) preproductionDataCache.set(projectId, next)
+      return next
+    })
   }
 
   if (!data && loading) {
@@ -415,7 +512,27 @@ export function PreproductionWorkspace({
       ) : failedTask ? (
         <div className="textTaskBar failed" role="alert">
           <CircleAlert size={17} />
-          <span><strong>上一次任务未完成</strong><small>{readableTextTaskError(failedTask.error)}</small></span>
+          <span><strong>{failedTaskTitle}</strong><small>{readableTextTaskError(failedTask.error)}</small></span>
+        </div>
+      ) : completedWarningTask ? (
+        <div className="textTaskBar warning" role="status">
+          <CircleAlert size={17} />
+          <span>
+            <strong>{completedWarningTask.type === 'script_adaptation'
+              ? '剧本已返工并保存，可继续下一步'
+              : '分镜已返工并保存，可继续下一步'}</strong>
+            <small>{completedWarningTask.detail?.warning}</small>
+            {completedWarningTask.detail?.suggestions?.length ? (
+              <details className="textTaskSuggestions">
+                <summary>查看修改建议（{completedWarningTask.detail.suggestions.length}）</summary>
+                <ul>
+                  {completedWarningTask.detail.suggestions.map((suggestion) => (
+                    <li key={suggestion}>{suggestion}</li>
+                  ))}
+                </ul>
+              </details>
+            ) : null}
+          </span>
         </div>
       ) : null}
 
@@ -424,7 +541,7 @@ export function PreproductionWorkspace({
           projectId={projectId!}
           data={data}
           taskRunning={Boolean(activeTask)}
-          onData={setData}
+          onData={storeData}
           onTask={addTask}
           onNotice={onNotice}
         />
@@ -444,6 +561,7 @@ export function PreproductionWorkspace({
         <ShotPlanningWorkspace
           projectId={projectId!}
           episodes={data.episodes}
+          assets={assets}
           storyboards={storyboards}
           taskRunning={Boolean(activeTask)}
           onTask={addTask}
@@ -483,6 +601,15 @@ function ScriptWorkspace({
   const [selectedEpisodeId, setSelectedEpisodeId] = useState(data.episodes[0]?.id || '')
   const [busy, setBusy] = useState(false)
   const selectedEpisode = data.episodes.find((episode) => episode.id === selectedEpisodeId) || data.episodes[0] || null
+  const adaptationRecommendation = useMemo(
+    () => recommendAdaptationPlan(novelContent),
+    [novelContent],
+  )
+  const recommendationApplied = Boolean(
+    adaptationRecommendation
+    && episodeCount === adaptationRecommendation.targetEpisodeCount
+    && episodeMinutes === adaptationRecommendation.episodeMinutes,
+  )
 
   useEffect(() => {
     setNovelTitle(data.novel?.title || '')
@@ -509,11 +636,26 @@ function ScriptWorkspace({
       return null
     }
     try {
-      const next = await requestJson<PreproductionData>(`/api/projects/${projectId}/novel`, {
+      const request = () => requestJson<SaveNovelResponse>(`/api/projects/${projectId}/novel`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ title: novelTitle, content: novelContent }),
-      })
+      }, NOVEL_SAVE_TIMEOUT_MS)
+      let saved: SaveNovelResponse
+      try {
+        saved = await request()
+      } catch (error) {
+        if (!retryableNovelSaveError(error)) throw error
+        onNotice('网络连接较慢，正在自动重试保存原文')
+        saved = await request()
+      }
+      const next: PreproductionData = {
+        ...data,
+        novel: saved.novel,
+        episodes: saved.changed
+          ? data.episodes.map((episode) => ({ ...episode, locked: false }))
+          : data.episodes,
+      }
       onData(next)
       if (showSuccess) onNotice('小说原文已保存')
       return next
@@ -528,13 +670,24 @@ function ScriptWorkspace({
     try {
       const saved = await saveNovel(false)
       if (!saved) return
+      const normalizedEpisodeCount = Math.max(1, Math.min(60, Math.round(episodeCount) || 1))
+      const normalizedEpisodeMinutes = Math.max(
+        0.5,
+        Math.min(MAX_EPISODE_MINUTES, Math.round(episodeMinutes * 2) / 2 || 0.5),
+      )
+      setEpisodeCount(normalizedEpisodeCount)
+      setEpisodeMinutes(normalizedEpisodeMinutes)
       const replaceExisting = saved.episodes.length > 0
       if (replaceExisting && !window.confirm('重新改编会替换现有分集剧本和评论。已有分镜不会删除，但会与新剧本脱离。继续吗？')) return
       const payload = await requestJson<{ task: TextTask }>(`/api/projects/${projectId}/adapt-script`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ targetEpisodeCount: episodeCount, episodeMinutes, replaceExisting }),
-      })
+        body: JSON.stringify({
+          targetEpisodeCount: normalizedEpisodeCount,
+          episodeMinutes: normalizedEpisodeMinutes,
+          replaceExisting,
+        }),
+      }, 60_000)
       onTask(payload.task)
       onNotice('导演改编任务已提交')
     } catch (error) {
@@ -644,13 +797,52 @@ function ScriptWorkspace({
         <div className="adaptControls">
           <label>
             目标集数
-            <input type="number" min="1" max="60" value={episodeCount} disabled={taskRunning} onChange={(event) => setEpisodeCount(Number(event.target.value))} />
+            <input
+              type="number"
+              min="1"
+              max="60"
+              value={episodeCount}
+              disabled={taskRunning}
+              onChange={(event) => setEpisodeCount(Math.max(1, Math.min(60, Number(event.target.value) || 1)))}
+            />
           </label>
           <label>
             每集分钟
-            <input type="number" min="0.5" max="10" step="0.5" value={episodeMinutes} disabled={taskRunning} onChange={(event) => setEpisodeMinutes(Number(event.target.value))} />
+            <input
+              type="number"
+              min="0.5"
+              max={MAX_EPISODE_MINUTES}
+              step="0.5"
+              value={episodeMinutes}
+              disabled={taskRunning}
+              onChange={(event) => setEpisodeMinutes(Math.max(
+                0.5,
+                Math.min(MAX_EPISODE_MINUTES, Number(event.target.value) || 0.5),
+              ))}
+            />
           </label>
         </div>
+        {adaptationRecommendation ? (
+          <div className={`adaptRecommendation ${adaptationRecommendation.capacityLimited ? 'warning' : ''}`}>
+            <span>
+              <strong>推荐 {adaptationRecommendation.targetEpisodeCount} 集 · 每集 {adaptationRecommendation.episodeMinutes} 分钟</strong>
+              <small>{adaptationRecommendation.reason}</small>
+            </span>
+            <button
+              className="quietButton"
+              type="button"
+              disabled={taskRunning || recommendationApplied}
+              onClick={() => {
+                setEpisodeCount(adaptationRecommendation.targetEpisodeCount)
+                setEpisodeMinutes(adaptationRecommendation.episodeMinutes)
+                onNotice(`已采用推荐：${adaptationRecommendation.targetEpisodeCount} 集，每集 ${adaptationRecommendation.episodeMinutes} 分钟`)
+              }}
+            >
+              {recommendationApplied ? <Check size={15} /> : <Sparkles size={15} />}
+              {recommendationApplied ? '已采用' : '采用推荐'}
+            </button>
+          </div>
+        ) : null}
         <button
           className="primaryButton"
           data-assistant-target="adapt-script"
@@ -1190,6 +1382,7 @@ function AssetPromptEditor({
 function ShotPlanningWorkspace({
   projectId,
   episodes,
+  assets,
   storyboards,
   taskRunning,
   onTask,
@@ -1200,6 +1393,7 @@ function ShotPlanningWorkspace({
 }: {
   projectId: string
   episodes: ScriptEpisode[]
+  assets: PlanningAsset[]
   storyboards: PlanningStoryboard[]
   taskRunning: boolean
   onTask: (task: TextTask) => void
@@ -1363,7 +1557,14 @@ function ShotPlanningWorkspace({
             onNotice={onNotice}
           />
         ) : selected ? (
-          <StoryboardPromptEditor key={`${selected.id}-${selected.videoPrompt?.length || 0}`} storyboard={selected} onChanged={onChanged} onNotice={onNotice} onOpenVideos={onOpenVideos} />
+          <StoryboardPromptEditor
+            key={`${selected.id}-${selected.directorPrompt?.length || 0}-${selected.videoPrompt?.length || 0}`}
+            storyboard={selected}
+            projectAssets={assets}
+            onChanged={onChanged}
+            onNotice={onNotice}
+            onOpenVideos={onOpenVideos}
+          />
         ) : (
           <div className="planningEmpty">
             <Film size={36} />
@@ -1434,23 +1635,40 @@ function StoryboardPromptPreviewPanel({
 
 function StoryboardPromptEditor({
   storyboard,
+  projectAssets,
   onChanged,
   onNotice,
   onOpenVideos,
 }: {
   storyboard: PlanningStoryboard
+  projectAssets: PlanningAsset[]
   onChanged: () => Promise<void>
   onNotice: (text: string, tone?: NoticeTone) => void
   onOpenVideos: () => void
 }) {
   const [draft, setDraft] = useState({
     title: storyboard.title,
-    notes: storyboard.notes || '',
+    notes: storyboard.notes?.split(/\r?\n/, 1)[0]?.split('｜').slice(-1)[0]?.trim()
+      || storyboard.assets.find((asset) => asset.type === 'location')?.name
+      || '',
     imagePrompt: storyboard.imagePrompt || '',
+    directorPrompt: storyboard.directorPrompt || '',
     videoPrompt: storyboard.videoPrompt || '',
     duration: storyboard.duration,
   })
   const [saving, setSaving] = useState(false)
+  const [assetPickerOpen, setAssetPickerOpen] = useState(false)
+  const [assetPickerQuery, setAssetPickerQuery] = useState('')
+  const [assetLinkBusyId, setAssetLinkBusyId] = useState<string | null>(null)
+  const linkedAssetIds = new Set(storyboard.assets.map((asset) => asset.id))
+  const normalizedAssetQuery = assetPickerQuery.trim().toLocaleLowerCase()
+  const pickerAssets = projectAssets
+    .filter((asset) => !linkedAssetIds.has(asset.id))
+    .filter((asset) => !normalizedAssetQuery || [
+      asset.name,
+      asset.description,
+      ...asset.tags,
+    ].some((value) => value.toLocaleLowerCase().includes(normalizedAssetQuery)))
 
   async function save() {
     setSaving(true)
@@ -1458,14 +1676,57 @@ function StoryboardPromptEditor({
       await requestJson(`/api/storyboards/${storyboard.id}`, {
         method: 'PATCH',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(draft),
+        body: JSON.stringify({ ...draft, baseUpdatedAt: storyboard.updatedAt }),
       })
       await onChanged()
-      onNotice('分镜文本已保存，资产识别已刷新')
+      onNotice('分镜文本已保存；本镜已选资产保持不变')
     } catch (error) {
       onNotice(error instanceof Error ? error.message : '分镜保存失败', 'error')
     } finally {
       setSaving(false)
+    }
+  }
+
+  async function updateAssetLink(
+    asset: Pick<PlanningAsset, 'id' | 'name' | 'type'>,
+    action: 'add' | 'remove',
+  ) {
+    if (assetLinkBusyId) return
+    setAssetLinkBusyId(asset.id)
+    const previousPrompt = draft.videoPrompt
+    const nextPrompt = action === 'add'
+      ? insertStoryboardAssetMention(previousPrompt, asset)
+      : removeStoryboardAssetMention(previousPrompt, asset.name)
+    setDraft((current) => ({ ...current, videoPrompt: nextPrompt }))
+    try {
+      const linked = await requestJson<{ storyboard: PlanningStoryboard }>(
+        `/api/storyboards/${storyboard.id}/assets${action === 'remove' ? `?assetId=${encodeURIComponent(asset.id)}` : ''}`,
+        {
+          method: action === 'add' ? 'POST' : 'DELETE',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            assetId: asset.id,
+            videoPrompt: nextPrompt,
+          }),
+        },
+      )
+      setDraft((current) => ({
+        ...current,
+        videoPrompt: linked.storyboard.videoPrompt || nextPrompt,
+      }))
+      await onChanged()
+      if (action === 'add') {
+        setAssetPickerQuery('')
+        if (pickerAssets.length <= 1) setAssetPickerOpen(false)
+      }
+      onNotice(action === 'add'
+        ? `已在提示词中加入 @${asset.name} 并保存`
+        : `已移除 @${asset.name} 并保存`)
+    } catch (error) {
+      setDraft((current) => ({ ...current, videoPrompt: previousPrompt }))
+      onNotice(error instanceof Error ? error.message : '资产关联更新失败', 'error')
+    } finally {
+      setAssetLinkBusyId(null)
     }
   }
 
@@ -1477,18 +1738,92 @@ function StoryboardPromptEditor({
       </div>
       <label>标题<input value={draft.title} onChange={(event) => setDraft((current) => ({ ...current, title: event.target.value }))} /></label>
       <div className="twoFields">
-        <label>连续性备注<input value={draft.notes} onChange={(event) => setDraft((current) => ({ ...current, notes: event.target.value }))} /></label>
+        <label>这个分镜的场景<input value={draft.notes} onChange={(event) => setDraft((current) => ({ ...current, notes: event.target.value }))} /></label>
         <label>时长（秒）<input type="number" min="4" max="15" value={draft.duration} onChange={(event) => setDraft((current) => ({ ...current, duration: Number(event.target.value) }))} /></label>
       </div>
       <label>首帧提示词<textarea value={draft.imagePrompt} onChange={(event) => setDraft((current) => ({ ...current, imagePrompt: event.target.value }))} rows={4} /></label>
-      <label className="shotPromptField">视频分镜提示词<textarea data-assistant-target="shot-plan-prompt" value={draft.videoPrompt} onChange={(event) => setDraft((current) => ({ ...current, videoPrompt: event.target.value }))} /></label>
-      <div className="recognizedAssets">
-        <div className="sectionLabel"><strong>已识别人物与场景</strong><span>{storyboard.assets.length}</span></div>
-        <div>
-          {storyboard.assets.map((asset) => (
-            <span key={asset.id} className={`${asset.type} ${asset.hasSelectedImage ? '' : 'missing'}`}><TypeIcon type={asset.type} size={13} />{asset.name}</span>
-          ))}
-          {storyboard.assets.length === 0 ? <small>保存后会按剧本中的人物和场景重新识别</small> : null}
+      <section className="storyboardPromptLayers" aria-label="分镜文本">
+        <label className="shotPromptField directorPromptField">
+          <span className="promptFieldHeading">
+            <span>导演分镜稿</span>
+            <small>页面审阅格式：分镜 / 景别机位运动 / 画面内容 / 动作对白</small>
+          </span>
+          <textarea
+            data-assistant-target="director-shot-plan"
+            value={draft.directorPrompt}
+            onChange={(event) => setDraft((current) => ({ ...current, directorPrompt: event.target.value }))}
+          />
+        </label>
+        <details className="storyboardVideoPromptDetails">
+          <summary>
+            <span><strong>视频生成提示词</strong><small>高级内容 · Seedance 实际读取</small></span>
+            <ChevronRight size={15} aria-hidden="true" />
+          </summary>
+          <label className="shotPromptField">
+            <span className="promptFieldHeading"><span>Seedance 时间轴提示词</span><small>资产 @ 引用与视频生成仍使用这里</small></span>
+            <textarea data-assistant-target="shot-plan-prompt" value={draft.videoPrompt} onChange={(event) => setDraft((current) => ({ ...current, videoPrompt: event.target.value }))} />
+          </label>
+        </details>
+      </section>
+      <div className="storyboardPromptAssetTools">
+        <div className="sectionLabel referenceSectionHeader">
+          <span className="referenceSectionTitle">
+            <strong>提示词资产</strong>
+            <small>初始识别后由你通过 @资产自由增删</small>
+          </span>
+          <button
+            className={`quietButton compact referenceAssetAddButton ${assetPickerOpen ? 'active' : ''}`}
+            type="button"
+            aria-expanded={assetPickerOpen}
+            onClick={() => setAssetPickerOpen((open) => !open)}
+          >
+            <Plus size={14} />添加资产
+          </button>
+        </div>
+        {assetPickerOpen ? (
+          <section className="storyboardAssetPicker" aria-label="添加项目资产到当前分镜提示词">
+            <header>
+              <span>
+                <strong>从项目资产库添加</strong>
+                <small>点击后写入 @资产并立即保存；视频生成只使用当前列表。</small>
+              </span>
+              <button className="iconButton small" type="button" title="关闭资产选择" aria-label="关闭资产选择" onClick={() => setAssetPickerOpen(false)}><X size={15} /></button>
+            </header>
+            <label className="storyboardAssetSearch">
+              <Search size={15} />
+              <input value={assetPickerQuery} onChange={(event) => setAssetPickerQuery(event.target.value)} placeholder="搜索角色、场景或道具" aria-label="搜索项目资产" />
+            </label>
+            {pickerAssets.length > 0 ? (
+              <div className="storyboardAssetPickerList">
+                {pickerAssets.slice(0, 24).map((asset) => (
+                  <button key={asset.id} type="button" disabled={assetLinkBusyId !== null} onClick={() => void updateAssetLink(asset, 'add')}>
+                    <span className="storyboardAssetPickerThumb">
+                      {asset.selectedImageUrl ? <img src={asset.selectedImageUrl} alt="" /> : <TypeIcon type={asset.type} size={18} />}
+                    </span>
+                    <span>
+                      <strong>{asset.name}</strong>
+                      <small>{typeLabels[asset.type]} · {asset.images.length > 0 ? '已有资产图' : '缺少资产图'}</small>
+                    </span>
+                    {assetLinkBusyId === asset.id ? <Loader2 className="spin" size={15} /> : <Plus size={15} />}
+                  </button>
+                ))}
+              </div>
+            ) : <div className="storyboardAssetPickerEmpty">{assetPickerQuery ? '没有匹配的未添加资产' : '项目资产已全部加入本镜'}</div>}
+          </section>
+        ) : null}
+        <div className="recognizedAssets">
+          <div className="sectionLabel"><strong>本镜已选资产</strong><span>{storyboard.assets.length}</span></div>
+          <div>
+            {storyboard.assets.map((asset) => (
+              <span key={asset.id} className={`${asset.type} ${asset.hasSelectedImage ? '' : 'missing'}`}>
+                <TypeIcon type={asset.type} size={13} />{asset.name}
+                <button type="button" title={`移除 @${asset.name}`} aria-label={`移除 @${asset.name}`} disabled={assetLinkBusyId !== null} onClick={() => void updateAssetLink(asset, 'remove')}>
+                  {assetLinkBusyId === asset.id ? <Loader2 className="spin" size={12} /> : <X size={12} />}
+                </button>
+              </span>
+            ))}
+            {storyboard.assets.length === 0 ? <small>暂无资产；点击“添加资产”写入 @资产</small> : null}
+          </div>
         </div>
       </div>
       {storyboard.videos.length > 0 ? <button className="quietButton" type="button" onClick={onOpenVideos}><Film size={16} />查看视频版本</button> : null}

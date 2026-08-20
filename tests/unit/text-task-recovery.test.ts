@@ -2,6 +2,7 @@ import { TaskStatus } from '@prisma/client'
 import { describe, expect, it } from 'vitest'
 import {
   canAutoRecoverTextTask,
+  isDeterministicTextApiFailure,
   isRecoverableTextTaskFailure,
   shouldMarkTextTaskInterrupted,
   TEXT_TASK_AUTO_RECOVERY_LIMIT,
@@ -39,7 +40,14 @@ describe('text task recovery', () => {
     expect(isRecoverableTextTaskFailure('TEXT_API_FAILED: 504 upstream timeout')).toBe(true)
     expect(isRecoverableTextTaskFailure('SCENE_CONSISTENCY_MISMATCH: 缺少旧屋客厅')).toBe(true)
     expect(isRecoverableTextTaskFailure('TEXT_API_FAILED: 401 invalid key')).toBe(false)
+    expect(isRecoverableTextTaskFailure('TEXT_API_FAILED: 400 unsupported model')).toBe(false)
+    expect(isRecoverableTextTaskFailure('TEXT_API_FAILED: 404 endpoint missing')).toBe(false)
     expect(isRecoverableTextTaskFailure('SCENE_CONSISTENCY_MISSING: 没有标准场景名')).toBe(false)
+
+    expect(isDeterministicTextApiFailure('TEXT_API_FAILED: 422 invalid request')).toBe(true)
+    expect(isDeterministicTextApiFailure('provider failed: TEXT_API_FAILED: 405 method not allowed')).toBe(true)
+    expect(isDeterministicTextApiFailure('TEXT_API_FAILED: 429 rate limited')).toBe(false)
+    expect(isDeterministicTextApiFailure('TEXT_API_FAILED: 504 upstream timeout')).toBe(false)
 
     expect(canAutoRecoverTextTask({
       status: TaskStatus.failed,

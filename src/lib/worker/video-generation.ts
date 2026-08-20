@@ -1,25 +1,45 @@
-import { AssetType, Prisma, TaskStatus } from '@prisma/client'
+import { UnrecoverableError } from 'bullmq'
+import { AssetType, BillingTaskType, Prisma, TaskStatus, VisualStyle } from '@prisma/client'
+import { recordCompletedUsage } from '@/lib/billing'
 import { prisma } from '@/lib/db'
 import { env } from '@/lib/env'
 import {
-  detectVideoCapability,
   downloadOpenAIVideo,
   extractVideoUrl,
+  isUnrecoverableVideoGenerationError,
+  shouldResetVideoProviderJobOnRetry,
   retrieveVideoJob,
+  selectVideoCapability,
   submitVideoGeneration,
 } from '@/lib/openai-video'
+import { resolveVideoApiProvider } from '@/lib/video-api-pool'
 import { normalizeVideoDuration } from '@/lib/video-batch'
 import { resolveVideoModelDefinition } from '@/lib/video-models'
+import { createReferenceMontage } from '@/lib/reference-montage'
 import {
+  planVideoReferences,
+  REFERENCE_MONTAGE_IMAGES_PER_VIDEO,
+} from '@/lib/video-reference-plan'
+import {
+  prepareSingleCharacterReference,
+  shouldPrepareSingleCharacterReference,
+} from '@/lib/video-character-reference'
+import {
+  isExcludedStoryboardAssetLink,
+  prioritizeStoryboardReferences,
+} from '@/lib/storyboards'
+import {
+  buildStoryboardReferenceMontageStorageKey,
   buildStoryboardStorageKey,
   downloadBuffer,
+  signedMediaUrl,
   uploadBuffer,
 } from '@/lib/storage'
 
 const sleep = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds))
 const supportedAspectRatios = ['16:9', '9:16', '1:1', '21:9', '3:4', '4:3'] as const
 type SupportedAspectRatio = typeof supportedAspectRatios[number]
-type SupportedResolution = '480p' | '720p'
+type SupportedResolution = '480p' | '720p' | '1080p'
 
 function taskPayload(value: unknown) {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -33,13 +53,31 @@ function payloadStringArray(value: unknown) {
     : []
 }
 
+class VideoTaskCancelledError extends Error {
+  constructor(message = 'VIDEO_TASK_CANCELLED: 用户取消了该视频生成任务。') {
+    super(message)
+    this.name = 'VideoTaskCancelledError'
+  }
+}
+
+async function throwIfVideoTaskCancelled(taskId: string) {
+  const latest = await prisma.generationTask.findUnique({
+    where: { id: taskId },
+    select: { status: true, error: true, payload: true },
+  })
+  const latestPayload = taskPayload(latest?.payload)
+  if (latestPayload.cancelRequested === true || /VIDEO_TASK_CANCELLED/iu.test(latest?.error || '')) {
+    throw new VideoTaskCancelledError(latest?.error || undefined)
+  }
+}
+
 function normalizeAspectRatio(value: unknown): SupportedAspectRatio {
   const candidate = String(value || '')
   return supportedAspectRatios.find((ratio) => ratio === candidate) || '16:9'
 }
 
 function normalizeResolution(value: unknown, model: string): SupportedResolution {
-  if (value === '480p' || value === '720p') return value
+  if (value === '480p' || value === '720p' || value === '1080p') return value
   return /(?:-|^)480p(?:-|$)/i.test(model) ? '480p' : '720p'
 }
 
@@ -53,7 +91,16 @@ function requestedVideoDimensions(aspectRatio: SupportedAspectRatio, resolution:
         '3:4': [496, 656],
         '4:3': [656, 496],
       }
-    : {
+    : resolution === '1080p'
+      ? {
+          '16:9': [1920, 1080],
+          '9:16': [1080, 1920],
+          '1:1': [1080, 1080],
+          '21:9': [2560, 1080],
+          '3:4': [1080, 1440],
+          '4:3': [1440, 1080],
+        }
+      : {
         '16:9': [1280, 720],
         '9:16': [720, 1280],
         '1:1': [720, 720],
@@ -95,6 +142,7 @@ export async function processVideoGenerationTask(
     throw new Error(`Video task or storyboard not found: ${taskId}`)
   }
   const payload = taskPayload(task.payload)
+  if (payload.cancelRequested === true) return payload
   if (task.status === TaskStatus.completed) return payload
 
   const checkpointVideoId = typeof payload.storyboardVideoId === 'string'
@@ -114,6 +162,15 @@ export async function processVideoGenerationTask(
       })
     : null
   if (existingVideo) {
+    await recordCompletedUsage({
+      idempotencyKey: `generation-task:${task.id}:video`,
+      userId: task.createdById,
+      taskType: BillingTaskType.video,
+      sourceType: 'generation_task',
+      sourceTaskId: task.id,
+      model: task.model,
+      durationSeconds: existingVideo.duration,
+    })
     await prisma.generationTask.update({
       where: { id: taskId },
       data: {
@@ -127,6 +184,7 @@ export async function processVideoGenerationTask(
     return existingVideo
   }
 
+  await throwIfVideoTaskCancelled(taskId)
   await prisma.generationTask.update({
     where: { id: taskId },
     data: {
@@ -138,6 +196,7 @@ export async function processVideoGenerationTask(
   })
 
   try {
+    await throwIfVideoTaskCancelled(taskId)
     const storyboard = task.storyboard
     const requestedDuration = Number(payload.duration || storyboard.duration)
     let duration = requestedDuration
@@ -147,15 +206,52 @@ export async function processVideoGenerationTask(
     const generateAudio = payload.generateAudio === undefined
       ? storyboard.generateAudio
       : Boolean(payload.generateAudio)
+    const modelDefinition = await resolveVideoModelDefinition(task.model).catch(() => null)
+    const payloadReferenceLimit = Number(payload.maximumReferenceImages)
+    const referenceLimit = Number.isInteger(payloadReferenceLimit) && payloadReferenceLimit > 0
+      ? payloadReferenceLimit
+      : modelDefinition?.maximumReferenceImages
+        ?? (/^(?:sd5-seedance-2\.0|happyhouse-(?:1\.0|1\.1))(?:-|$)/i.test(task.model) ? 9 : 4)
+    const continuityFrameMediaId = typeof payload.continuityFrameMediaId === 'string'
+      ? payload.continuityFrameMediaId.trim()
+      : ''
+    const continuitySourceVideoId = typeof payload.continuitySourceVideoId === 'string'
+      ? payload.continuitySourceVideoId.trim()
+      : ''
+    const continuitySource = continuityFrameMediaId && continuitySourceVideoId
+      ? await prisma.storyboardVideo.findUnique({
+          where: { id: continuitySourceVideoId },
+          select: {
+            id: true,
+            tailFrameMediaId: true,
+            tailFrameMedia: { select: { storageKey: true, mimeType: true } },
+            storyboard: { select: { projectId: true } },
+          },
+        })
+      : null
+    if (continuityFrameMediaId && (
+      !continuitySource
+      || continuitySource.storyboard.projectId !== storyboard.projectId
+      || continuitySource.tailFrameMediaId !== continuityFrameMediaId
+      || !continuitySource.tailFrameMedia?.mimeType.startsWith('image/')
+    )) {
+      throw new Error('CONTINUITY_FRAME_INVALID: 上一镜尾帧来源校验失败')
+    }
+    const assetReferenceLimit = Math.max(0, referenceLimit - (continuitySource ? 1 : 0))
+    const maximumReferenceVideos = modelDefinition?.maximumReferenceVideos || 0
+    const totalAssetReferenceCapacity = assetReferenceLimit
+      + maximumReferenceVideos * REFERENCE_MONTAGE_IMAGES_PER_VIDEO
     const sourceStoryboardIds = payloadStringArray(payload.sourceStoryboardIds)
     if (sourceStoryboardIds.length === 0) sourceStoryboardIds.push(storyboard.id)
-    const requestedReferenceAssetIds = payloadStringArray(payload.referenceAssetIds).slice(0, 4)
+    const hasExplicitReferenceAssetIds = Array.isArray(payload.referenceAssetIds)
+    const allowTextOnlyCharacters = payload.referenceStrategy === 'text_only_characters'
+    const requestedReferenceAssetIds = payloadStringArray(payload.referenceAssetIds)
     const requestedReferenceAssets = requestedReferenceAssetIds.length > 0
       ? await prisma.asset.findMany({
           where: {
             id: { in: requestedReferenceAssetIds },
             projectId: storyboard.projectId,
-            type: { in: [AssetType.character, AssetType.location] },
+            type: { in: [AssetType.character, AssetType.location, AssetType.prop] },
           },
           include: {
             selectedImage: { include: { media: true } },
@@ -165,40 +261,142 @@ export async function processVideoGenerationTask(
     const requestedReferenceAssetsById = new Map(
       requestedReferenceAssets.map((asset) => [asset.id, asset]),
     )
-    const references = requestedReferenceAssetIds.length > 0
+    const references = totalAssetReferenceCapacity === 0
+      ? []
+      : hasExplicitReferenceAssetIds
       ? requestedReferenceAssetIds.flatMap((assetId, index) => {
           const asset = requestedReferenceAssetsById.get(assetId)
-          return asset?.selectedImage?.media
+          return asset?.selectedImage?.media && !(continuitySource && asset.type === AssetType.location)
             ? [{ assetId, referenceOrder: index + 1, asset }]
             : []
-        })
-      : storyboard.assetLinks
-          .filter((link) => (
-            (link.asset.type === AssetType.character || link.asset.type === AssetType.location)
+        }).slice(0, totalAssetReferenceCapacity)
+      : prioritizeStoryboardReferences(
+          storyboard.assetLinks.filter((link) => (
+            !isExcludedStoryboardAssetLink(link.matchReason)
+            && (link.asset.type === AssetType.character || link.asset.type === AssetType.location || link.asset.type === AssetType.prop)
             && link.asset.selectedImage?.media
-          ))
-          .slice(0, 4)
+          )),
+          totalAssetReferenceCapacity,
+          { omitLocations: Boolean(continuitySource) },
+        )
 
-    if (references.length === 0) {
+    const referencePlan = planVideoReferences(
+      references.map((link) => link.assetId),
+      assetReferenceLimit,
+      maximumReferenceVideos,
+    )
+    if (referencePlan.rejectedMediaIds.length > 0) {
+      throw new Error(`VIDEO_REFERENCE_LIMIT: 当前模型最多接收 ${referencePlan.totalCapacity} 项图片资产`)
+    }
+    const referencesByAssetId = new Map(references.map((link) => [link.assetId, link]))
+    const imageReferences = referencePlan.imageMediaIds.map((assetId) => referencesByAssetId.get(assetId)!).filter(Boolean)
+
+    if (references.length === 0 && !continuitySource && !allowTextOnlyCharacters) {
       throw new Error('VIDEO_REFERENCE_REQUIRED: 分镜没有匹配到已设置主图的资产')
     }
 
-    const referenceImageUrls = await Promise.all(references.map(async (link) => {
+    const referenceImageUrls: string[] = []
+    const singlePersonReferenceAssetIds: string[] = []
+    for (const link of imageReferences) {
       const media = link.asset.selectedImage!.media
-      const bytes = await downloadBuffer(media.storageKey)
-      return `data:${media.mimeType};base64,${bytes.toString('base64')}`
-    }))
-    const config = {
-      baseUrl: env.videoApiBaseUrl(),
-      apiKey: env.videoApiKey(),
-      mode: env.videoApiMode() as 'auto' | 'openai' | 'sub2api-grok' | 'newapi-grok',
-      model: task.model,
+      const sourceUrl = await signedMediaUrl(media.storageKey, {
+        expiresInSeconds: 60 * 60,
+      })
+      if (shouldPrepareSingleCharacterReference({
+        model: task.model,
+        visualStyle: storyboard.project.visualStyle as VisualStyle,
+        assetType: link.asset.type,
+        prompt: link.asset.prompt,
+        description: link.asset.description,
+      })) {
+        try {
+          const prepared = await prepareSingleCharacterReference({ sourceUrl })
+          referenceImageUrls.push(prepared.url)
+          if (prepared.transformed) singlePersonReferenceAssetIds.push(link.assetId)
+          continue
+        } catch (error) {
+          console.warn(`Failed to prepare single-person reference for ${link.asset.name}`, error)
+        }
+      }
+      referenceImageUrls.push(sourceUrl)
     }
-    const capability = await detectVideoCapability(config)
-    if (!capability) {
+    if (continuitySource?.tailFrameMedia) {
+      referenceImageUrls.push(await signedMediaUrl(continuitySource.tailFrameMedia.storageKey, {
+        expiresInSeconds: 60 * 60,
+      }))
+    }
+    const cachedVideoIds = payloadStringArray(payload.referenceVideoMediaIds)
+    const cachedVideos = cachedVideoIds.length === referencePlan.videoGroups.length
+      ? await prisma.mediaObject.findMany({
+          where: { id: { in: cachedVideoIds }, mimeType: 'video/mp4' },
+        })
+      : []
+    const cachedVideosById = new Map(cachedVideos.map((media) => [media.id, media]))
+    let orderedReferenceVideos = cachedVideoIds.map((id) => cachedVideosById.get(id)).filter(Boolean)
+    if (orderedReferenceVideos.length !== referencePlan.videoGroups.length) {
+      orderedReferenceVideos = []
+      for (const [groupIndex, group] of referencePlan.videoGroups.entries()) {
+        await throwIfVideoTaskCancelled(taskId)
+        const images = await Promise.all(group.map(async (assetId) => {
+          const media = referencesByAssetId.get(assetId)!.asset.selectedImage!.media
+          return { bytes: await downloadBuffer(media.storageKey), mimeType: media.mimeType }
+        }))
+        const montage = await createReferenceMontage({
+          images,
+          width: dimensions.width,
+          height: dimensions.height,
+        })
+        const storageKey = buildStoryboardReferenceMontageStorageKey({
+          projectId: storyboard.projectId,
+          storyboardId: storyboard.id,
+          taskId: task.id,
+          groupIndex,
+        })
+        await uploadBuffer({ key: storageKey, body: montage.bytes, mimeType: 'video/mp4' })
+        const media = await prisma.mediaObject.upsert({
+          where: { storageKey },
+          create: {
+            kind: 'video',
+            storageKey,
+            mimeType: 'video/mp4',
+            sizeBytes: BigInt(montage.bytes.byteLength),
+            width: montage.probe.width,
+            height: montage.probe.height,
+          },
+          update: {
+            mimeType: 'video/mp4',
+            sizeBytes: BigInt(montage.bytes.byteLength),
+            width: montage.probe.width,
+            height: montage.probe.height,
+          },
+        })
+        orderedReferenceVideos.push(media)
+      }
+      payload.referencePlan = referencePlan
+      payload.referenceVideoMediaIds = orderedReferenceVideos.map((media) => media!.id)
+      await prisma.generationTask.update({
+        where: { id: task.id },
+        data: { progress: Math.max(4, task.progress), payload: payload as Prisma.InputJsonObject },
+      })
+    }
+    const referenceVideoUrls = await Promise.all(orderedReferenceVideos.map((media) => (
+      signedMediaUrl(media!.storageKey, { expiresInSeconds: 60 * 60 })
+    )))
+    const existingProviderJobId = typeof payload.providerJobId === 'string'
+      ? payload.providerJobId.trim()
+      : ''
+    const configuredMode = env.videoApiMode() as 'auto' | 'openai' | 'sub2api-grok' | 'newapi-grok'
+    const provider = await resolveVideoApiProvider({
+      baseUrl: env.videoApiBaseUrl(),
+      model: task.model,
+      mode: configuredMode,
+      preferredKeySlot: existingProviderJobId ? Number(payload.videoApiKeySlot) : undefined,
+    })
+    const capability = selectVideoCapability([task.model], task.model, configuredMode)
+    if (!provider || !capability) {
       throw new Error(`VIDEO_MODEL_UNAVAILABLE: ${task.model}`)
     }
-    const modelDefinition = await resolveVideoModelDefinition(task.model).catch(() => null)
+    const config = provider.config
     duration = normalizeVideoDuration(
       requestedDuration,
       modelDefinition?.minimumDuration ?? (capability.mode === 'newapi-grok' ? 6 : 4),
@@ -208,9 +406,7 @@ export async function processVideoGenerationTask(
     const prompt = task.prompt.trim()
     if (!prompt) throw new Error('VIDEO_PROMPT_REQUIRED: 视频提示词不能为空')
 
-    const existingProviderJobId = typeof payload.providerJobId === 'string'
-      ? payload.providerJobId.trim()
-      : ''
+    await throwIfVideoTaskCancelled(taskId)
     const submitted = existingProviderJobId
       ? await retrieveVideoJob(config, existingProviderJobId)
       : await submitVideoGeneration(config, capability, {
@@ -220,15 +416,28 @@ export async function processVideoGenerationTask(
           aspectRatio,
           resolution,
           referenceImageUrls,
+          maximumReferenceImages: referenceLimit,
+          referenceVideoUrls,
+          maximumReferenceVideos,
           generateAudio,
         })
+    await throwIfVideoTaskCancelled(taskId)
     Object.assign(payload, {
       duration,
       aspectRatio,
       resolution,
       providerJobId: submitted.id,
+      videoApiKeySlot: provider.keySlot,
       sourceStoryboardIds,
       referenceAssetIds: references.map((link) => link.assetId),
+      referenceImageAssetIds: referencePlan.imageMediaIds,
+      referenceVideoAssetGroups: referencePlan.videoGroups,
+      referenceVideoMediaIds: orderedReferenceVideos.map((media) => media!.id),
+      singlePersonReferenceAssetIds,
+      maximumReferenceImages: referenceLimit,
+      maximumReferenceVideos,
+      continuityFrameMediaId: continuitySource?.tailFrameMediaId || null,
+      continuitySourceVideoId: continuitySource?.id || null,
     })
     await prisma.generationTask.update({
       where: { id: taskId },
@@ -246,7 +455,9 @@ export async function processVideoGenerationTask(
         throw new Error(`VIDEO_TASK_TIMEOUT: ${submitted.id}`)
       }
       await sleep(10_000)
+      await throwIfVideoTaskCancelled(taskId)
       current = await retrieveVideoJob(config, submitted.id)
+      await throwIfVideoTaskCancelled(taskId)
       const elapsedProgress = Math.min(88, 8 + Math.floor((Date.now() - startedPollingAt) / 12_000))
       await prisma.generationTask.update({
         where: { id: taskId },
@@ -261,6 +472,18 @@ export async function processVideoGenerationTask(
       throw new Error(`VIDEO_TASK_FAILED: ${JSON.stringify(current.raw)}`)
     }
 
+    await throwIfVideoTaskCancelled(taskId)
+
+    await recordCompletedUsage({
+      idempotencyKey: `generation-task:${task.id}:video`,
+      userId: task.createdById,
+      taskType: BillingTaskType.video,
+      sourceType: 'generation_task',
+      sourceTaskId: task.id,
+      model: capability.model,
+      durationSeconds: duration,
+    })
+
     const resultUrl = extractVideoUrl(current.raw)
     let bytes: Uint8Array
     let mimeType = 'video/mp4'
@@ -272,6 +495,7 @@ export async function processVideoGenerationTask(
     } else {
       bytes = await downloadOpenAIVideo(config, submitted.id)
     }
+    await throwIfVideoTaskCancelled(taskId)
 
     const storageKey = buildStoryboardStorageKey({
       projectId: storyboard.projectId,
@@ -328,9 +552,17 @@ export async function processVideoGenerationTask(
           aspectRatio,
           resolution,
           providerJobId: submitted.id,
+          videoApiKeySlot: provider.keySlot,
           storyboardVideoId: video.id,
           sourceStoryboardIds,
           referenceAssetIds: references.map((link) => link.assetId),
+          referenceImageAssetIds: referencePlan.imageMediaIds,
+          referenceVideoAssetGroups: referencePlan.videoGroups,
+          referenceVideoMediaIds: orderedReferenceVideos.map((media) => media!.id),
+          maximumReferenceImages: referenceLimit,
+          maximumReferenceVideos,
+          continuityFrameMediaId: continuitySource?.tailFrameMediaId || null,
+          continuitySourceVideoId: continuitySource?.id || null,
         },
       },
     })
@@ -338,19 +570,38 @@ export async function processVideoGenerationTask(
     return video
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    const willRetry = options.willRetryOnFailure === true
-    const retryPayload = willRetry && /VIDEO_TASK_FAILED/i.test(message)
-      ? { ...payload, providerJobId: null }
+    if (error instanceof VideoTaskCancelledError || /VIDEO_TASK_CANCELLED/iu.test(message)) {
+      await prisma.generationTask.update({
+        where: { id: taskId },
+        data: {
+          status: TaskStatus.failed,
+          completedAt: new Date(),
+          error: message,
+          payload: {
+            ...payload,
+            cancelRequested: true,
+            cancelRequestedAt: payload.cancelRequestedAt || new Date().toISOString(),
+          } as Prisma.InputJsonObject,
+        },
+      })
+      throw new UnrecoverableError(message)
+    }
+    const unrecoverable = isUnrecoverableVideoGenerationError(error)
+    const willRetry = options.willRetryOnFailure === true && !unrecoverable
+    const retryPayload = willRetry && shouldResetVideoProviderJobOnRetry(message)
+      ? { ...payload, providerJobId: null, videoApiKeySlot: null }
       : payload
     await prisma.generationTask.update({
       where: { id: taskId },
       data: {
         status: willRetry ? TaskStatus.queued : TaskStatus.failed,
+        progress: willRetry ? 3 : undefined,
         completedAt: willRetry ? null : new Date(),
         error: willRetry ? null : message,
         payload: retryPayload as Prisma.InputJsonObject,
       },
     })
+    if (unrecoverable) throw new UnrecoverableError(message)
     throw error
   }
 }

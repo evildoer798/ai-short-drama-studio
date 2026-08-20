@@ -13,6 +13,7 @@ import {
   buildStoryboardVideoDisplayName,
   buildStoryboardVideoDownloadFilename,
 } from '@/lib/storyboard-video-names'
+import { resolveMediaProjectId } from '@/lib/media-access'
 
 export async function GET(
   _request: NextRequest,
@@ -36,22 +37,54 @@ export async function GET(
           },
           take: 1,
         },
+        storyboardVideoTailFrames: {
+          include: {
+            storyboard: { select: { projectId: true } },
+          },
+          take: 1,
+        },
         projectRenders: {
           select: { projectId: true, title: true },
+          take: 1,
+        },
+        canvasNodes: {
+          include: { canvas: { select: { userId: true } } },
+          take: 1,
+        },
+        directorImageVersions: {
+          include: {
+            keyframe: { include: { production: { select: { projectId: true } } } },
+          },
+          take: 1,
+        },
+        directorVideoVersions: {
+          include: {
+            shot: { include: { production: { select: { projectId: true } } } },
+          },
+          take: 1,
+        },
+        directorStateImageVersions: {
+          include: {
+            stateAsset: { include: { production: { select: { projectId: true } } } },
+          },
           take: 1,
         },
       },
     })
 
-    const projectId = media?.images[0]?.asset.projectId
-      || media?.storyboardVideos[0]?.storyboard.projectId
-      || media?.projectRenders[0]?.projectId
-    if (!media || !projectId) {
+    const projectId = resolveMediaProjectId(media)
+    const canvasOwnerId = media?.canvasNodes[0]?.canvas.userId
+    if (!media || (!projectId && !canvasOwnerId)) {
       throw new HttpError(404, 'MEDIA_NOT_FOUND', 'Media not found')
     }
 
-    await requireProjectAccess(projectId, user.id)
+    if (canvasOwnerId) {
+      if (canvasOwnerId !== user.id) throw new HttpError(403, 'MEDIA_FORBIDDEN', 'Media access denied')
+    } else {
+      await requireProjectAccess(projectId!, user.id)
+    }
     const download = _request.nextUrl.searchParams.get('download') === '1'
+    const assetImage = media.images[0]
     const render = media.projectRenders[0]
     const storyboardVideo = media.storyboardVideos[0]
     const extension = extensionForMime(media.mimeType)
@@ -65,18 +98,30 @@ export async function GET(
         createdAt: storyboardVideo.createdAt,
       })
       : null
+    const assetImageName = assetImage
+      ? `${assetImage.asset.name}-${assetImage.asset.selectedImageId === assetImage.id ? '主图' : `版本${assetImage.variant}`}`
+      : null
     const downloadFilename = download ? buildStoryboardVideoDownloadFilename({
-      displayName: render?.title?.trim() || storyboardVideoName || `媒体-${media.id}`,
+      displayName: render?.title?.trim() || storyboardVideoName || assetImageName || `media-${media.id}`,
       extension,
     }) : undefined
-    const direct = _request.nextUrl.searchParams.get('direct') === '1'
-    if (media.mimeType.startsWith('video/') && (direct || download)) {
+    const proxy = _request.nextUrl.searchParams.get('proxy') === '1'
+    const redirectToObjectStorage = !proxy && (
+      media.mimeType.startsWith('image/')
+      || media.mimeType.startsWith('video/')
+      || media.mimeType.startsWith('audio/')
+    )
+    if (redirectToObjectStorage) {
       const location = await signedMediaUrl(media.storageKey, {
         downloadFilename,
       })
       return NextResponse.redirect(location, {
         status: 307,
-        headers: { 'Cache-Control': 'private, no-store, max-age=0' },
+        headers: {
+          'Cache-Control': download
+            ? 'private, no-store, max-age=0'
+            : 'private, max-age=300',
+        },
       })
     }
     const range = _request.headers.get('range') || undefined

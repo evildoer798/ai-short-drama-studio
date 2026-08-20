@@ -7,11 +7,14 @@ async function main() {
   const workspaceName = process.env.SEED_WORKSPACE_NAME || 'Short Drama Studio'
   const projectName = process.env.SEED_PROJECT_NAME || 'Demo Project'
   const existingUser = await prisma.user.findUnique({ where: { email } })
-  const user = existingUser || await prisma.user.create({
+  const user = existingUser
+    ? await prisma.user.update({ where: { id: existingUser.id }, data: { role: 'admin' } })
+    : await prisma.user.create({
     data: {
       email,
       name: 'Admin',
       passwordHash: await hash(password, 12),
+      role: 'admin',
     },
   })
 

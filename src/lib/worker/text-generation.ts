@@ -3,6 +3,7 @@ import {
   GenerationTaskType,
   Prisma,
   TaskStatus,
+  VisualStyle,
 } from '@prisma/client'
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
@@ -28,11 +29,14 @@ import {
   buildSeriesBibleMergePrompt,
   buildSeriesBiblePrompt,
   buildMissingDialogueShotsPrompt,
+  buildStoryboardAtomicRepairPrompt,
+  buildStoryboardFinalRepairPrompt,
+  buildStoryboardFinalReviewPrompt,
   buildStoryboardGenerationPrompt,
+  type StoryboardFinalReviewPromptIssue,
   dialogueMissing,
   canonicalizeScriptCharacterNames,
   enforceAssetPrompt,
-  extractRequiredStoryboardDialogueLines,
   extractScriptDialogueLines,
   extractScriptSceneLocations,
   extractSourceDialogues,
@@ -53,23 +57,52 @@ import {
   firstEpisodeColdOpenIssue,
   isSuspiciousTextReuse,
   removeRepeatedOpeningFromLaterEpisode,
+  SCRIPT_COLD_OPEN_START,
+  SCRIPT_MAIN_TIMELINE_START,
   scriptAuditPassed,
   scriptCharacterCount,
+  scriptQualityAuditScore,
+  scriptQualityAuditWarnings,
   textReuseMetrics,
 } from '@/lib/script-quality'
+import { parseCompletedScreenplay } from '@/lib/screenplay-import'
 import {
   calculateSceneConsistency,
   storyboardLocationNames,
   storyboardPromptSection,
   storyboardTimeLocation,
 } from '@/lib/scene-consistency'
-import { matchStoryboardAssets, syncStoryboardAssetLinks } from '@/lib/storyboards'
+import {
+  conciseStoryboardSceneFacts,
+  conciseStoryboardSceneSection,
+  storyboardSceneHasDynamicContent,
+} from '@/lib/storyboard-scene'
+import {
+  buildNaturalStoryboardPrompt,
+  matchStoryboardAssets,
+  syncStoryboardAssetLinks,
+} from '@/lib/storyboards'
 import {
   orderedTextApiKeyIndexes,
   textStoryboardParallelism,
 } from '@/lib/text-api-pool'
 import { textProviderLabel, type TextProviderLabel } from '@/lib/text-provider-label'
 import { buildStyleLock } from '@/lib/visual-styles'
+import {
+  inferStoryboardContinuityState,
+  storyboardContinuityStateIssues,
+  type ContinuityTransitionType,
+} from '@/lib/storyboard-continuity'
+import {
+  fuseStoryboardTimelineDetails,
+  storyboardTimelineDetailIssues,
+} from '@/lib/storyboard-timeline'
+import {
+  repairExactFinalStoryboardDialogueDuplicates,
+  type FinalStoryboardDialogueDocument,
+} from '@/lib/storyboard-dialogue-validation'
+import { createStoryboardRevision } from '@/lib/storyboard-revisions'
+import { recordTextUsageFromContext } from '@/lib/billing-context'
 
 const episodePlanSchema = z.object({
   episodes: z.array(z.object({
@@ -133,7 +166,27 @@ const adaptationCheckpointSchema = z.object({
   })).default([]),
   nameAuditCompleted: z.boolean().default(false),
   qualityRepairCount: z.number().int().nonnegative().default(0),
+  qualityAuditScore: z.number().int().nonnegative().default(0),
+  qualityAuditWarnings: z.array(z.string().trim().min(1).max(500)).max(20).default([]),
 })
+
+type ScriptQualityProgress = {
+  phase: 'reviewing' | 'repairing' | 'verifying' | 'finalizing'
+  completedEpisodes: number
+  totalEpisodes: number
+  completedSegments: number
+  totalSegments: number
+  activeEpisodeNumbers: number[]
+  activeRoutes: []
+  parallelism: number
+  segmentParallelism: number
+  reviewRound: number
+  maximumReviewRounds: number
+  modifiedShots: number
+  remainingIssues: number
+  fatalIssues: number
+  warning?: string
+}
 
 const assetInventoryItemSchema = z.object({
   type: z.nativeEnum(AssetType),
@@ -145,6 +198,22 @@ const assetInventoryItemSchema = z.object({
 const assetInventorySchema = z.object({
   assets: z.array(assetInventoryItemSchema).default([]),
 })
+
+export function assetInventorySchemaForType(type: AssetType) {
+  return z.preprocess((value) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return value
+    const record = value as Record<string, unknown>
+    if (!Array.isArray(record.assets)) return value
+    return {
+      ...record,
+      assets: record.assets.map((asset) => (
+        asset && typeof asset === 'object' && !Array.isArray(asset)
+          ? { ...asset as Record<string, unknown>, type }
+          : asset
+      )),
+    }
+  }, assetInventorySchema)
+}
 
 const assetPromptResultSchema = z.object({
   description: z.string().trim().min(1).max(12000),
@@ -194,59 +263,327 @@ const generatedStoryboardSchema = z.object({
 })
 
 const SCRIPT_ADAPTATION_PIPELINE_VERSION = 'series-bible-quality-audit-v3'
+const STORYBOARD_SEGMENT_SHOT_LIMIT = 40
+const STORYBOARD_REVIEW_SHOT_LIMIT = 120
+const STORYBOARD_REVIEW_ISSUE_LIMIT = 240
 
-const compactStoryboardRequired = (max: number) => z.string().trim().min(1)
-  .transform((value) => value.slice(0, max))
 const compactStoryboardDetail = (max: number) => z.string().trim().optional().default('')
   .transform((value) => value.slice(0, max))
+const compactStoryboardDefault = (max: number, fallback: string) => z.string().trim().optional().default(fallback)
+  .transform((value) => (value || fallback).slice(0, max))
 
 const compactStoryboardShotSchema = z.object({
-  t: compactStoryboardRequired(120),
-  n: compactStoryboardRequired(1200),
+  t: compactStoryboardDefault(120, '剧情原子镜头'),
+  n: compactStoryboardDefault(1200, '时间地点承接当前剧本场次'),
+  i: compactStoryboardDetail(900),
   p: compactStoryboardDetail(2500),
   h: compactStoryboardDetail(3000),
   r: compactStoryboardDetail(2200),
   e: compactStoryboardDetail(2800),
   l: compactStoryboardDetail(1800),
-  c: compactStoryboardRequired(1600),
+  c: compactStoryboardDefault(1600, '中景固定机位'),
   f: compactStoryboardDetail(2800),
   s: compactStoryboardDetail(4500),
   m: compactStoryboardDetail(3600),
-  v: compactStoryboardRequired(5000),
-  a: compactStoryboardRequired(5000),
+  v: compactStoryboardDefault(14000, '人物按剧本完成本镜动作，神态随剧情触发产生自然变化。'),
+  a: compactStoryboardDefault(5000, '无对白'),
   q: compactStoryboardDetail(2400),
   o: compactStoryboardDetail(2400),
   g: compactStoryboardDetail(2800),
   x: compactStoryboardDetail(2200),
   z: compactStoryboardDetail(3200),
-  d: z.coerce.number().int().min(4).max(15).catch(8),
+  d: z.coerce.number().int().min(3).max(15).catch(8),
 })
 
 const compactStoryboardSchema = z.object({
-  shots: z.array(compactStoryboardShotSchema).min(1).max(40),
+  shots: z.array(compactStoryboardShotSchema).min(1).max(STORYBOARD_SEGMENT_SHOT_LIMIT),
 })
-
-function compactStoryboardSchemaForTarget(targetShotCount: number) {
-  const minimum = Math.max(1, Math.min(40, Math.round(targetShotCount)))
-  return z.object({
-    shots: z.array(compactStoryboardShotSchema).min(minimum).max(Math.min(40, minimum + 1)),
-  })
-}
 
 const compactStoryboardAllowEmptySchema = z.object({
-  shots: z.array(compactStoryboardShotSchema).max(40).default([]),
+  shots: z.array(compactStoryboardShotSchema).max(STORYBOARD_SEGMENT_SHOT_LIMIT).default([]),
 })
 
-const storyboardCheckpointSchema = z.object({
+const storyboardDialogueTranslationSchema = z.object({
+  translations: z.array(z.object({
+    shotNumber: z.coerce.number().int().min(1).max(STORYBOARD_SEGMENT_SHOT_LIMIT),
+    a: z.string().trim().min(1).max(5000),
+  })).min(1).max(STORYBOARD_SEGMENT_SHOT_LIMIT),
+})
+
+export type StoryboardFinalReviewIssue = StoryboardFinalReviewPromptIssue
+
+type StoryboardFinalReviewReport = {
+  passed: boolean
+  issues: StoryboardFinalReviewIssue[]
+}
+
+const storyboardFinalReviewCategories = [
+  'plot',
+  'dialogue',
+  'character',
+  'scene',
+  'continuity',
+  'duration',
+  'prompt_conflict',
+  'directing',
+] as const
+
+function finalReviewCategory(value: unknown, problem: string): StoryboardFinalReviewIssue['category'] {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : ''
+  if ((storyboardFinalReviewCategories as readonly string[]).includes(normalized)) {
+    return normalized as StoryboardFinalReviewIssue['category']
+  }
+  if (/对白|台词|说话人|speaker|dialogue/iu.test(problem)) return 'dialogue'
+  if (/人物|身份|角色|分身|换人|character/iu.test(problem)) return 'character'
+  if (/场景|地点|白名单|scene|location/iu.test(problem)) return 'scene'
+  if (/时长|秒|快读|duration/iu.test(problem)) return 'duration'
+  if (/连续|站位|朝向|接触|道具|不可逆|尾帧|continuity/iu.test(problem)) return 'continuity'
+  if (/景别|构图|机位|情绪视点|反应|导演|camera|framing/iu.test(problem)) return 'directing'
+  if (/矛盾|冲突|提示词|prompt/iu.test(problem)) return 'prompt_conflict'
+  return 'plot'
+}
+
+function normalizeStoryboardFinalReviewIssue(value: unknown): StoryboardFinalReviewIssue | null {
+  if (typeof value === 'string') {
+    const problem = value.replace(/\s+/g, ' ').trim().slice(0, 800)
+    if (!problem) return null
+    const category = finalReviewCategory(undefined, problem)
+    return {
+      severity: category === 'directing' ? 'warning' : 'fatal',
+      category,
+      shotNumbers: [],
+      scriptEvidence: '',
+      problem,
+      repairInstruction: problem,
+    }
+  }
+  const issue = finalReviewRecord(value)
+  if (!issue) return null
+  const problem = String(issue.problem ?? issue.issue ?? issue.message ?? '').replace(/\s+/g, ' ').trim().slice(0, 800)
+  if (!problem) return null
+  const category = finalReviewCategory(issue.category ?? issue.type, problem)
+  const requestedWarning = String(issue.severity ?? issue.level ?? '').trim().toLowerCase() === 'warning'
+  const containsFatalFacts = /剧情|对白|台词|说话人|人物|身份|角色|场景|地点|错序|时序|无过程换位|状态复原|站位|朝向|接触|道具|不可逆|尾帧|时长|快读|矛盾|冲突|plot|dialogue|speaker|character|scene|location|continuity|duration|prompt/iu.test(problem)
+  const rawShotNumbers = issue.shotNumbers ?? issue.shots ?? issue.shotNumber
+  return {
+    severity: category === 'directing' && requestedWarning && !containsFatalFacts ? 'warning' : 'fatal',
+    category,
+    shotNumbers: finalReviewIntegerList(Array.isArray(rawShotNumbers) ? rawShotNumbers : [rawShotNumbers], 1),
+    scriptEvidence: String(issue.scriptEvidence ?? issue.evidence ?? '').replace(/\s+/g, ' ').trim().slice(0, 1200),
+    problem,
+    repairInstruction: String(issue.repairInstruction ?? issue.fix ?? issue.suggestion ?? problem)
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 1200),
+  }
+}
+
+export function normalizeStoryboardFinalReviewReport(value: unknown): StoryboardFinalReviewReport {
+  const record = finalReviewRecord(value)
+  const rawIssues = Array.isArray(record?.issues)
+    ? record.issues
+    : Array.isArray(value) ? value : []
+  const issues = rawIssues
+    .map(normalizeStoryboardFinalReviewIssue)
+    .filter((issue): issue is StoryboardFinalReviewIssue => Boolean(issue))
+    .slice(0, STORYBOARD_REVIEW_ISSUE_LIMIT)
+  return {
+    passed: record?.passed === true && issues.length === 0,
+    issues,
+  }
+}
+
+const storyboardFinalReviewReportSchema = z.unknown().transform(normalizeStoryboardFinalReviewReport)
+
+type StoryboardFinalReviewPatch = {
+  passed: boolean
+  issues: string[]
+  order: number[]
+  remove: number[]
+  replacements: Array<{ shotNumber: number; shot: Record<string, unknown> }>
+  insertions: Array<{ afterShotNumber: number; shot: Record<string, unknown> }>
+  replaceAll?: boolean
+}
+
+function finalReviewRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null
+}
+
+function finalReviewInteger(value: unknown, minimum: number) {
+  const number = Number(value)
+  return Number.isInteger(number) && number >= minimum && number <= STORYBOARD_REVIEW_SHOT_LIMIT ? number : null
+}
+
+function finalReviewIntegerList(value: unknown, minimum: number) {
+  return Array.isArray(value)
+    ? [...new Set(value.flatMap((item) => {
+        const number = finalReviewInteger(item, minimum)
+        return number === null ? [] : [number]
+      }))]
+    : []
+}
+
+export function normalizeStoryboardFinalReviewPatch(value: unknown): StoryboardFinalReviewPatch {
+  const empty = (): StoryboardFinalReviewPatch => ({
+    passed: false,
+    issues: [],
+    order: [],
+    remove: [],
+    replacements: [],
+    insertions: [],
+    replaceAll: false,
+  })
+  if (Array.isArray(value)) {
+    const records = value.map(finalReviewRecord).filter((item): item is Record<string, unknown> => Boolean(item))
+    const fullShots = records.filter((item) => 't' in item || 'a' in item || 'n' in item)
+    if (fullShots.length === value.length && fullShots.length > 0) {
+      return {
+        ...empty(),
+        passed: true,
+        replacements: fullShots.slice(0, STORYBOARD_REVIEW_SHOT_LIMIT).map((shot, index) => ({ shotNumber: index + 1, shot })),
+        replaceAll: true,
+      }
+    }
+    const replacements = records.flatMap((item) => {
+      const shotNumber = finalReviewInteger(item.shotNumber ?? item.shotIndex ?? item.index, 1)
+      const shot = finalReviewRecord(item.shot ?? item.replacement ?? item.patch)
+      return shotNumber && shot ? [{ shotNumber, shot }] : []
+    })
+    const issues = value.flatMap((item) => {
+      if (typeof item === 'string') return [item.slice(0, 500)]
+      const record = finalReviewRecord(item)
+      const message = record && typeof (record.issue ?? record.message ?? record.problem) === 'string'
+        ? String(record.issue ?? record.message ?? record.problem).slice(0, 500)
+        : ''
+      return message ? [message] : []
+    })
+    return { ...empty(), passed: replacements.length > 0 && issues.length === 0, replacements, issues }
+  }
+
+  const record = finalReviewRecord(value)
+  if (!record) return empty()
+  const issues = Array.isArray(record.issues)
+    ? record.issues.flatMap((item) => {
+        if (typeof item === 'string') return [item.slice(0, 500)]
+        const issue = finalReviewRecord(item)
+        const message = issue && typeof (issue.issue ?? issue.message ?? issue.problem) === 'string'
+          ? String(issue.issue ?? issue.message ?? issue.problem).slice(0, 500)
+          : ''
+        return message ? [message] : []
+      }).slice(0, 24)
+    : []
+  const sourceReplacements = Array.isArray(record.replacements)
+    ? record.replacements
+    : Array.isArray(record.shots) ? record.shots : []
+  const replaceAll = Array.isArray(record.shots)
+    && record.shots.length > 0
+    && record.shots.every((item) => {
+      const shot = finalReviewRecord(item)
+      return Boolean(shot && ('t' in shot || 'a' in shot || 'n' in shot))
+    })
+  const replacements = sourceReplacements.flatMap((item, index) => {
+    const replacement = finalReviewRecord(item)
+    if (!replacement) return []
+    const nestedShot = finalReviewRecord(replacement.shot ?? replacement.replacement ?? replacement.patch)
+    const shot = nestedShot || replacement
+    const shotNumber = finalReviewInteger(
+      replacement.shotNumber ?? replacement.shotIndex ?? replacement.index ?? (Array.isArray(record.shots) ? index + 1 : null),
+      1,
+    )
+    return shotNumber ? [{ shotNumber, shot }] : []
+  }).slice(0, STORYBOARD_REVIEW_SHOT_LIMIT)
+  const insertions = (Array.isArray(record.insertions) ? record.insertions : []).flatMap((item) => {
+    const insertion = finalReviewRecord(item)
+    if (!insertion) return []
+    const afterShotNumber = finalReviewInteger(
+      insertion.afterShotNumber ?? insertion.afterIndex ?? insertion.after,
+      0,
+    )
+    const shot = finalReviewRecord(insertion.shot ?? insertion.insertion ?? insertion.patch)
+    return afterShotNumber !== null && shot ? [{ afterShotNumber, shot }] : []
+  }).slice(0, 32)
+  return {
+    passed: record.passed === true || record.pass === true || (replaceAll && issues.length === 0),
+    issues,
+    order: finalReviewIntegerList(record.order, 1),
+    remove: finalReviewIntegerList(record.remove ?? record.removed, 1),
+    replacements,
+    insertions,
+    replaceAll,
+  }
+}
+
+const storyboardFinalReviewPatchSchema = z.unknown().transform(normalizeStoryboardFinalReviewPatch)
+
+const storyboardFinalReviewIssueSchema = z.object({
+  severity: z.enum(['fatal', 'warning']),
+  category: z.enum(storyboardFinalReviewCategories),
+  shotNumbers: z.array(z.number().int().min(1).max(STORYBOARD_REVIEW_SHOT_LIMIT))
+    .max(STORYBOARD_REVIEW_SHOT_LIMIT)
+    .default([]),
+  scriptEvidence: z.string().max(1200).default(''),
+  problem: z.string().min(1).max(800),
+  repairInstruction: z.string().min(1).max(1200),
+})
+
+const storyboardEpisodeReviewCheckpointSchema = z.object({
+  episodeId: z.string().min(1),
+  stage: z.enum(['reviewed', 'repaired', 'verified']),
+  round: z.number().int().min(0).max(3),
+  noChangeAttempts: z.number().int().nonnegative().max(20).default(0),
+  modifiedShots: z.number().int().nonnegative().default(0),
+  currentShots: z.array(compactStoryboardShotSchema).min(1).max(STORYBOARD_REVIEW_SHOT_LIMIT),
+  currentIssues: z.array(storyboardFinalReviewIssueSchema).max(STORYBOARD_REVIEW_ISSUE_LIMIT).default([]),
+  bestShots: z.array(compactStoryboardShotSchema).min(1).max(STORYBOARD_REVIEW_SHOT_LIMIT),
+  bestIssues: z.array(storyboardFinalReviewIssueSchema).max(STORYBOARD_REVIEW_ISSUE_LIMIT).default([]),
+})
+
+const storyboardCheckpointV5Schema = z.object({
   version: z.literal(5),
   sourceFingerprint: z.string().min(1),
   completedEpisodeIds: z.array(z.string().min(1)).default([]),
   segments: z.array(z.object({
     episodeId: z.string().min(1),
     segmentIndex: z.number().int().nonnegative(),
-    shots: z.array(compactStoryboardShotSchema).min(1).max(40),
+    shots: z.array(compactStoryboardShotSchema).min(1).max(STORYBOARD_SEGMENT_SHOT_LIMIT),
   })).default([]),
 })
+
+const storyboardCheckpointSchema = z.object({
+  version: z.literal(6),
+  sourceFingerprint: z.string().min(1),
+  completedEpisodeIds: z.array(z.string().min(1)).default([]),
+  segments: z.array(z.object({
+    episodeId: z.string().min(1),
+    segmentIndex: z.number().int().nonnegative(),
+    shots: z.array(compactStoryboardShotSchema).min(1).max(STORYBOARD_SEGMENT_SHOT_LIMIT),
+  })).default([]),
+  episodeReviews: z.array(storyboardEpisodeReviewCheckpointSchema).default([]),
+})
+
+export function restoreStoryboardCheckpoint(value: unknown, sourceFingerprint: string) {
+  const current = storyboardCheckpointSchema.safeParse(value)
+  if (current.success && current.data.sourceFingerprint === sourceFingerprint) return current.data
+  const legacy = storyboardCheckpointV5Schema.safeParse(value)
+  if (legacy.success && legacy.data.sourceFingerprint === sourceFingerprint) {
+    return {
+      version: 6 as const,
+      sourceFingerprint,
+      completedEpisodeIds: legacy.data.completedEpisodeIds,
+      segments: legacy.data.segments,
+      episodeReviews: [],
+    }
+  }
+  return {
+    version: 6 as const,
+    sourceFingerprint,
+    completedEpisodeIds: [],
+    segments: [],
+    episodeReviews: [],
+  }
+}
 
 type TaskPayload = Record<string, unknown>
 
@@ -404,9 +741,10 @@ function configuredTextMode(provider: TextProviderName) {
 }
 
 function textModeOrder(provider: TextProviderName): StructuredTextMode[] {
-  return configuredTextMode(provider) === 'chat_completions'
-    ? ['chat_completions', 'responses']
-    : ['responses', 'chat_completions']
+  const configured = configuredTextMode(provider)
+  if (configured === 'chat_completions') return ['chat_completions', 'chat_completions']
+  if (configured === 'responses') return ['responses', 'responses']
+  return ['chat_completions', 'responses']
 }
 
 function textProviderRequest(
@@ -429,6 +767,7 @@ function textProviderRequest(
     baseUrl,
     apiKey: apiKeyOverride || textProviderKeys(provider)[0],
     model,
+    onUsage: async (usage) => { await recordTextUsageFromContext({ baseUrl, model, usage }) },
     mode: mode || input.mode || configuredTextMode(provider),
     system: input.system,
     prompt: input.prompt,
@@ -758,6 +1097,7 @@ async function saveAdaptationCheckpoint(
   taskId: string,
   payload: TaskPayload,
   checkpoint: z.output<typeof adaptationCheckpointSchema>,
+  progress?: ScriptQualityProgress,
 ) {
   await prisma.generationTask.update({
     where: { id: taskId },
@@ -765,6 +1105,7 @@ async function saveAdaptationCheckpoint(
       payload: {
         ...payload,
         adaptationCheckpoint: checkpoint,
+        ...(progress ? { scriptQualityProgress: progress } : {}),
       } as Prisma.InputJsonObject,
     },
   })
@@ -779,7 +1120,88 @@ async function processScriptAdaptation(task: {
   if (!source) throw new Error('请先保存小说原文')
   const payload = payloadRecord(task.payload)
   const targetEpisodeCount = Math.max(1, Math.min(60, Number(payload.targetEpisodeCount) || 15))
-  const episodeMinutes = Math.max(0.5, Math.min(10, Number(payload.episodeMinutes) || 1.5))
+  const episodeMinutes = Math.max(0.5, Math.min(3, Number(payload.episodeMinutes) || 1.5))
+  const completedScreenplay = parseCompletedScreenplay(source.content)
+  if (completedScreenplay) {
+    const detectedEpisodeCount = completedScreenplay.episodes.length
+    if (targetEpisodeCount !== detectedEpisodeCount) {
+      throw new Error(
+        `COMPLETED_SCREENPLAY_EPISODE_COUNT_MISMATCH: 已识别为 ${detectedEpisodeCount} 集完整分集剧本，`
+        + `目标集数必须设置为 ${detectedEpisodeCount}；系统不会把成稿压缩或扩写为 ${targetEpisodeCount} 集。`,
+      )
+    }
+
+    await updateProgress(task.id, 20)
+    let detachedStoryboardCount = 0
+    await prisma.$transaction(async (tx) => {
+      const importedByNumber = new Map(completedScreenplay.episodes.map((episode) => [
+        episode.episodeNumber,
+        episode,
+      ]))
+      const existingEpisodes = await tx.scriptEpisode.findMany({
+        where: { projectId: task.projectId },
+        select: { id: true, episodeNumber: true, title: true, content: true },
+      })
+      const changedEpisodeIds = existingEpisodes.flatMap((episode) => {
+        const imported = importedByNumber.get(episode.episodeNumber)
+        return imported && (imported.title !== episode.title || imported.content !== episode.content)
+          ? [episode.id]
+          : []
+      })
+      if (changedEpisodeIds.length > 0) {
+        const detached = await tx.storyboard.updateMany({
+          where: { episodeId: { in: changedEpisodeIds } },
+          data: { episodeId: null, episodeSceneNumber: null },
+        })
+        detachedStoryboardCount = detached.count
+      }
+
+      for (const episode of completedScreenplay.episodes) {
+        await tx.scriptEpisode.upsert({
+          where: {
+            projectId_episodeNumber: {
+              projectId: task.projectId,
+              episodeNumber: episode.episodeNumber,
+            },
+          },
+          update: {
+            title: episode.title,
+            logline: null,
+            content: episode.content,
+            sourceChunkIndexes: [episode.episodeNumber],
+            locked: false,
+          },
+          create: {
+            projectId: task.projectId,
+            episodeNumber: episode.episodeNumber,
+            title: episode.title,
+            logline: null,
+            content: episode.content,
+            sourceChunkIndexes: [episode.episodeNumber],
+            locked: false,
+          },
+        })
+      }
+      await tx.scriptEpisode.deleteMany({
+        where: {
+          projectId: task.projectId,
+          episodeNumber: { notIn: completedScreenplay.episodes.map((episode) => episode.episodeNumber) },
+        },
+      })
+    })
+    await updateProgress(task.id, 98)
+
+    return {
+      targetEpisodeCount,
+      episodeMinutes,
+      episodeCount: detectedEpisodeCount,
+      directScreenplayImport: true,
+      aiRewriteSkipped: true,
+      sourcePreserved: true,
+      detachedStoryboardCount,
+      pipelineVersion: 'completed-screenplay-direct-import-v1',
+    }
+  }
   const segmentation = splitSourceForEpisodes(source.content, targetEpisodeCount)
   const chunks = segmentation.chunks
   if (chunks.length > 40) {
@@ -800,6 +1222,8 @@ async function processScriptAdaptation(task: {
         nameMappings: [],
         nameAuditCompleted: false,
         qualityRepairCount: 0,
+        qualityAuditScore: 0,
+        qualityAuditWarnings: [],
       }
   const analyses: Array<{ index: number; analysis: string }> = [...checkpoint.analyses]
   await updateProgress(task.id, 5)
@@ -1149,9 +1573,6 @@ async function processScriptAdaptation(task: {
         // The optional dialogue repair must not discard an otherwise complete episode draft.
       }
     }
-    if (missing.length > 0) {
-      parsed.content += `\n\n【原著对白核对区｜需导演安放】\n${missing.map((item) => `- ${item.text}`).join('\n')}`
-    }
     let draft = {
       episodeNumber: index + 1,
       title: parsed.title || episode.title,
@@ -1181,8 +1602,60 @@ async function processScriptAdaptation(task: {
     await updateProgress(task.id, 48 + (drafts.length / plan.length) * 38)
   }
 
+  const cloneDrafts = (items: typeof drafts) => items.map((draft) => ({
+    ...draft,
+    sourceChunkIndexes: [...draft.sourceChunkIndexes],
+  }))
+  const scriptQualityIssueCount = (audit: ReturnType<typeof auditScriptEpisodes>) => (
+    audit.duplicatePairs.length
+    + audit.missingHooks.length
+    + audit.lengthIssues.length
+    + (audit.firstEpisodeColdOpenIssue ? 1 : 0)
+  )
+  const scriptQualityProgress = (
+    phase: ScriptQualityProgress['phase'],
+    reviewRound: number,
+    audit: ReturnType<typeof auditScriptEpisodes>,
+    warning?: string,
+  ): ScriptQualityProgress => ({
+    phase,
+    completedEpisodes: drafts.length,
+    totalEpisodes: plan.length,
+    completedSegments: drafts.length,
+    totalSegments: plan.length,
+    activeEpisodeNumbers: [...new Set([
+      ...audit.duplicatePairs.flatMap((item) => [item.leftEpisode, item.rightEpisode]),
+      ...audit.missingHooks.map((item) => item.episodeNumber),
+      ...audit.lengthIssues.map((item) => item.episodeNumber),
+      ...(audit.firstEpisodeColdOpenIssue ? [1] : []),
+    ])].sort((left, right) => left - right),
+    activeRoutes: [],
+    parallelism: 1,
+    segmentParallelism: 1,
+    reviewRound,
+    maximumReviewRounds: 3,
+    modifiedShots: checkpoint.qualityRepairCount,
+    remainingIssues: scriptQualityIssueCount(audit),
+    fatalIssues: 0,
+    ...(warning ? { warning } : {}),
+  })
+
   let qualityAudit = auditScriptEpisodes(drafts, episodeMinutes)
-  for (let pass = 0; pass < 2 && !scriptAuditPassed(qualityAudit); pass++) {
+  let bestQualityDrafts = cloneDrafts(drafts)
+  let bestQualityAudit = qualityAudit
+  let bestQualityScore = scriptQualityAuditScore(qualityAudit)
+  const captureBestQualityDraft = () => {
+    const score = scriptQualityAuditScore(qualityAudit)
+    if (score > bestQualityScore) return
+    bestQualityScore = score
+    bestQualityDrafts = cloneDrafts(drafts)
+    bestQualityAudit = qualityAudit
+  }
+  checkpoint.qualityAuditScore = bestQualityScore
+  checkpoint.qualityAuditWarnings = scriptQualityAuditWarnings(bestQualityAudit)
+  await saveAdaptationCheckpoint(task.id, payload, checkpoint, scriptQualityProgress('reviewing', 0, qualityAudit))
+
+  for (let pass = 0; pass < 3 && !scriptAuditPassed(qualityAudit); pass++) {
     let deterministicDedupApplied = false
     for (const duplicate of qualityAudit.duplicatePairs) {
       if (duplicate.rightEpisode !== duplicate.leftEpisode + 1) continue
@@ -1196,8 +1669,14 @@ async function processScriptAdaptation(task: {
     }
     if (deterministicDedupApplied) {
       checkpoint.drafts = drafts
-      await saveAdaptationCheckpoint(task.id, payload, checkpoint)
       qualityAudit = auditScriptEpisodes(drafts, episodeMinutes)
+      captureBestQualityDraft()
+      await saveAdaptationCheckpoint(
+        task.id,
+        payload,
+        checkpoint,
+        scriptQualityProgress('repairing', pass + 1, qualityAudit),
+      )
       if (scriptAuditPassed(qualityAudit)) break
     }
     const issueMap = new Map<number, Set<string>>()
@@ -1228,27 +1707,53 @@ async function processScriptAdaptation(task: {
       )
     }
 
+    await saveAdaptationCheckpoint(
+      task.id,
+      payload,
+      checkpoint,
+      scriptQualityProgress('repairing', pass + 1, qualityAudit),
+    )
     for (const [episodeNumber, issueSet] of [...issueMap.entries()].sort((left, right) => left[0] - right[0])) {
       const draftIndex = drafts.findIndex((draft) => draft.episodeNumber === episodeNumber)
       if (draftIndex < 0) continue
       drafts[draftIndex] = await repairEpisodeDraft(drafts[draftIndex], draftIndex, [...issueSet])
       checkpoint.drafts = drafts
-      await saveAdaptationCheckpoint(task.id, payload, checkpoint)
+      await saveAdaptationCheckpoint(
+        task.id,
+        payload,
+        checkpoint,
+        scriptQualityProgress('repairing', pass + 1, qualityAudit),
+      )
       await updateProgress(task.id, 87 + ((draftIndex + 1) / drafts.length) * 6)
     }
     qualityAudit = auditScriptEpisodes(drafts, episodeMinutes)
-  }
-  if (!scriptAuditPassed(qualityAudit)) {
-    const duplicateSummary = qualityAudit.duplicatePairs
-      .slice(0, 6)
-      .map((item) => `${item.leftEpisode}-${item.rightEpisode}`)
-      .join('、')
-    throw new Error(
-      `SCRIPT_QUALITY_AUDIT_FAILED: 全剧终检未通过；重复集对 ${duplicateSummary || '无'}，`
-      + `缺少 Hook ${qualityAudit.missingHooks.map((item) => item.episodeNumber).join('、') || '无'}，`
-      + `时长异常 ${qualityAudit.lengthIssues.map((item) => item.episodeNumber).join('、') || '无'}。任务会保留检查点供自动续跑。`,
+    captureBestQualityDraft()
+    drafts.splice(0, drafts.length, ...cloneDrafts(bestQualityDrafts))
+    qualityAudit = bestQualityAudit
+    checkpoint.drafts = drafts
+    checkpoint.qualityAuditScore = bestQualityScore
+    checkpoint.qualityAuditWarnings = scriptQualityAuditWarnings(bestQualityAudit)
+    await saveAdaptationCheckpoint(
+      task.id,
+      payload,
+      checkpoint,
+      scriptQualityProgress('verifying', pass + 1, qualityAudit),
     )
   }
+  drafts.splice(0, drafts.length, ...cloneDrafts(bestQualityDrafts))
+  qualityAudit = bestQualityAudit
+  checkpoint.drafts = drafts
+  checkpoint.qualityAuditScore = bestQualityScore
+  checkpoint.qualityAuditWarnings = scriptQualityAuditWarnings(qualityAudit)
+  let qualityWarning = checkpoint.qualityAuditWarnings.length > 0
+    ? `已自动返工并保存问题最少的剧本，可继续下一步。${checkpoint.qualityAuditWarnings.join('；')}`
+    : undefined
+  await saveAdaptationCheckpoint(
+    task.id,
+    payload,
+    checkpoint,
+    scriptQualityProgress('verifying', 3, qualityAudit, qualityWarning),
+  )
   await updateProgress(task.id, 94)
 
   const observedByName = new Map<string, { episodes: Set<number>; examples: string[] }>()
@@ -1307,13 +1812,19 @@ async function processScriptAdaptation(task: {
     }
   }
   checkpoint.drafts = drafts
-  await saveAdaptationCheckpoint(task.id, payload, checkpoint)
-  await updateProgress(task.id, 96)
-
   qualityAudit = auditScriptEpisodes(drafts, episodeMinutes)
-  if (!scriptAuditPassed(qualityAudit)) {
-    throw new Error('SCRIPT_QUALITY_AUDIT_FAILED_AFTER_NAME_NORMALIZATION: 姓名统一后的全剧终检未通过，未覆盖现有剧本')
-  }
+  checkpoint.qualityAuditScore = scriptQualityAuditScore(qualityAudit)
+  checkpoint.qualityAuditWarnings = scriptQualityAuditWarnings(qualityAudit)
+  qualityWarning = checkpoint.qualityAuditWarnings.length > 0
+    ? `已自动返工并保存问题最少的剧本，可继续下一步。${checkpoint.qualityAuditWarnings.join('；')}`
+    : undefined
+  await saveAdaptationCheckpoint(
+    task.id,
+    payload,
+    checkpoint,
+    scriptQualityProgress('finalizing', 3, qualityAudit, qualityWarning),
+  )
+  await updateProgress(task.id, 96)
 
   await prisma.$transaction(async (tx) => {
     for (const draft of drafts) {
@@ -1366,7 +1877,11 @@ async function processScriptAdaptation(task: {
       firstEpisodeFlashforwardColdOpen: qualityAudit.firstEpisodeColdOpenIssue === null,
       lengthIssueCount: qualityAudit.lengthIssues.length,
       repairCount: checkpoint.qualityRepairCount,
+      score: checkpoint.qualityAuditScore,
+      warnings: checkpoint.qualityAuditWarnings,
+      passed: scriptAuditPassed(qualityAudit),
     },
+    scriptQualityProgress: scriptQualityProgress('finalizing', 3, qualityAudit, qualityWarning),
     sequentialEpisodeDrafting: true,
     pipelineVersion: SCRIPT_ADAPTATION_PIPELINE_VERSION,
   }
@@ -1757,7 +2272,7 @@ async function processAssetExtraction(task: {
           knownAssets,
           storyboardEvidence: storyboardAssetEvidence(episodeStoryboards, type),
         }),
-        schema: assetInventorySchema,
+        schema: assetInventorySchemaForType(type),
         maxOutputTokens: type === AssetType.prop ? 1400 : 1100,
       })
       return {
@@ -1842,7 +2357,7 @@ async function processAssetExtraction(task: {
             knownAssets: [...existingAssets, ...priorCurated],
             episodeAppearances,
           }),
-          schema: assetInventorySchema,
+          schema: assetInventorySchemaForType(type),
           maxOutputTokens: 1800,
         })
         curated = response.assets
@@ -1939,7 +2454,7 @@ async function processAssetExtraction(task: {
           customStylePrompt: project.customStylePrompt,
         }),
         schema: assetPromptResultSchema,
-        maxOutputTokens: 2800,
+        maxOutputTokens: 1600,
       })
       return {
         key,
@@ -1988,6 +2503,7 @@ async function processAssetExtraction(task: {
       prompt: candidate.prompt,
       characterNames,
       visualStyle: productionProject.visualStyle,
+      customStylePrompt: productionProject.customStylePrompt,
       preserveName: candidate.type === AssetType.location && storyboardSceneNames.has(candidate.name),
     })
     let existing = await prisma.asset.findFirst({
@@ -2085,7 +2601,7 @@ async function processAssetExtraction(task: {
               customStylePrompt: productionProject.customStylePrompt,
             }),
             schema: assetPromptResultSchema,
-            maxOutputTokens: 2800,
+            maxOutputTokens: 1600,
           })
           repair = {
             ...anchor,
@@ -2146,58 +2662,211 @@ async function processAssetExtraction(task: {
 
 type GeneratedStoryboard = z.output<typeof generatedStoryboardSchema>['storyboards'][number]
 type CompactShot = z.output<typeof compactStoryboardSchema>['shots'][number]
-type CompactShotCore = Pick<CompactShot, 't' | 'n' | 'c' | 'v' | 'a' | 'd'>
-type CompactShotInput = CompactShotCore & Partial<Omit<CompactShot, keyof CompactShotCore>>
+export type CompactShotInput = Partial<CompactShot>
 
 export function normalizeCompactShot(shot: CompactShotInput): CompactShot {
   return compactStoryboardShotSchema.parse(shot)
 }
 
-export function splitStoryboardScript(content: string, maxChars = 320) {
-  const lines = content.replace(/\r\n/g, '\n').split('\n').map((line) => line.trim()).filter(Boolean)
-  const units = lines.flatMap((line) => {
-    if (line.length <= maxChars) return [line]
-    return line.match(/[^。！？!?；;]+[。！？!?；;]?/g)?.map((item) => item.trim()).filter(Boolean) || [line]
-  })
-  const chunks: string[] = []
-  let current = ''
-  for (const unit of units) {
-    if (current && current.length + unit.length + 1 > maxChars) {
-      chunks.push(current)
-      current = ''
+export function applyStoryboardFinalReviewPatch(
+  inputShots: CompactShotInput[],
+  patch: z.output<typeof storyboardFinalReviewPatchSchema>,
+) {
+  const shots = inputShots.map(normalizeCompactShot)
+  if (patch.replaceAll) {
+    const replacementShots = [...patch.replacements]
+      .sort((left, right) => left.shotNumber - right.shotNumber)
+      .map((item) => normalizeCompactShot({
+        ...(shots[item.shotNumber - 1] || {}),
+        ...item.shot,
+      }))
+    const insertions = new Map<number, CompactShot[]>()
+    for (const insertion of patch.insertions) {
+      const current = insertions.get(insertion.afterShotNumber) || []
+      current.push(normalizeCompactShot(insertion.shot))
+      insertions.set(insertion.afterShotNumber, current)
     }
-    if (unit.length > maxChars) {
-      for (let start = 0; start < unit.length; start += maxChars) {
-        if (current) {
-          chunks.push(current)
-          current = ''
-        }
-        chunks.push(unit.slice(start, start + maxChars))
-      }
-    } else {
-      current += `${current ? '\n' : ''}${unit}`
+    const result: CompactShot[] = [...(insertions.get(0) || [])]
+    replacementShots.forEach((shot, index) => {
+      result.push(shot)
+      result.push(...(insertions.get(index + 1) || []))
+    })
+    return result
+  }
+  const removed = new Set(patch.remove.filter((shotNumber) => shotNumber <= shots.length))
+  const replacements = new Map(
+    patch.replacements
+      .filter((item) => item.shotNumber <= shots.length)
+      .map((item) => [item.shotNumber, normalizeCompactShot({
+        ...shots[item.shotNumber - 1],
+        ...item.shot,
+      })]),
+  )
+  const requestedOrder = [...new Set(patch.order)]
+    .filter((shotNumber) => shotNumber <= shots.length && !removed.has(shotNumber))
+  const order = requestedOrder.length > 0
+    ? [
+        ...requestedOrder,
+        ...shots.map((_shot, index) => index + 1)
+          .filter((shotNumber) => !removed.has(shotNumber) && !requestedOrder.includes(shotNumber)),
+      ]
+    : shots.map((_shot, index) => index + 1).filter((shotNumber) => !removed.has(shotNumber))
+  const insertions = new Map<number, CompactShot[]>()
+  for (const insertion of patch.insertions) {
+    const current = insertions.get(insertion.afterShotNumber) || []
+    current.push(normalizeCompactShot(insertion.shot))
+    insertions.set(insertion.afterShotNumber, current)
+  }
+
+  const result: CompactShot[] = [...(insertions.get(0) || [])]
+  for (const shotNumber of order) {
+    result.push(replacements.get(shotNumber) || shots[shotNumber - 1])
+    result.push(...(insertions.get(shotNumber) || []))
+  }
+  const unplacedInsertions = [...insertions.entries()]
+    .filter(([afterShotNumber]) => afterShotNumber !== 0 && !order.includes(afterShotNumber))
+    .flatMap(([, values]) => values)
+  result.push(...unplacedInsertions)
+  return result
+}
+
+export function storyboardFinalReviewIssueScore(issues: StoryboardFinalReviewIssue[]) {
+  const fatal = issues.filter((issue) => issue.severity === 'fatal').length
+  const warning = issues.length - fatal
+  return fatal * 10_000 + warning * 100 + issues.length
+}
+
+export function storyboardFinalReviewHasFatalIssues(issues: StoryboardFinalReviewIssue[]) {
+  return issues.some((issue) => issue.severity === 'fatal')
+}
+
+export function nonBlockingStoryboardReviewWarnings(issues: StoryboardFinalReviewIssue[]) {
+  return issues.map((issue) => ({
+    ...issue,
+  }))
+}
+
+export function storyboardShotChangeCount(before: CompactShotInput[], after: CompactShotInput[]) {
+  const normalizedBefore = before.map(normalizeCompactShot)
+  const normalizedAfter = after.map(normalizeCompactShot)
+  const length = Math.max(normalizedBefore.length, normalizedAfter.length)
+  let changed = 0
+  for (let index = 0; index < length; index++) {
+    if (JSON.stringify(normalizedBefore[index] ?? null) !== JSON.stringify(normalizedAfter[index] ?? null)) {
+      changed++
     }
   }
-  if (current) chunks.push(current)
+  return changed
+}
+
+function dedupeStoryboardFinalReviewIssues(issues: StoryboardFinalReviewIssue[]) {
+  const seen = new Set<string>()
+  return issues.filter((issue) => {
+    const key = `${issue.severity}:${issue.category}:${issue.shotNumbers.join(',')}:${issue.problem}`
+      .toLocaleLowerCase()
+      .replace(/\s+/g, '')
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+export function preferStoryboardReviewCandidate(input: {
+  currentShots: CompactShot[]
+  currentIssues: StoryboardFinalReviewIssue[]
+  bestShots: CompactShot[]
+  bestIssues: StoryboardFinalReviewIssue[]
+}) {
+  const currentScore = storyboardFinalReviewIssueScore(input.currentIssues)
+  const bestScore = storyboardFinalReviewIssueScore(input.bestIssues)
+  return currentScore <= bestScore
+    ? { shots: input.currentShots, issues: input.currentIssues }
+    : { shots: input.bestShots, issues: input.bestIssues }
+}
+
+export function shouldFinalizeStoryboardReviewLocally(input: {
+  stage: string | null
+  round: number
+  maximumRounds: number
+}) {
+  return input.stage === 'repaired' && input.round >= input.maximumRounds
+}
+
+export function canUseLocalStoryboardVerificationFallback(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error)
+  if (nonRetryableTextApiError(error)) return false
+  return /timeout|timed?\s*out|aborted|TEXT_API_FAILED:\s*(?:429|5\d\d)|fetch|socket|ECONN|ENOTFOUND|JSON|Zod|structured|网关|读取超时/iu.test(message)
+}
+
+export function canFinalizeStoryboardAfterRepairFailure(repairRound: number, error: unknown) {
+  return repairRound > 0 && canUseLocalStoryboardVerificationFallback(error)
+}
+
+export function splitStoryboardScript(content: string, maxChars = 520) {
+  const lines = content.replace(/\r\n/g, '\n').split('\n').map((line) => line.trim()).filter(Boolean)
+  const chunks: string[] = []
+  let current = ''
+  let sceneHeading = ''
+  const isSceneHeading = (line: string) => /^(?:\*\*)?(?:【\s*(?:(?:场次|场景)[^】]*|场\s*\d+(?:\s*[-—]\s*\d+)?[^】]*)】|(?:场次|场景)\s*[^\n]{0,80}|场\s*\d+(?:\s*[-—]\s*\d+)?(?:\s+[^\n]{0,80})?$)/u.test(line)
+  const flush = () => {
+    if (!current.trim()) return
+    chunks.push(current.trim())
+    current = ''
+  }
+  const startWithSceneHeading = () => {
+    if (!current && sceneHeading) current = sceneHeading
+  }
+
+  for (const line of lines) {
+    if (isSceneHeading(line)) {
+      flush()
+      sceneHeading = line
+      current = line
+      continue
+    }
+    const units = line.length <= maxChars
+      ? [line]
+      : line.match(/[^。！？!?；;]+[。！？!?；;]?/g)?.map((item) => item.trim()).filter(Boolean) || [line]
+    for (const unit of units) {
+      startWithSceneHeading()
+      if (current && current.length + unit.length + 1 > maxChars) {
+        flush()
+        startWithSceneHeading()
+      }
+      if (unit.length > maxChars) {
+        flush()
+        for (let start = 0; start < unit.length; start += maxChars) {
+          const slice = unit.slice(start, start + maxChars)
+          chunks.push(`${sceneHeading ? `${sceneHeading}\n` : ''}${slice}`.trim())
+        }
+      } else {
+        current += `${current ? '\n' : ''}${unit}`
+      }
+    }
+  }
+  flush()
   return chunks.length > 0 ? chunks : [content.trim()]
 }
 
 export function targetStoryboardShotCount(script: string, minimum = 1) {
-  const dialogueTurns = extractRequiredStoryboardDialogueLines(script).length
+  const dialogues = extractScriptDialogueLines(script)
+  const dialogueChars = dialogues.reduce((total, dialogue) => total + dialogue.text.length, 0)
+  const dialogueBeats = Math.ceil(dialogueChars / 70)
   const visibleChars = script.replace(/\s+/g, '').length
-  return Math.max(minimum, Math.min(30, Math.max(dialogueTurns, Math.ceil(visibleChars / 70))))
+  return Math.max(minimum, Math.min(60, Math.max(dialogueBeats, Math.ceil(visibleChars / 70))))
 }
 
 export function allocateStoryboardShotTargets(chunks: string[], targetShotCount: number) {
   if (chunks.length === 0) return []
   const targets = chunks.map((chunk) => targetStoryboardShotCount(chunk))
-  const target = Math.max(chunks.length, Math.round(targetShotCount))
-  let remaining = Math.max(0, target - targets.reduce((total, count) => total + count, 0))
+  const minimumTotal = targets.reduce((total, count) => total + count, 0)
+  const target = Math.max(minimumTotal, Math.round(targetShotCount))
+  let remaining = Math.max(0, target - minimumTotal)
   if (remaining === 0) return targets
 
   const weights = chunks.map((chunk) => (
     Math.max(1, chunk.replace(/\s+/g, '').length)
-    + extractRequiredStoryboardDialogueLines(chunk).length * 70
+    + extractScriptDialogueLines(chunk).length * 70
   ))
   const totalWeight = weights.reduce((total, weight) => total + weight, 0)
   const fractional = weights.map((weight, index) => {
@@ -2212,12 +2881,6 @@ export function allocateStoryboardShotTargets(chunks: string[], targetShotCount:
     .slice(0, remaining)
     .forEach(({ index }) => { targets[index] += 1 })
   return targets
-}
-
-const ESSENTIAL_VOICEOVER_FACT = /(?:[0-9零〇一二三四五六七八九十百千万两]+(?:年|个月|月|天|小时|分钟|公里|米|岁|次|美元|元|万|亿)|年前|年后|此前|后来|曾经|原来|其实|真相|身份|从未|已经|一直|死亡|去世|失踪|怀孕|确诊|欠债|贷款|破产|录取|退学|签证|账户|遗嘱|合同|约定|秘密|凶手)/u
-
-function essentialStoryboardVoiceover(text: string) {
-  return ESSENTIAL_VOICEOVER_FACT.test(text)
 }
 
 function parseStoryboardDialogueSegment(segment: string) {
@@ -2248,7 +2911,7 @@ export function suppressNonessentialStoryboardVoiceovers(
         && candidate.os === dialogue.os
         && (!dialogueMissing(dialogue.text, candidate.text) || !dialogueMissing(candidate.text, dialogue.text))
       ))
-      const keep = Boolean(source && essentialStoryboardVoiceover(source.text))
+      const keep = Boolean(source)
       if (!keep) removed++
       return keep
     })
@@ -2259,7 +2922,7 @@ export function suppressNonessentialStoryboardVoiceovers(
     const hasVoiceover = retainedDialogues.some(isStoryboardVoiceover)
     const hasOnscreenDialogue = retainedDialogues.some((dialogue) => !isStoryboardVoiceover(dialogue))
     const voiceRule = hasVoiceover
-      ? `${shot.q}；只保留剧本中无法视觉化的最短关键信息，不增加其他旁白或内心独白。`
+      ? `${shot.q}；完整保留原剧本旁白、画外音或【OS】，不增加原文之外的声音。`
       : hasOnscreenDialogue
         ? `${shot.q}；只生成保留的现场对白，不生成旁白、画外音或内心独白。`
         : '本镜无对白，不生成配音、旁白、画外音或内心独白。'
@@ -2272,10 +2935,824 @@ export function suppressNonessentialStoryboardVoiceovers(
   })
 }
 
-function compactShotSpeakers(shot: CompactShot) {
-  return new Set(
-    extractScriptDialogueLines(shot.a.replace(/[；;]/g, '\n')).map((dialogue) => dialogue.speaker),
+export type StoryboardAtomicityIssue = {
+  index: number
+  title: string
+  reasons: string[]
+}
+
+const MULTI_BEAT_STORYBOARD_TITLE = /(?:[\/／]|→|->|\bto\b|\s至\s|(?:抵达|进入|离开|返回).{0,16}(?:再|后|并).{0,16}(?:抵达|进入|离开|返回))/iu
+const MULTI_SETUP_CAMERA = /(?:蒙太奇|快切|跳切|多角度|镜头组|分屏|随后切|然后切|再切|切换为|转为.{0,12}(?:特写|近景|中景|全景|远景)|先.{0,24}(?:特写|近景|中景|全景|远景).{0,24}(?:再|随后|然后).{0,24}(?:特写|近景|中景|全景|远景))/u
+const LOCATION_TRANSITION_IN_SHOT = /(?:转场|场景切换|画面切到|镜头切到|随后来到|然后来到|回忆结束|回到现实|进入回忆)/u
+const PACKED_TIMELINE_MARKER = /\d+(?:\.\d+)?\s*(?:-|~|～|—|至)\s*\d+(?:\.\d+)?\s*秒/u
+
+export function storyboardAtomicityIssues(
+  shots: CompactShotInput[],
+  locations: StoryboardLocationAsset[] = [],
+) {
+  return shots.flatMap((inputShot, index): StoryboardAtomicityIssue[] => {
+    const shot = normalizeCompactShot(inputShot)
+    const reasons: string[] = []
+    const sceneText = [shot.n, shot.e, shot.f, shot.s, shot.v, shot.a, shot.g].join('\n')
+    const allText = [shot.t, sceneText, shot.c].join('\n')
+    const exactLocations = locations.filter((location) => (
+      normalizedStoryboardLocation(sceneText).includes(normalizedStoryboardLocation(location.name))
+    ))
+    const matchedLocations = [...new Map(
+      [...exactLocations, ...storyboardSemanticLocationMatches(sceneText, locations)]
+        .map((location) => [location.name, location]),
+    ).values()]
+
+    if (MULTI_BEAT_STORYBOARD_TITLE.test(shot.t)) reasons.push('标题串联了多个剧情节点')
+    if (shot.n.split('｜').length !== 2 || shot.n.includes('\n')) reasons.push('时间地点不是单一“时间｜地点”')
+    if (matchedLocations.length > 1) reasons.push(`同一镜出现多个地点：${matchedLocations.map((location) => location.name).join('、')}`)
+    if (LOCATION_TRANSITION_IN_SHOT.test(sceneText)) reasons.push('同一镜包含地点或时空切换')
+    if (MULTI_SETUP_CAMERA.test(shot.c)) reasons.push('同一镜包含快切、多角度或多个机位')
+    if (PACKED_TIMELINE_MARKER.test(allText)) reasons.push('同一镜已经包含多个带时间段的子镜头')
+    if (shot.d < 4 || shot.d > 6) reasons.push(`镜头时长为 ${shot.d} 秒，超出原子分镜 4-6 秒范围`)
+
+    return reasons.length > 0 ? [{ index, title: shot.t, reasons }] : []
+  })
+}
+
+export type StoryboardContinuityIssue = {
+  index: number
+  title: string
+  reasons: string[]
+}
+
+const COMPLETED_FALL = /(?:坠入|坠落|跌落|掉下|失去支撑.{0,12}下坠|身体迅速向下|falls?\s+(?:into|from)|plunges?)/iu
+const RESTORED_CLIFF_HOLD = /(?:悬在.{0,12}崖|抠住.{0,10}崖|抓住.{0,10}崖|扒住.{0,10}崖|hangs?\s+from\s+the\s+cliff|clings?\s+to\s+the\s+cliff)/iu
+const COMPLETED_COLLAPSE = /(?:倒地|瘫倒|昏倒|失去意识|collapses?|falls?\s+unconscious)/iu
+const RESTORED_STANDING = /(?:站起|重新起身|起身)/u
+const STANDING_WITHOUT_RECOVERY = /(?:站在|站立|快步走|继续行走|walks?|stands?)/iu
+const COMPLETED_BLACKOUT = /(?:画面|镜头)?(?:直接)?切黑|画面全黑|黑屏/u
+const EXPLICIT_TIME_RESET = /(?:回忆|倒叙|闪回|时间倒回|回到主线|重新起身|从黑屏渐亮|淡入|flashback|time\s+rewinds?|fade\s+in)/iu
+const SPOKEN_AUDIO_CONFLICT = /(?:无配音|不生成配音|无对白|全程不说话|说话人无对白)/u
+const COLLAPSE_SUBJECT_PATTERN = /(?:^|[\n，。；;：:])\s*([\p{L}\p{N}·•.'’ _-]{1,40}?)\s*(?:倒地|瘫倒|昏厥|失去意识|collapses?|falls?\s+unconscious)/gimu
+const STANDING_SUBJECT_PATTERN = /(?:^|[\n，。；;：:])\s*([\p{L}\p{N}·•.'’ _-]{1,40}?)\s*(?:站在|站立|站起|重新起身|继续行走|快步走|walks?|stands?)/gimu
+
+function storyboardStateSubjects(value: string, pattern: RegExp) {
+  return [...value.matchAll(pattern)].map((match) => match[1]
+    .replace(/^(?:先|随后|然后|最后|同时|画面中)\s*/u, '')
+    .trim()
+    .toLocaleLowerCase())
+    .filter(Boolean)
+}
+
+function normalizedDialogueKey(value: string) {
+  return value.toLocaleLowerCase().replace(/[\s\p{P}\p{S}]+/gu, '')
+}
+
+function estimatedDialogueSeconds(value: string) {
+  const hanCharacters = value.match(/\p{Script=Han}/gu)?.length || 0
+  const latinWords = value.match(/[A-Za-z]+(?:'[A-Za-z]+)?/g)?.length || 0
+  return hanCharacters / 4 + latinWords / 2.5
+}
+
+function extractStoryboardShotDialogues(value: string) {
+  const markerPattern = /(?:^|(?<=[\n；;。.!?])\s*)([\p{L}\p{N}·•.'’ _-]{1,32})(【OS】)?[：:]\s*/gmu
+  const matches = [...value.matchAll(markerPattern)]
+  if (matches.length === 0) {
+    return value
+      .split(/[\r\n；;]+/u)
+      .flatMap((segment) => extractScriptDialogueLines(segment.trim()))
+  }
+  return matches.flatMap((match, index) => {
+    const start = (match.index || 0) + match[0].length
+    const end = matches[index + 1]?.index ?? value.length
+    const text = value.slice(start, end).trim().replace(/^[\s，,]+|[\s；;]+$/gu, '')
+    if (!text || /^(?:[（(]?无对白[）)]?|no dialogue)$/iu.test(text)) return []
+    return [{
+      speaker: match[1].trim(),
+      os: Boolean(match[2]),
+      text,
+    }]
+  })
+}
+
+function normalizedStoryboardSpeaker(value: string) {
+  return value
+    .replace(/【OS】/gu, '')
+    .replace(/[（(][^）)]*[）)]/gu, '')
+    .replace(/\s+/gu, '')
+    .trim()
+}
+
+function normalizedStoryboardDialogueText(value: string) {
+  const normalized = value
+    .replace(/[\s“”「」『』'"，。！？：；、,.!?:~～…@￥&]/gu, '')
+    .replace(/^嗯+/gu, '')
+    .replace(/没没(?:啊)?/gu, '没有')
+  return normalized.length > 2
+    ? normalized.replace(/[啊呀呢吧]+$/gu, '')
+    : normalized
+}
+
+function storyboardDialogueLcsRatio(source: string, candidate: string) {
+  if (!source || !candidate) return 0
+  let previous = new Uint16Array(candidate.length + 1)
+  for (let sourceIndex = 0; sourceIndex < source.length; sourceIndex++) {
+    const current = new Uint16Array(candidate.length + 1)
+    for (let candidateIndex = 0; candidateIndex < candidate.length; candidateIndex++) {
+      current[candidateIndex + 1] = source[sourceIndex] === candidate[candidateIndex]
+        ? previous[candidateIndex] + 1
+        : Math.max(previous[candidateIndex + 1], current[candidateIndex])
+    }
+    previous = current
+  }
+  return previous[candidate.length] / source.length
+}
+
+function storyboardDialogueBigramCoverage(source: string, candidate: string) {
+  if (source.length < 2) return candidate.includes(source) ? 1 : 0
+  const sourceBigrams = new Set(
+    Array.from({ length: source.length - 1 }, (_value, index) => source.slice(index, index + 2)),
   )
+  let matched = 0
+  for (const bigram of sourceBigrams) {
+    if (candidate.includes(bigram)) matched++
+  }
+  return matched / Math.max(1, sourceBigrams.size)
+}
+
+function storyboardDialogueNumericFacts(value: string) {
+  return value.match(/(?:\d+(?:\.\d+)?|[一二三四五六七八九十百千万]+)(?:万|岁|年|块|元)/gu) || []
+}
+
+function storyboardDialogueMeaningCovered(sourceValue: string, candidateValue: string) {
+  const source = normalizedStoryboardDialogueText(sourceValue)
+  const candidate = normalizedStoryboardDialogueText(candidateValue)
+  if (!source || !candidate) return false
+  if (candidate.includes(source)) return true
+  if (source.length < 2 || candidate.length < 2) return false
+  const numericFacts = storyboardDialogueNumericFacts(sourceValue)
+  if (numericFacts.some((fact) => !candidateValue.includes(fact))) return false
+  const lcsRatio = storyboardDialogueLcsRatio(source, candidate)
+  const bigramCoverage = storyboardDialogueBigramCoverage(source, candidate)
+  const retainedLength = Math.min(1, candidate.length / source.length)
+  if (source.length <= 8) return lcsRatio >= 0.75 && retainedLength >= 0.6
+  if (source.length <= 20) return lcsRatio >= 0.48 && bigramCoverage >= 0.3 && retainedLength >= 0.4
+  return lcsRatio >= 0.45 && bigramCoverage >= 0.28 && retainedLength >= 0.35
+}
+
+export function storyboardDialogueMissing(
+  inputShots: CompactShotInput[],
+  sourceDialogue: { speaker: string; text: string; os?: boolean },
+) {
+  if (normalizedStoryboardDialogueText(sourceDialogue.text).length < 2) return false
+  const sourceSpeaker = normalizedStoryboardSpeaker(sourceDialogue.speaker)
+  const generated = inputShots.flatMap((inputShot) => (
+    extractStoryboardShotDialogues(normalizeCompactShot(inputShot).a)
+  ))
+  const candidates: string[] = []
+  for (let index = 0; index < generated.length; index++) {
+    if (normalizedStoryboardSpeaker(generated[index].speaker) !== sourceSpeaker) continue
+    if (sourceDialogue.os !== undefined && generated[index].os !== sourceDialogue.os) continue
+    let combined = ''
+    for (let cursor = index; cursor < Math.min(generated.length, index + 5); cursor++) {
+      if (normalizedStoryboardSpeaker(generated[cursor].speaker) !== sourceSpeaker) break
+      if (sourceDialogue.os !== undefined && generated[cursor].os !== sourceDialogue.os) break
+      combined += generated[cursor].text
+      candidates.push(combined)
+    }
+  }
+  return !candidates.some((candidate) => storyboardDialogueMeaningCovered(sourceDialogue.text, candidate))
+}
+
+export function dedupeStoryboardDialogueShots(
+  inputShots: CompactShotInput[],
+  options: {
+    script?: string
+    visualStyle?: VisualStyle
+  } = {},
+) {
+  const sourceCounts = new Map<string, number>()
+  for (const dialogue of options.script ? extractScriptDialogueLines(options.script) : []) {
+    const key = `${dialogue.speaker}:${dialogue.os ? 'os' : 'spoken'}:${normalizedDialogueKey(dialogue.text)}`
+    sourceCounts.set(key, (sourceCounts.get(key) || 0) + 1)
+  }
+  const hasMarkedColdOpen = Boolean(
+    options.script?.includes(SCRIPT_COLD_OPEN_START)
+    && options.script.includes(SCRIPT_MAIN_TIMELINE_START),
+  )
+  const seenCounts = new Map<string, number>()
+
+  return inputShots.map((inputShot): CompactShot => {
+    const shot = normalizeCompactShot(inputShot)
+    const dialogues = extractStoryboardShotDialogues(shot.a)
+    if (dialogues.length === 0) return shot
+
+    const retained = dialogues.filter((dialogue) => {
+      const normalizedText = normalizedDialogueKey(dialogue.text)
+      if (normalizedText.length < 2) return true
+      const key = `${dialogue.speaker}:${dialogue.os ? 'os' : 'spoken'}:${normalizedText}`
+      const seenCount = seenCounts.get(key) || 0
+      const allowedCount = sourceCounts.get(key)
+        || (options.visualStyle === VisualStyle.overseas_live_action && hasMarkedColdOpen ? 2 : 1)
+      if (seenCount >= allowedCount) return false
+      seenCounts.set(key, seenCount + 1)
+      return true
+    })
+    if (retained.length === dialogues.length) return shot
+    if (retained.length === 0) {
+      return {
+        ...shot,
+        t: shot.t.replace(/（对白续镜\s*\d+）/gu, '').trim() || '无对白反应',
+        a: '无对白。',
+        q: '无对白；保留人物自然呼吸和现场反应。',
+        o: '保留当前场景环境声和必要音效；无背景音乐、无字幕。',
+      }
+    }
+    return {
+      ...shot,
+      a: retained.map((dialogue) => (
+        `${dialogue.speaker}${dialogue.os ? '【OS】' : ''}：${dialogue.text}`
+      )).join('；'),
+    }
+  })
+}
+
+function splitDialogueTextForTiming(text: string, maximumSeconds: number) {
+  if (estimatedDialogueSeconds(text) <= maximumSeconds) return [text]
+  const hanCharacters = text.match(/\p{Script=Han}/gu)?.length || 0
+  const latinWords = text.match(/[A-Za-z]+(?:'[A-Za-z]+)?/g)?.length || 0
+  if (latinWords >= hanCharacters) {
+    const maximumWords = Math.max(5, Math.floor(maximumSeconds * 2.5))
+    const protectedText = text.replace(/\b(Mr|Mrs|Ms|Dr|Prof|St)\./giu, '$1<prd>')
+    const restoreAbbreviations = (value: string) => value.replace(/<prd>/gu, '.')
+    const sentenceUnits = protectedText.match(/[^,;.!?]+[,;.!?]+|[^,;.!?]+$/gu)
+      ?.map((sentence) => restoreAbbreviations(sentence.trim()))
+      .filter(Boolean) || [text]
+    const groups: string[] = []
+    for (const sentence of sentenceUnits) {
+      const words = sentence.split(/\s+/u).filter(Boolean)
+      if (words.length > maximumWords) {
+        const chunkCount = Math.ceil(words.length / maximumWords)
+        const balancedSize = Math.ceil(words.length / chunkCount)
+        const chunks: string[][] = []
+        for (let index = 0; index < words.length; index += balancedSize) {
+          chunks.push(words.slice(index, index + balancedSize))
+        }
+        for (let index = 0; index < chunks.length - 1; index++) {
+          const lastWord = chunks[index].at(-1)?.replace(/[^A-Za-z']/gu, '').toLocaleLowerCase() || ''
+          if (/^(?:a|an|the|of|to|for|from|with|and|or|but|as)$/u.test(lastWord) && chunks[index + 1].length > 0) {
+            chunks[index].push(chunks[index + 1].shift() as string)
+          }
+        }
+        groups.push(...chunks.filter((chunk) => chunk.length > 0).map((chunk) => chunk.join(' ')))
+        continue
+      }
+      const current = groups.at(-1)
+      const currentWords = current?.split(/\s+/u).filter(Boolean).length || 0
+      if (current && currentWords + words.length <= maximumWords) {
+        groups[groups.length - 1] = `${current} ${sentence}`
+      } else {
+        groups.push(sentence)
+      }
+    }
+    return groups.filter(Boolean)
+  }
+  const maximumCharacters = Math.max(8, Math.floor(maximumSeconds * 4))
+  const clauses = text.match(/[^，,；;。！？!?]+[，,；;。！？!?]?/gu)?.map((item) => item.trim()).filter(Boolean)
+    || [text]
+  const groups: string[] = []
+  const protectedWords = /要不|富婆|大学|学姐|腰子|身份证|迈巴赫|民政局|洛雪微|林夏|陆野/gu
+  const splitLongClause = (clause: string) => {
+    const characters = [...clause]
+    const chunkCount = Math.ceil(characters.length / maximumCharacters)
+    const balancedSize = Math.ceil(characters.length / chunkCount)
+    const chunks: string[] = []
+    let start = 0
+    while (start < characters.length) {
+      let end = Math.min(characters.length, start + balancedSize)
+      if (end < characters.length) {
+        const joined = characters.join('')
+        for (const match of joined.matchAll(protectedWords)) {
+          const wordStart = match.index || 0
+          const wordEnd = wordStart + match[0].length
+          if (wordStart < end && end < wordEnd) {
+            end = wordStart - start >= Math.max(6, Math.floor(balancedSize * 0.55))
+              ? wordStart
+              : wordEnd
+            break
+          }
+        }
+      }
+      if (end <= start) end = Math.min(characters.length, start + balancedSize)
+      chunks.push(characters.slice(start, end).join(''))
+      start = end
+    }
+    return chunks
+  }
+  for (const clause of clauses) {
+    if ([...clause].length > maximumCharacters) {
+      groups.push(...splitLongClause(clause))
+      continue
+    }
+    const current = groups.at(-1) || ''
+    if (current && [...current, ...clause].length <= maximumCharacters) {
+      groups[groups.length - 1] = `${current}${clause}`
+    } else {
+      groups.push(clause)
+    }
+  }
+  return groups.filter(Boolean)
+}
+
+export function splitOverlongStoryboardDialogueShots(inputShots: CompactShotInput[]) {
+  return inputShots.flatMap((inputShot): CompactShot[] => {
+    const normalizedShot = normalizeCompactShot(inputShot)
+    const requestedDuration = Number(inputShot.d)
+    const shot = Number.isInteger(requestedDuration) && requestedDuration >= 3 && requestedDuration <= 15
+      ? { ...normalizedShot, d: requestedDuration }
+      : normalizedShot
+    const dialogues = extractStoryboardShotDialogues(shot.a)
+    const currentSeconds = dialogues.reduce(
+      (total, dialogue) => total + estimatedDialogueSeconds(dialogue.text),
+      dialogues.length > 0 ? 0.5 + Math.max(0, dialogues.length - 1) * 0.5 : 0,
+    )
+    if (dialogues.length === 0 || currentSeconds <= shot.d + 0.05) return [shot]
+
+    const originalEnding = [shot.s, shot.m, shot.v, shot.g, shot.x].join('\n')
+    const hasTerminalAction = COMPLETED_FALL.test(originalEnding)
+      || COMPLETED_COLLAPSE.test(originalEnding)
+      || COMPLETED_BLACKOUT.test(originalEnding)
+    const maximumDialogueSeconds = hasTerminalAction ? 4 : 5
+    const maximumGroupSeconds = hasTerminalAction ? 4.75 : 5.75
+    const emotionalPovOwner = normalizedDirectorPovOwner(
+      shot.i.match(STORYBOARD_EMOTIONAL_POV)?.[1] || '',
+    )
+    const reactionOwner = emotionalPovOwner && !/^(?:场景|环境|空间|无)$/u.test(emotionalPovOwner)
+      ? emotionalPovOwner
+      : ''
+    const units = dialogues.flatMap((dialogue) => (
+      splitDialogueTextForTiming(dialogue.text, maximumDialogueSeconds).map((text) => ({ ...dialogue, text }))
+    ))
+    const groups: typeof units[] = []
+    for (const unit of units) {
+      const current = groups.at(-1)
+      const candidate = [...(current || []), unit]
+      const candidateSeconds = candidate.reduce(
+        (total, dialogue) => total + estimatedDialogueSeconds(dialogue.text),
+        0.5 + Math.max(0, candidate.length - 1) * 0.5,
+      )
+      if (current && candidateSeconds <= maximumGroupSeconds) current.push(unit)
+      else groups.push([unit])
+    }
+
+    return groups.map((group, index): CompactShot => {
+      const duration = Math.max(4, Math.min(6, Math.ceil(group.reduce(
+        (total, dialogue) => total + estimatedDialogueSeconds(dialogue.text),
+        0.5 + Math.max(0, group.length - 1) * 0.5,
+      ))))
+      const dialogueText = group.map((dialogue) => (
+        `${dialogue.speaker}${dialogue.os ? '【OS】' : ''}：${dialogue.text}`
+      )).join('；')
+      const speakerNames = [...new Set(group.map((dialogue) => dialogue.speaker))]
+      const continuation = index > 0
+      const finalGroup = index === groups.length - 1
+      const holdTerminalAction = hasTerminalAction && !finalGroup
+      const dialogueAction = `${speakerNames.join('、')}按顺序完成本段现场对白，其余人物保持倾听；本镜不提前执行后续不可逆动作。`
+      const continuationCamera = index % 3 === 1
+        ? `${reactionOwner || '主要倾听者'}正面或清晰侧面近景，固定机位，优先读取触发后的面部反应`
+        : index % 3 === 2
+          ? `从${reactionOwner || '主要倾听者'}肩后拍摄的双人中近景，过肩固定机位，同时保留说话者口型和倾听者侧脸`
+          : continuation
+            ? `关系双人中景，侧面轻微手持，保持说话者与${reactionOwner || '主要倾听者'}的视线关系`
+            : shot.c
+      const continuationReaction = reactionOwner
+        ? `${reactionOwner}保持正脸或清晰侧脸可见；触发台词结束后保留${reactionOwner}至少一秒可读反应，具体呈现视线、眉眼或嘴角变化。`
+        : '主要倾听者保持正脸或清晰侧脸可见；触发台词结束后保留至少一秒可读反应。'
+      return normalizeCompactShot({
+        ...shot,
+        t: continuation ? `${shot.t}（对白续镜 ${index + 1}）`.slice(0, 120) : shot.t,
+        p: continuation ? '严格承接上一镜尾帧，人物、站位、视线、手部、道具和场景均不重置。' : shot.p,
+        c: continuationCamera,
+        f: continuation
+          ? `从上一镜尾帧直接继续；${reactionOwner || '主要倾听者'}正脸或清晰侧脸在画内，当前说话者开始本段口型。`
+          : shot.f,
+        s: holdTerminalAction
+          ? dialogueAction
+          : hasTerminalAction && finalGroup
+            ? `先由${speakerNames.join('、')}按顺序完成本段现场对白；对白结束后再连续执行：${shot.s}`
+            : continuation
+              ? `先保持上一镜结束姿态；随后${speakerNames.join('、')}按顺序继续现场对白；最后在本段对白结束后自然停顿。`
+              : shot.s,
+        m: holdTerminalAction
+          ? '人物保持动作发生前的稳定支撑、站位、重心、手部和道具状态，不坠落、不倒地、不离场、不切黑。'
+          : continuation && !hasTerminalAction
+            ? '人物保持稳定站位和重心，不发生新的身体接触、换位、换手或道具转移。'
+            : shot.m,
+        v: holdTerminalAction
+          ? `${speakerNames.join('、')}自然同步口型，${continuationReaction}画面持续处于不可逆动作发生前。`
+          : continuation && !hasTerminalAction
+            ? `${speakerNames.join('、')}按对白顺序自然同步口型；${continuationReaction}`
+            : shot.v,
+        a: dialogueText,
+        q: `${speakerNames.join('、')}沿用固定声线和自然语速；无旁白、无后期配音感，保留演员现场对白。`,
+        o: '保留演员现场对白、当前场景环境声和必要音效；无背景音乐、无字幕。',
+        g: holdTerminalAction
+          ? `本段对白结束，${reactionOwner || '主要倾听者'}正脸或清晰侧脸仍可见，人物保持不可逆动作发生前的站位、支撑、手部、视线和道具状态。`
+          : continuation && !hasTerminalAction
+            ? `本段对白结束，${reactionOwner || '主要倾听者'}的具体面部反应成为尾帧焦点；人物保持当前站位、朝向、手部、视线、服装和道具状态。`
+            : shot.g,
+        x: holdTerminalAction
+          ? '下一镜从完全相同的动作前状态继续剩余对白，不重置人物或道具。'
+          : shot.x,
+        d: duration,
+      })
+    })
+  })
+}
+
+export function normalizeOverseasStoryboardDialogueTerms(inputShots: CompactShotInput[]) {
+  return inputShots.map((inputShot): CompactShot => {
+    const shot = normalizeCompactShot(inputShot)
+    return {
+      ...shot,
+      a: shot.a
+        .replace(/[ \t]*议会[ \t]*/gu, ' Council ')
+        .replace(/[ \t]*狼群[ \t]*/gu, ' pack ')
+        .replace(/[ \t]{2,}/gu, ' ')
+        .replace(/[ \t]+([.,!?;:])/gu, '$1'),
+    }
+  })
+}
+
+export function normalizeStoryboardSpokenAudioRules(inputShots: CompactShotInput[]) {
+  return inputShots.map((inputShot): CompactShot => {
+    const shot = normalizeCompactShot(inputShot)
+    const dialogues = extractStoryboardShotDialogues(shot.a)
+    if (dialogues.length === 0) return shot
+    const onsiteDialogues = dialogues.filter((dialogue) => !isStoryboardVoiceover(dialogue))
+    const voiceovers = dialogues.filter(isStoryboardVoiceover)
+    const onsiteNames = [...new Set(onsiteDialogues.map((dialogue) => dialogue.speaker))]
+    const voiceoverNames = [...new Set(voiceovers.map((dialogue) => dialogue.speaker))]
+    const voiceoverRule = voiceovers.length > 0
+      ? `${voiceoverNames.join('、')}的原剧本旁白、画外音或【OS】完整保留，禁止画面人物为其对口型。`
+      : ''
+    return {
+      ...shot,
+      q: onsiteDialogues.length > 0
+        ? `${onsiteNames.join('、')}沿用固定声线和自然语速；无新增旁白、无后期配音感，保留演员现场对白。${voiceoverRule}`
+        : voiceoverRule,
+      o: `${onsiteDialogues.length > 0 ? '保留演员现场对白、' : ''}${voiceovers.length > 0 ? '保留原剧本旁白、画外音和【OS】、' : ''}当前场景环境声和必要音效；无背景音乐、无字幕。`,
+    }
+  })
+}
+
+export function storyboardContinuityIssues(
+  inputShots: CompactShotInput[],
+  clipSeconds = 15,
+) {
+  const shots = inputShots.map(normalizeCompactShot)
+  const reasonsByIndex = new Map<number, string[]>()
+  const addReason = (index: number, reason: string) => {
+    const reasons = reasonsByIndex.get(index) || []
+    if (!reasons.includes(reason)) reasons.push(reason)
+    reasonsByIndex.set(index, reasons)
+  }
+
+  for (let index = 1; index < shots.length; index++) {
+    const previous = shots[index - 1]
+    const current = shots[index]
+    if (storyboardLocationFromNote(previous.n) !== storyboardLocationFromNote(current.n)) continue
+    const previousEnd = [previous.s, previous.v, previous.a, previous.g].join('\n')
+    const currentStart = [current.p, current.f, current.s, current.v, current.a].join('\n')
+    const transition = [previous.x, current.n, current.p, current.f].join('\n')
+    if (EXPLICIT_TIME_RESET.test(transition)) continue
+    if (COMPLETED_FALL.test(previousEnd) && RESTORED_CLIFF_HOLD.test(currentStart)) {
+      addReason(index, '上一镜已经完成坠落，下一镜却恢复为悬挂或抓住崖边的旧状态')
+    }
+    if (COMPLETED_COLLAPSE.test(previousEnd)
+      && STANDING_WITHOUT_RECOVERY.test(currentStart)
+      && !RESTORED_STANDING.test(currentStart)) {
+      const collapsedSubjects = storyboardStateSubjects(previousEnd, COLLAPSE_SUBJECT_PATTERN)
+      const standingSubjects = storyboardStateSubjects(currentStart, STANDING_SUBJECT_PATTERN)
+      const restoresSameSubject = collapsedSubjects.some((collapsed) => standingSubjects.some((standing) => (
+        collapsed.includes(standing) || standing.includes(collapsed)
+      )))
+      if (restoresSameSubject) {
+        addReason(index, '上一镜已经倒地或失去意识，下一镜未写起身过程却恢复站立或行走')
+      }
+    }
+    if (COMPLETED_BLACKOUT.test(previousEnd) && !EXPLICIT_TIME_RESET.test(currentStart)) {
+      addReason(index, '上一镜已经切黑，下一镜在同一时空继续动作或对白但没有淡入、倒叙或时间转换')
+    }
+  }
+
+  const safeClipSeconds = Math.max(4, Math.min(15, Math.round(clipSeconds)))
+  let clipIndex = 1
+  let clipDuration = 0
+  let clipLocation = ''
+  let seenDialogues = new Map<string, number>()
+  for (let index = 0; index < shots.length; index++) {
+    const shot = shots[index]
+    const location = storyboardLocationFromNote(shot.n)
+    if (clipDuration > 0 && (location !== clipLocation || clipDuration + shot.d > safeClipSeconds)) {
+      clipIndex++
+      clipDuration = 0
+      seenDialogues = new Map<string, number>()
+    }
+    if (clipDuration === 0) clipLocation = location
+    clipDuration += shot.d
+
+    const dialogues = extractStoryboardShotDialogues(shot.a)
+    const estimatedSeconds = dialogues.reduce(
+      (total, dialogue) => total + estimatedDialogueSeconds(dialogue.text),
+      dialogues.length > 0 ? 0.5 + Math.max(0, dialogues.length - 1) * 0.5 : 0,
+    )
+    if (estimatedSeconds > shot.d + 0.05) {
+      addReason(index, `对白自然表演约需 ${estimatedSeconds.toFixed(1)} 秒，超过当前 ${shot.d} 秒镜头`)
+    }
+    if (dialogues.length > 0 && SPOKEN_AUDIO_CONFLICT.test([shot.q, shot.o].join('\n'))) {
+      addReason(index, '镜头存在现场对白，但声音要求同时写了无配音、无对白或说话人无对白')
+    }
+    for (const dialogue of dialogues) {
+      const normalizedText = normalizedDialogueKey(dialogue.text)
+      if (normalizedText.length < 3) continue
+      const key = `${dialogue.speaker}:${normalizedText}`
+      const firstIndex = seenDialogues.get(key)
+      if (firstIndex !== undefined) {
+        addReason(index, `同一 15 秒段第 ${clipIndex} 段重复对白“${dialogue.speaker}：${dialogue.text}”`)
+        addReason(firstIndex, `同一 15 秒段第 ${clipIndex} 段的这句对白在后镜再次出现`)
+      } else {
+        seenDialogues.set(key, index)
+      }
+    }
+  }
+
+  return [...reasonsByIndex.entries()].map(([index, reasons]): StoryboardContinuityIssue => ({
+    index,
+    title: shots[index]?.t || `镜头 ${index + 1}`,
+    reasons,
+  }))
+}
+
+export function storyboardEpisodeReviewIssues(
+  inputShots: CompactShotInput[],
+  options: {
+    script?: string
+    visualStyle?: VisualStyle
+  } = {},
+) {
+  const shots = inputShots.map(normalizeCompactShot)
+  const reasonsByIndex = new Map<number, string[]>()
+  const addReason = (index: number, reason: string) => {
+    const safeIndex = Math.max(0, Math.min(shots.length - 1, index))
+    const reasons = reasonsByIndex.get(safeIndex) || []
+    if (!reasons.includes(reason)) reasons.push(reason)
+    reasonsByIndex.set(safeIndex, reasons)
+  }
+  if (shots.length === 0) return []
+
+  const sourceDialogues = options.script
+    ? extractScriptDialogueLines(options.script)
+    : []
+  const hasMarkedColdOpen = Boolean(
+    options.script?.includes(SCRIPT_COLD_OPEN_START)
+    && options.script.includes(SCRIPT_MAIN_TIMELINE_START),
+  )
+  const sourceCounts = new Map<string, number>()
+  for (const dialogue of sourceDialogues) {
+    const key = `${dialogue.speaker}:${dialogue.os ? 'os' : 'spoken'}:${normalizedDialogueKey(dialogue.text)}`
+    sourceCounts.set(key, (sourceCounts.get(key) || 0) + 1)
+  }
+
+  const seenDialogues = new Map<string, { count: number; firstIndex: number }>()
+  let previousSourceDialogueIndex = -1
+  let generatedDialogueCount = 0
+  for (let index = 0; index < shots.length; index++) {
+    const dialogues = extractStoryboardShotDialogues(shots[index].a)
+    generatedDialogueCount += dialogues.length
+    for (const dialogue of dialogues) {
+      const normalizedText = normalizedDialogueKey(dialogue.text)
+      if (normalizedText.length < 2) continue
+      if (options.visualStyle === VisualStyle.overseas_live_action && /\p{Script=Han}/u.test(dialogue.text)) {
+        addReason(index, `海外真人短剧的现场对白仍含中文“${dialogue.text}”，必须改为自然美式英语`)
+      }
+
+      const key = `${dialogue.speaker}:${dialogue.os ? 'os' : 'spoken'}:${normalizedText}`
+      const seen = seenDialogues.get(key)
+      const nextCount = (seen?.count || 0) + 1
+      const allowedCount = sourceCounts.get(key)
+        || (options.visualStyle === VisualStyle.overseas_live_action && hasMarkedColdOpen ? 2 : 1)
+      if (nextCount > allowedCount) {
+        addReason(index, `整集重复对白“${dialogue.speaker}：${dialogue.text}”`)
+        if (seen) addReason(seen.firstIndex, '这句对白在本集后续镜头被重复生成')
+      }
+      seenDialogues.set(key, { count: nextCount, firstIndex: seen?.firstIndex ?? index })
+
+      if (options.visualStyle !== VisualStyle.overseas_live_action && options.script) {
+        const sourceIndex = sourceDialogues.findIndex((source, candidateIndex) => (
+          candidateIndex >= previousSourceDialogueIndex
+          && source.speaker === dialogue.speaker
+          && source.os === dialogue.os
+          && normalizedDialogueKey(source.text) === normalizedText
+        ))
+        const anySourceIndex = sourceDialogues.findIndex((source) => (
+          source.speaker === dialogue.speaker
+          && source.os === dialogue.os
+          && normalizedDialogueKey(source.text) === normalizedText
+        ))
+        if (sourceIndex < 0 && anySourceIndex >= 0) {
+          addReason(index, `对白“${dialogue.speaker}：${dialogue.text}”出现在锁定剧本顺序之前`)
+        }
+        if (sourceIndex >= 0) previousSourceDialogueIndex = sourceIndex
+      }
+    }
+  }
+
+  if (options.visualStyle === VisualStyle.overseas_live_action
+    && sourceDialogues.length > 0
+    && generatedDialogueCount < sourceDialogues.length) {
+    addReason(
+      shots.length - 1,
+      `海外英语现场对白仅 ${generatedDialogueCount} 句，少于锁定剧本需要覆盖的 ${sourceDialogues.length} 句`,
+    )
+  }
+
+  return [...reasonsByIndex.entries()].map(([index, reasons]): StoryboardContinuityIssue => ({
+    index,
+    title: shots[index]?.t || `镜头 ${index + 1}`,
+    reasons,
+  }))
+}
+
+const STORYBOARD_DIRECTOR_INTENT = /(?:^|[；;\n])\s*意图\s*[：:]/u
+const STORYBOARD_EMOTIONAL_POV = /(?:^|[；;\n])\s*情绪视点\s*[：:]\s*([^；;\n]+)/u
+const STORYBOARD_EMOTIONAL_TRIGGER = /(?:^|[；;\n])\s*触发\s*[：:]/u
+const STORYBOARD_EMOTIONAL_END_BEAT = /(?:^|[；;\n])\s*情绪落点\s*[：:]/u
+const STORYBOARD_FACE_REACTION = /正脸|清晰侧脸|面部|眼神|瞳孔|眉(?:眼|头)?|眼眶|嘴角|嘴唇|下颌|喉结|泪|表情|面肌/u
+const STORYBOARD_HIDDEN_FACE = /背影|背对(?:镜头|摄影机)|面部不可见|看不清.{0,6}(?:脸|面部)|脸部被遮挡/u
+
+function normalizedDirectorPovOwner(value: string) {
+  return value
+    .replace(/\s*[（(].*$/u, '')
+    .replace(/^(?:人物|角色)\s*[：:]?/u, '')
+    .trim()
+}
+
+function directorPovAliases(owner: string) {
+  const aliases = [owner]
+  const firstName = owner.split(/[·•]/u)[0]?.trim()
+  if (firstName && firstName.length >= 2) aliases.push(firstName)
+  return [...new Set(aliases)]
+}
+
+function storyboardCameraSignature(value: string) {
+  const scales = value.match(/大特写|特写|中近景|近景|中景|全景|远景/g) || []
+  const angles = value.match(/正面|侧面|背面|过肩|俯拍|仰拍|平拍/g) || []
+  const moves = value.match(/固定|跟拍|推镜|拉镜|摇镜|横移|手持|环绕|甩镜/g) || []
+  const signature = [...new Set([...scales, ...angles, ...moves])].join('|')
+  return signature || value.replace(/[\s，,。；;]+/gu, '').slice(0, 60)
+}
+
+export function storyboardDirectorIssues(inputShots: CompactShotInput[]) {
+  const shots = inputShots.map(normalizeCompactShot)
+  const reasonsByIndex = new Map<number, string[]>()
+  const addReason = (index: number, reason: string) => {
+    const reasons = reasonsByIndex.get(index) || []
+    if (!reasons.includes(reason)) reasons.push(reason)
+    reasonsByIndex.set(index, reasons)
+  }
+
+  for (let index = 0; index < shots.length; index++) {
+    const shot = shots[index]
+    if (!STORYBOARD_DIRECTOR_INTENT.test(shot.i)
+      || !STORYBOARD_EMOTIONAL_POV.test(shot.i)
+      || !STORYBOARD_EMOTIONAL_TRIGGER.test(shot.i)
+      || !STORYBOARD_EMOTIONAL_END_BEAT.test(shot.i)) {
+      addReason(index, '缺少完整导演意图 i：必须包含意图、情绪视点、触发和情绪落点')
+      continue
+    }
+
+    const owner = normalizedDirectorPovOwner(shot.i.match(STORYBOARD_EMOTIONAL_POV)?.[1] || '')
+    if (!owner || /^(?:场景|环境|空间|无)$/u.test(owner)) continue
+
+    const visiblePerformance = [shot.f, shot.v, shot.g].join('\n')
+    const ownerAliases = directorPovAliases(owner)
+    const ownerVisible = ownerAliases.some((alias) => visiblePerformance.includes(alias))
+    if (!ownerVisible) {
+      addReason(index, `情绪视点角色“${owner}”没有出现在首帧、表演或尾帧画面中`)
+    }
+    if (!STORYBOARD_FACE_REACTION.test(visiblePerformance)) {
+      addReason(index, `情绪视点角色“${owner}”缺少正脸或清晰侧脸的具体微表情反应`)
+    }
+    if (STORYBOARD_HIDDEN_FACE.test(visiblePerformance) && !STORYBOARD_FACE_REACTION.test(visiblePerformance)) {
+      addReason(index, `情绪视点角色“${owner}”只以背影或遮挡状态出现，观众无法读取情绪`)
+    }
+
+    const dialogues = extractStoryboardShotDialogues(shot.a)
+    const otherSpeakerTriggersEmotion = dialogues.some((dialogue) => !ownerAliases.some((alias) => (
+      dialogue.speaker === alias
+      || dialogue.speaker.includes(alias)
+      || alias.includes(dialogue.speaker)
+    )))
+    if (otherSpeakerTriggersEmotion && (!ownerVisible || !STORYBOARD_FACE_REACTION.test(visiblePerformance))) {
+      addReason(index, `对手台词触发“${owner}”情绪，但镜头没有保留“${owner}”的可读倾听反应`)
+    }
+  }
+
+  for (let index = 2; index < shots.length; index++) {
+    const run = shots.slice(index - 2, index + 1)
+    const sameLocation = run.every((shot) => (
+      storyboardLocationFromNote(shot.n) === storyboardLocationFromNote(run[0].n)
+    ))
+    const signatures = run.map((shot) => storyboardCameraSignature(shot.c))
+    if (sameLocation && signatures[0] && signatures.every((signature) => signature === signatures[0])) {
+      addReason(index, `同一场景连续三个镜头使用相同景别、角度和运动“${signatures[0]}”，情绪镜头缺少推进`)
+    }
+  }
+
+  return [...reasonsByIndex.entries()].map(([index, reasons]): StoryboardContinuityIssue => ({
+    index,
+    title: shots[index]?.t || `镜头 ${index + 1}`,
+    reasons,
+  }))
+}
+
+function replaceHiddenPovFraming(value: string) {
+  return value
+    .replace(/(?:只(?:以|有))?背影(?:状态)?/gu, '清晰侧脸状态')
+    .replace(/背对(?:镜头|摄影机)/gu, '侧身面对摄影机并露出清晰侧脸')
+    .replace(/面部不可见|脸部被遮挡|看不清.{0,6}(?:脸|面部)/gu, '面部清晰可见')
+}
+
+export function repairStoryboardDirectorCoverage(inputShots: CompactShotInput[]) {
+  const repaired = inputShots.map((inputShot): CompactShot => {
+    const shot = normalizeCompactShot(inputShot)
+    const owner = normalizedDirectorPovOwner(shot.i.match(STORYBOARD_EMOTIONAL_POV)?.[1] || '')
+    if (!owner || /^(?:场景|环境|空间|无)$/u.test(owner)) return shot
+
+    const aliases = directorPovAliases(owner)
+    const visiblePerformance = [shot.f, shot.v, shot.g].join('\n')
+    const ownerVisible = aliases.some((alias) => visiblePerformance.includes(alias))
+    const faceReadable = STORYBOARD_FACE_REACTION.test(visiblePerformance)
+    const hiddenFace = STORYBOARD_HIDDEN_FACE.test(visiblePerformance)
+    if (ownerVisible && faceReadable && !hiddenFace) return shot
+
+    const repairedFirstFrame = replaceHiddenPovFraming(shot.f)
+    const repairedPerformance = replaceHiddenPovFraming(shot.v)
+    const repairedEndFrame = replaceHiddenPovFraming(shot.g)
+    return normalizeCompactShot({
+      ...shot,
+      c: hiddenFace || !faceReadable
+        ? `${owner}正面或清晰侧面中近景，固定机位，优先读取情绪反应`
+        : shot.c,
+      f: `${repairedFirstFrame}${repairedFirstFrame ? '；' : ''}${owner}正脸或清晰侧脸位于画面可读位置。`,
+      v: `${repairedPerformance}${repairedPerformance ? '；' : ''}触发发生后保留${owner}至少一秒可读反应：${owner}的视线停顿，眉眼收紧，嘴角克制变化。`,
+      g: `${repairedEndFrame}${repairedEndFrame ? '；' : ''}${owner}正脸或清晰侧脸保持清晰，具体面部反应成为尾帧焦点。`,
+    })
+  })
+
+  for (let index = 2; index < repaired.length; index++) {
+    const run = repaired.slice(index - 2, index + 1)
+    const sameLocation = run.every((shot) => (
+      storyboardLocationFromNote(shot.n) === storyboardLocationFromNote(run[0].n)
+    ))
+    const signatures = run.map((shot) => storyboardCameraSignature(shot.c))
+    if (!sameLocation || !signatures[0] || !signatures.every((signature) => signature === signatures[0])) continue
+
+    const shot = repaired[index]
+    const owner = normalizedDirectorPovOwner(shot.i.match(STORYBOARD_EMOTIONAL_POV)?.[1] || '')
+    repaired[index] = normalizeCompactShot({
+      ...shot,
+      c: owner && !/^(?:场景|环境|空间|无)$/u.test(owner)
+        ? `${owner}正面特写，固定机位，以视线和嘴角变化完成情绪落点`
+        : '侧面关系中景，轻微手持，以空间关系完成本镜落点',
+    })
+  }
+
+  return repaired
+}
+
+export function actionableStoryboardFinalReviewIssues(
+  issues: string[],
+  options: {
+    script: string
+    shots: CompactShotInput[]
+    allowedLocationNames: string[]
+  },
+) {
+  const hasMarkedColdOpen = options.script.includes(SCRIPT_COLD_OPEN_START)
+    && options.script.includes(SCRIPT_MAIN_TIMELINE_START)
+  const hasDialogueContinuations = options.shots.some((shot) => /对白续镜/u.test(String(shot.t || '')))
+  const hasUnderwaterLocation = options.allowedLocationNames.some((name) => /深海|海底|水下/u.test(name))
+
+  return issues.filter((issue) => {
+    if (hasMarkedColdOpen && (
+      /(?:冷开场|倒叙).{0,100}(?:重复|删除|只保留)/u.test(issue)
+      || /(?:重复|删除).{0,100}(?:冷开场|倒叙)/u.test(issue)
+      || /重复.{0,80}(?:坠落|白狼|悬崖)/u.test(issue)
+    )) return false
+    if (hasDialogueContinuations && /对白.{0,100}(?:截断|不完整|补全|合并)/u.test(issue)) return false
+    if (/结尾钩子缺失/u.test(issue) && /(?:已包含|当前镜头.{0,40}包含)/u.test(issue)) return false
+    if (hasUnderwaterLocation
+      && /(?:深海之下|海底深处|水下深处).{0,100}(?:不在白名单|添加.{0,20}白名单)/u.test(issue)) return false
+    return true
+  })
 }
 
 export function enforceSupplementalDialogue<T extends { a: string }>(
@@ -2309,53 +3786,31 @@ function insertMissingDialogueShots(input: {
 }) {
   const sourceDialogues = extractScriptDialogueLines(input.script)
   const result = [...input.current]
-  for (const missing of input.missing) {
-    const supplementalIndex = input.supplemental.findIndex(
-      (shot) => !dialogueMissing(shot.a, missing.text),
-    )
-    if (supplementalIndex < 0) continue
-    const sourceIndex = sourceDialogues.findIndex(
-      (dialogue) => dialogue.speaker === missing.speaker && dialogue.text === missing.text,
-    )
+  const placements = input.supplemental.flatMap((shot) => {
+    const sourceIndexes = input.missing.flatMap((missing) => {
+      if (storyboardDialogueMissing([shot], missing)) return []
+      const sourceIndex = sourceDialogues.findIndex(
+        (dialogue) => dialogue.speaker === missing.speaker
+          && dialogue.os === missing.os
+          && dialogue.text === missing.text,
+      )
+      return sourceIndex >= 0 ? [sourceIndex] : []
+    })
+    return sourceIndexes.length > 0 ? [{ shot, sourceIndex: Math.min(...sourceIndexes) }] : []
+  }).sort((left, right) => left.sourceIndex - right.sourceIndex)
+
+  for (const placement of placements) {
     let insertionIndex = result.length
-    for (const later of sourceDialogues.slice(Math.max(0, sourceIndex + 1))) {
-      const nextShotIndex = result.findIndex((shot) => !dialogueMissing(shot.a, later.text))
+    for (const later of sourceDialogues.slice(Math.max(0, placement.sourceIndex + 1))) {
+      const nextShotIndex = result.findIndex((shot) => !storyboardDialogueMissing([shot], later))
       if (nextShotIndex >= 0) {
         insertionIndex = nextShotIndex
         break
       }
     }
-    result.splice(insertionIndex, 0, input.supplemental[supplementalIndex])
-    input.supplemental.splice(supplementalIndex, 1)
+    result.splice(insertionIndex, 0, placement.shot)
   }
   return result
-}
-
-function mergeCompactShots(left: CompactShot, right: CompactShot): CompactShot {
-  const joined = (first: string, second: string, separator: string, max: number) => (
-    !first ? second.slice(0, max) : !second || first === second ? first : `${first}${separator}${second}`.slice(0, max)
-  )
-  return {
-    t: joined(left.t, right.t, ' / ', 120),
-    n: joined(left.n, right.n, '；', 1200),
-    p: left.p || right.p,
-    h: joined(left.h, right.h, '；', 3000),
-    r: joined(left.r, right.r, '；', 2200),
-    e: joined(left.e, right.e, '；', 2800),
-    l: joined(left.l, right.l, '；', 1800),
-    c: joined(left.c, right.c, '，随后', 1600),
-    f: left.f || right.f,
-    s: joined(left.s, right.s, '；随后按顺序执行：', 4500),
-    m: joined(left.m, right.m, '；', 3600),
-    v: joined(left.v, right.v, '；', 5000),
-    a: joined(left.a, right.a, '；', 5000),
-    q: joined(left.q, right.q, '；', 2400),
-    o: joined(left.o, right.o, '；', 2400),
-    g: right.g || left.g,
-    x: right.x || left.x,
-    z: joined(left.z, right.z, '；', 3200),
-    d: Math.min(15, left.d + right.d),
-  }
 }
 
 function storyboardField(value: string, fallback: string) {
@@ -2364,25 +3819,43 @@ function storyboardField(value: string, fallback: string) {
 
 export function stitchStoryboardContinuity(shots: CompactShotInput[], previousTail = '') {
   let inheritedTail = previousTail.trim()
+  let previousEndedBlack = COMPLETED_BLACKOUT.test(inheritedTail)
+  let previousSceneKey = ''
   return shots.map((inputShot, index): CompactShot => {
-    const shot = normalizeCompactShot(inputShot)
-    const firstFrame = storyboardField(
-      shot.f,
-      inheritedTail
-        ? `严格沿用上一镜尾帧中的人物站位、朝向、手部状态、视线、服装、道具、场景陈设、光线和焦点。`
-        : `${shot.n}，以${shot.c}建立本镜开场，人物和场景状态与已锁定剧本一致。`,
-    )
-    const previousFrame = inheritedTail || storyboardField(
-      shot.p,
-      index === 0
-        ? `本集第一镜，从已锁定剧本的开场人物状态、场景陈设和光线开始。`
-        : `承接上一镜尾帧，不重置人物和场景状态。`,
-    )
+    const normalizedShot = normalizeCompactShot(inputShot)
+    const requestedDuration = Number(inputShot.d)
+    const shot = Number.isInteger(requestedDuration) && requestedDuration >= 3 && requestedDuration <= 15
+      ? { ...normalizedShot, d: requestedDuration }
+      : normalizedShot
+    const currentSceneKey = storyboardLocationFromNote(shot.n)
+    const sceneChanged = Boolean(previousSceneKey && currentSceneKey !== previousSceneKey)
+    const firstFrame = previousEndedBlack
+      ? `画面从全黑自然淡入${shot.n}，以${shot.c}建立新的可见画面，不恢复切黑前的动作状态。`
+      : sceneChanged
+        ? `切入${shot.n}，以${shot.c}重新建立当前场景的空间、人物站位和光线，不继承上一场景的陈设或人物位置。`
+      : storyboardField(
+        shot.f,
+        inheritedTail
+          ? `严格沿用上一镜尾帧中的人物站位、朝向、手部状态、视线、服装、道具、场景陈设、光线和焦点。`
+          : `${shot.n}，以${shot.c}建立本镜开场，人物和场景状态与已锁定剧本一致。`,
+      )
+    const previousFrame = previousEndedBlack
+      ? `上一镜已经切黑；本镜通过黑场淡入进入${shot.n}，按锁定剧本开始下一叙事节拍。`
+      : sceneChanged
+        ? `上一场景已经结束；本镜按剧本切入${shot.n}，从当前场景的初始人物站位和环境状态开始。`
+      : inheritedTail || storyboardField(
+        shot.p,
+        index === 0
+          ? `本集第一镜，从已锁定剧本的开场人物状态、场景陈设和光线开始。`
+          : `承接上一镜尾帧，不重置人物和场景状态。`,
+      )
     const tailFrame = storyboardField(
       shot.g,
       `${shot.v}；动作停止在可稳定承接下一镜的状态，保留人物站位、视线、服装、道具归属、场景陈设、光线和镜头焦点。`,
     )
     inheritedTail = tailFrame
+    previousEndedBlack = COMPLETED_BLACKOUT.test([shot.s, shot.v, tailFrame, shot.x].join('\n'))
+    previousSceneKey = storyboardEndLocationFromNote(shot.n)
     return {
       ...shot,
       p: previousFrame,
@@ -2402,14 +3875,108 @@ function normalizedStoryboardLocation(value: string) {
   return value.toLocaleLowerCase().replace(/[\s\p{P}\p{S}]+/gu, '')
 }
 
+const STORYBOARD_LOCATION_SEMANTIC_GROUPS = [
+  ['深海', '海底', '水下', '水中', '下沉', 'underwater', 'oceanfloor', 'beneaththesea'],
+  ['悬崖', '崖边', '峭壁', '深渊', 'cliff', 'cliffside'],
+  ['木屋', '小屋', '棚屋', 'cabin', 'hut'],
+  ['森林', '树林', '林地', '林间', 'forest', 'woods'],
+  ['石阵', '石环', 'stonecircle'],
+  ['祭坛', 'altar'],
+  ['实验室', 'laboratory', 'lab'],
+] as const
+
+function storyboardSemanticLocationMatches<T extends StoryboardLocationAsset>(context: string, locations: T[]) {
+  const normalizedContext = normalizedStoryboardLocation(context)
+  const matches = new Map<string, T>()
+  for (const group of STORYBOARD_LOCATION_SEMANTIC_GROUPS) {
+    const normalizedTerms = group.map(normalizedStoryboardLocation)
+    if (!normalizedTerms.some((term) => normalizedContext.includes(term))) continue
+    const candidates = locations.filter((location) => {
+      const normalizedLocation = normalizedStoryboardLocation(location.name)
+      return normalizedTerms.some((term) => normalizedLocation.includes(term))
+    })
+    if (candidates.length === 1) matches.set(candidates[0].name, candidates[0])
+  }
+  return [...matches.values()]
+}
+
+function uniqueLocationSemanticMatch<T extends StoryboardLocationAsset>(context: string, locations: T[]): T | undefined {
+  const matches = storyboardSemanticLocationMatches(context, locations)
+  return matches.length === 1 ? matches[0] : undefined
+}
+
+function explicitPhysicalLocationOverride<T extends StoryboardLocationAsset>(shot: CompactShot, locations: T[]) {
+  const visibleContext = [shot.t, shot.s, shot.m, shot.v, shot.g].join('\n')
+  const rules: Array<{ context: RegExp; location: RegExp }> = [
+    { context: /(?:深海中|深海之下|深海深处|海底深处|海水.{0,16}(?:下沉|上浮)|水中.{0,16}(?:下沉|上浮)|水下空间)/u, location: /深海|海底|水下/u },
+    { context: /(?:冲上沙滩|海浪拍打|沙滩|礁石|岸边)/u, location: /海岸|沙滩|岸边|礁石/u },
+    { context: /(?:【?闪回】?|幼年.{0,30}(?:金属床|仪器|针管)|白色实验室)/u, location: /实验室/u },
+    { context: /(?:壁炉|木床|木桌|木屋内)/u, location: /木屋(?!外)/u },
+    { context: /(?:木屋外|屋外月光|屋外空地)/u, location: /木屋外|屋外/u },
+  ]
+  for (const rule of rules) {
+    if (!rule.context.test(visibleContext)) continue
+    const candidates = locations.filter((location) => rule.location.test(location.name))
+    if (candidates.length === 1) return candidates[0]
+  }
+  return undefined
+}
+
+function storyboardEvidenceShingles(value: string) {
+  const normalized = value.toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, '')
+  const characters = [...normalized]
+  const shingles = new Set<string>()
+  for (let index = 0; index <= characters.length - 3; index++) {
+    shingles.add(characters.slice(index, index + 3).join(''))
+  }
+  return shingles
+}
+
+function storyboardLocationEvidenceMatch<T extends StoryboardLocationAsset>(shot: CompactShot, locations: T[]) {
+  if (locations.length < 2) return undefined
+  const shotShingles = storyboardEvidenceShingles([shot.t, shot.s, shot.m, shot.v, shot.a].join('\n'))
+  if (shotShingles.size === 0) return undefined
+  const locationShingles = locations.map((location) => storyboardEvidenceShingles(location.description))
+  const frequencies = new Map<string, number>()
+  for (const shingles of locationShingles) {
+    for (const shingle of shingles) frequencies.set(shingle, (frequencies.get(shingle) || 0) + 1)
+  }
+  const ranked = locations.map((location, index) => ({
+    location,
+    score: [...locationShingles[index]].filter((shingle) => (
+      frequencies.get(shingle) === 1 && shotShingles.has(shingle)
+    )).length,
+  })).sort((left, right) => right.score - left.score)
+  const best = ranked[0]
+  const second = ranked[1]
+  return best && best.score >= 3 && best.score >= (second?.score || 0) + 2
+    ? best.location
+    : undefined
+}
+
 function storyboardTimeLabel(value: string) {
   const match = value.match(/^(?:现实|回忆|梦境)?[，,\s]*(?:凌晨|清晨|早晨|上午|中午|下午|傍晚|黄昏|夜晚|深夜|白天)/u)
   return match?.[0].replace(/^[，,\s]+|[，,\s]+$/g, '') || '时间承接已锁定剧本'
 }
 
-function uniqueLocationSuffixMatch(context: string, locations: StoryboardLocationAsset[]) {
+function explicitStoryboardLocationLabel(value: string) {
+  const parts = value.split(/[｜|]/u).map((part) => part.trim()).filter(Boolean)
+  if (parts.length < 2) return ''
+  const candidate = parts.slice(1).join('｜').trim()
+  if (!candidate || /^(?:时间|场景)?承接(?:上一镜|已锁定剧本)/u.test(candidate)) return ''
+  if (/^(?:普通|默认|通用|未命名|某个|一处)/u.test(candidate)) return ''
+  return candidate
+}
+
+function storyboardLocationIsPlaceholder(value: string) {
+  const normalized = value.replace(/\s+/gu, '')
+  return !explicitStoryboardLocationLabel(value)
+    && /(?:承接上一镜|承接已锁定剧本|时间承接|场景承接)/u.test(normalized)
+}
+
+function uniqueLocationSuffixMatch<T extends StoryboardLocationAsset>(context: string, locations: T[]): T | undefined {
   const normalizedContext = normalizedStoryboardLocation(context)
-  const locationKinds = ['起居室', '会客室', '办公室', '会议室', '卧室', '客厅', '厨房', '餐厅', '书房', '浴室', '卫生间', '走廊', '楼梯间', '地下室', '停车场', '公路', '山路', '街道', '小院', '庭院', '医院', '学校', '教室', '宿舍', '商场', '酒店', '车站', '机场']
+  const locationKinds = ['起居室', '会客室', '办公室', '会议室', '卧室', '客厅', '厨房', '餐厅', '书房', '浴室', '卫生间', '走廊', '楼梯间', '地下室', '停车场', '公路', '山路', '河边', '街道', '小院', '庭院', '医院', '学校', '教室', '宿舍', '商场', '酒店', '车站', '机场', '木屋', '森林', '营地', '石阵', '祭坛', '广场', '悬崖', '崖边', '牢房', '关押区', '储备室', '议会厅', '遗迹', '实验室', '空地', '围墙']
   const matches = locations.filter((location) => locationKinds.some((kind) => (
     location.name.includes(kind) && normalizedContext.includes(normalizedStoryboardLocation(kind))
   )))
@@ -2433,57 +4000,99 @@ export function enforceStoryboardLocationAssets(
 
   const normalizedShots = shots.map(normalizeCompactShot)
   const directMatches = normalizedShots.map((shot) => {
-    const context = [shot.n, shot.e, shot.f, shot.v, shot.g].join('\n')
-    const exact = locations.find((location) => (
+    const actionContext = [shot.t, shot.s, shot.m, shot.a, shot.x].join('\n')
+    const context = [shot.t, shot.n, shot.e, shot.f, shot.s, shot.m, shot.v, shot.a, shot.g, shot.x].join('\n')
+    const actionExact = locations.find((location) => (
+      normalizedStoryboardLocation(actionContext).includes(normalizedStoryboardLocation(location.name))
+    ))
+    const actionSemantic = uniqueLocationSemanticMatch(actionContext, locations)
+    const physicalOverride = explicitPhysicalLocationOverride(shot, locations)
+    const evidenceOverride = storyboardLocationEvidenceMatch(shot, locations)
+    const noteExact = locations.find((location) => (
+      normalizedStoryboardLocation(shot.n).includes(normalizedStoryboardLocation(location.name))
+    ))
+    const exact = noteExact || locations.find((location) => (
       normalizedStoryboardLocation(context).includes(normalizedStoryboardLocation(location.name))
     ))
-    return exact
-      || matchStoryboardAssets(matchableLocations, context, matchableLocations.length)[0]
+    const strongMatch = evidenceOverride
+      || physicalOverride
+      || noteExact
+      || actionExact
+      || actionSemantic
+      || exact
+      || uniqueLocationSemanticMatch(context, locations)
+    if (strongMatch) return strongMatch
+    if (explicitStoryboardLocationLabel(shot.n)) return undefined
+    return matchStoryboardAssets(matchableLocations, context, matchableLocations.length)[0]
       || uniqueLocationSuffixMatch(context, locations)
-      || (locations.length === 1 ? locations[0] : undefined)
+      || (!explicitStoryboardLocationLabel(shot.n) && locations.length === 1 ? locations[0] : undefined)
   })
   let inheritedLocation: StoryboardLocationAsset | undefined
+  let activeFlashbackLocation = ''
+  const closedFlashbackLocations = new Set<string>()
+  const isFlashbackLocation = (location: StoryboardLocationAsset) => (
+    location.name.endsWith('（闪回）') || /(?:回忆|闪回)/u.test(location.description)
+  )
 
   return normalizedShots.map((shot, index): CompactShot => {
-    const matched = directMatches[index]
-      || inheritedLocation
-      || directMatches.slice(index + 1).find(Boolean)
-      || locations[0]
+    const explicitLocation = explicitStoryboardLocationLabel(shot.n)
+    let matched = directMatches[index]
+    if (!matched && explicitLocation) return shot
+    if (!matched && storyboardLocationIsPlaceholder(shot.n)) {
+      matched = inheritedLocation
+        || directMatches.slice(index + 1).find(Boolean)
+        || (locations.length === 1 ? locations[0] : undefined)
+    }
+    if (!matched) return shot
+    if (activeFlashbackLocation && matched.name !== activeFlashbackLocation) {
+      closedFlashbackLocations.add(activeFlashbackLocation)
+      activeFlashbackLocation = ''
+    }
+    if (isFlashbackLocation(matched)) {
+      if (closedFlashbackLocations.has(matched.name)
+        && inheritedLocation
+        && !isFlashbackLocation(inheritedLocation)) {
+        matched = inheritedLocation
+      } else {
+        activeFlashbackLocation = matched.name
+      }
+    }
     inheritedLocation = matched
-    const anchor = `场景资产唯一锚点“${matched.name}”：${matched.description.slice(0, 800)}`
+    const foreignLocations = locations.filter((location) => location.name !== matched.name)
+    const containsForeignLocation = (value: string) => {
+      const semanticMatches = new Set(storyboardSemanticLocationMatches(value, locations).map((location) => location.name))
+      return foreignLocations.some((location) => (
+        normalizedStoryboardLocation(value).includes(normalizedStoryboardLocation(location.name))
+        || semanticMatches.has(location.name)
+      ))
+    }
+    const sceneFacts = conciseStoryboardSceneFacts(matched.description, 220)
+    const anchor = `场景资产“${matched.name}”：${sceneFacts || '固定空间结构、陈设、材质与基础光线沿用场景资产主图'}`
     const prohibition = `禁止将场景“${matched.name}”替换为其他地点，禁止改变固定空间结构、材质、陈设位置和基础光源。`
     return {
       ...shot,
       n: `${storyboardTimeLabel(shot.n)}｜${matched.name}`,
-      e: shot.e.includes(anchor) ? shot.e : `${anchor}；${shot.e}`.slice(0, 2800),
+      p: containsForeignLocation(shot.p) ? '' : shot.p,
+      f: containsForeignLocation(shot.f) ? '' : shot.f,
+      g: containsForeignLocation(shot.g) ? '' : shot.g,
+      e: anchor,
       z: shot.z.includes(prohibition) ? shot.z : `${shot.z}${shot.z ? '；' : ''}${prohibition}`.slice(0, 3200),
     }
   })
 }
 
 export function compactStoryboardShots(shots: CompactShotInput[], target: number) {
-  const compacted = shots.map(normalizeCompactShot)
-  while (compacted.length > Math.max(1, target)) {
-    const mergeIndex = compacted.findIndex((shot, index) => {
-      const next = compacted[index + 1]
-      if (!next) return false
-      const speakers = new Set([...compactShotSpeakers(shot), ...compactShotSpeakers(next)])
-      const sameLocation = storyboardLocationFromNote(shot.n) === storyboardLocationFromNote(next.n)
-      return speakers.size <= 1 && sameLocation
-    })
-    if (mergeIndex < 0) break
-    compacted.splice(mergeIndex, 2, mergeCompactShots(compacted[mergeIndex], compacted[mergeIndex + 1]))
-  }
-  return compacted
+  void target
+  return shots.map(normalizeCompactShot)
 }
 
-export function fitStoryboardDuration(shots: CompactShotInput[], targetSeconds = 90) {
-  if (shots.length === 0) return shots
+export function fitStoryboardDuration(shots: CompactShotInput[], targetSeconds = 90): CompactShot[] {
+  if (shots.length === 0) return []
   const normalized = shots.map(normalizeCompactShot)
-  const minimum = normalized.length * 4
+  const minimum = normalized.length * 3
   const maximum = normalized.length * 15
   const total = Math.max(minimum, Math.min(maximum, Math.round(targetSeconds)))
-  const durations = Array.from({ length: normalized.length }, () => 4)
+  const durations = Array.from({ length: normalized.length }, () => 3)
   let remaining = total - minimum
   let cursor = 0
   while (remaining > 0) {
@@ -2497,59 +4106,276 @@ export function fitStoryboardDuration(shots: CompactShotInput[], targetSeconds =
 }
 
 const STORYBOARD_VIDEO_CLIP_SECONDS = 15
-const STORYBOARD_EPISODE_MAX_SECONDS = 120
+const STORYBOARD_MAX_TIMELINE_BEATS_PER_CLIP = 3
+const STORYBOARD_MAX_CHARACTERS_PER_CLIP = 4
 
 function formatTimelineSecond(value: number) {
   return Number.isInteger(value) ? String(value) : value.toFixed(1)
 }
 
-function packCompactShotGroup(shots: CompactShot[], clipSeconds: number): CompactShot {
-  if (shots.length === 1) return { ...shots[0], d: clipSeconds }
-  const totalWeight = shots.reduce((total, shot) => total + Math.max(1, shot.d), 0)
-  let elapsedWeight = 0
-  const timed = shots.map((shot, index) => {
-    const start = clipSeconds * elapsedWeight / totalWeight
-    elapsedWeight += Math.max(1, shot.d)
-    const end = index === shots.length - 1
-      ? clipSeconds
-      : clipSeconds * elapsedWeight / totalWeight
-    return {
-      shot,
-      label: `${formatTimelineSecond(start)}-${formatTimelineSecond(end)}秒 子镜头${index + 1}`,
-    }
-  })
-  const field = (key: keyof Pick<CompactShot, 'n' | 'h' | 'r' | 'e' | 'l' | 'c' | 's' | 'm' | 'v' | 'a' | 'q' | 'o' | 'z'>) => timed
-    .filter((item) => item.shot[key].trim())
-    .map((item) => `${item.label}：${item.shot[key]}`)
-    .join('\n')
-  const timedField = (
-    key: keyof Pick<CompactShot, 'h' | 'r' | 'e' | 'l' | 's' | 'm' | 'q' | 'o' | 'z'>,
-    introduction: string,
-  ) => {
-    const value = field(key)
-    return value ? `${introduction}\n${value}` : ''
+function compactTimelineValue(value: string, maximum: number) {
+  const normalized = value.replace(/\s+/gu, ' ').trim()
+  return normalized.length <= maximum ? normalized : `${normalized.slice(0, maximum - 1).trim()}…`
+}
+
+function uniqueShotField(
+  shots: CompactShot[],
+  key: keyof Pick<CompactShot, 'h' | 'r' | 'e' | 'l' | 'o' | 'z'>,
+  maximum: number,
+) {
+  return compactTimelineValue(
+    [...new Set(shots.map((shot) => shot[key].trim()).filter(Boolean))].join('；'),
+    maximum,
+  )
+}
+
+function characterDeclarationKey(value: string) {
+  const candidate = value
+    .replace(/^[\s\-•]+/u, '')
+    .match(/^([^：:(（\n]{2,40})(?=\s*[：:(（])/u)?.[1]?.trim()
+  if (!candidate || /^(?:人物|角色|本镜|初始|出场|声音|关键道具)/u.test(candidate)) return ''
+  return candidate
+}
+
+function splitCharacterDeclarationNames(value: string): string[] {
+  const punctuationParts = value.split(/[、，,]/u).map((part) => part.trim()).filter(Boolean)
+  if (punctuationParts.length > 1) return punctuationParts.flatMap(splitCharacterDeclarationNames)
+  const relationParts = value.split(/与/u).map((part) => part.trim()).filter(Boolean)
+  if (relationParts.length > 1) return relationParts.flatMap(splitCharacterDeclarationNames)
+  const andParts = value.split(/和/u).map((part) => part.trim()).filter(Boolean)
+  if (andParts.length === 2 && andParts.every((part) => [...part].length >= 2)) {
+    return andParts.flatMap(splitCharacterDeclarationNames)
   }
-  return {
-    t: `${shots[0].t} 至 ${shots[shots.length - 1].t}`.slice(0, 120),
-    n: `本集内连续 ${clipSeconds} 秒视频，禁止跨集\n${field('n')}`,
+  return value ? [value] : []
+}
+
+function uniqueCharacterShotField(shots: CompactShot[], maximum: number) {
+  const seenCharacters = new Set<string>()
+  const seenFragments = new Set<string>()
+  const output: string[] = []
+  for (const shot of shots) {
+    for (const rawFragment of shot.h.split(/[；;\n]+/u)) {
+      const fragment = rawFragment.trim()
+      if (!fragment) continue
+      const characterName = characterDeclarationKey(fragment)
+      if (characterName) {
+        if (seenCharacters.has(characterName)) continue
+        seenCharacters.add(characterName)
+      } else if (seenFragments.has(fragment)) {
+        continue
+      }
+      seenFragments.add(fragment)
+      output.push(fragment)
+    }
+  }
+  return compactTimelineValue(output.join('；'), maximum)
+}
+
+function characterNamesFromLock(value: string) {
+  return [...new Set(
+    value.split(/[；;\n]+/u)
+      .flatMap((fragment) => splitCharacterDeclarationNames(characterDeclarationKey(fragment.trim())))
+      .filter(Boolean),
+  )]
+}
+
+function storyboardActiveCharacterNames(shots: CompactShot[]) {
+  const declaredNames = characterNamesFromLock(uniqueCharacterShotField(shots, 6000))
+  const spokenNames = shots.flatMap((shot) => (
+    extractStoryboardShotDialogues(shot.a).map((dialogue) => dialogue.speaker)
+  ))
+  const explicitlyOffscreenNames = new Set(shots.flatMap((shot) => [
+    ...shot.h.split(/[；;\n]+/u)
+      .filter((fragment) => /画外|只通过|仅通过|不得入镜|不入镜/u.test(fragment))
+      .flatMap((fragment) => splitCharacterDeclarationNames(characterDeclarationKey(fragment))),
+    ...[...shot.v.matchAll(/画外角色[：:]?([^。；\n]+)/gu)]
+      .flatMap((match) => match[1].split(/[、，,和与\s]+/u).map((name) => name.trim()).filter(Boolean)),
+  ]))
+  return [...new Set([...declaredNames, ...spokenNames])]
+    .filter((name) => !explicitlyOffscreenNames.has(name))
+}
+
+function uniqueActiveCharacterShotField(shots: CompactShot[], maximum: number) {
+  const activeNames = new Set(storyboardActiveCharacterNames(shots))
+  const seenCharacters = new Set<string>()
+  const seenFragments = new Set<string>()
+  const output: string[] = []
+  for (const shot of shots) {
+    for (const rawFragment of shot.h.split(/[；;\n]+/u)) {
+      const fragment = rawFragment.trim()
+      if (!fragment) continue
+      const characterName = characterDeclarationKey(fragment)
+      if (characterName) {
+        const declarationNames = splitCharacterDeclarationNames(characterName)
+        if (declarationNames.length > 0 && !declarationNames.some((name) => activeNames.has(name))) continue
+        if (seenCharacters.has(characterName)) continue
+        seenCharacters.add(characterName)
+      } else if (seenFragments.has(fragment)) {
+        continue
+      }
+      seenFragments.add(fragment)
+      output.push(fragment)
+    }
+  }
+  return compactTimelineValue(output.join('；'), maximum)
+}
+
+function storyboardGroupCharacterNames(shots: CompactShot[]) {
+  return storyboardActiveCharacterNames(shots)
+}
+
+function normalizeStoryboardCameraCast(value: string, characterNames: string[]) {
+  return characterNames.reduce((camera, name) => {
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    return camera.replace(
+      new RegExp(`从${escaped}腰部高度(俯拍|仰拍|平拍|拍摄)`, 'gu'),
+      `摄影机固定在${name}身后右侧腰线外，$1`,
+    )
+  }, value)
+}
+
+type PackedStoryboardSceneRun = {
+  start: number
+  end: number
+  locationKey: string
+  shots: CompactShot[]
+}
+
+function packedStoryboardSceneRuns(shots: CompactShot[]) {
+  const runs: PackedStoryboardSceneRun[] = []
+  let cursor = 0
+  for (const shot of shots) {
+    const start = cursor
+    cursor += shot.d
+    const locationKey = storyboardLocationFromNote(shot.n)
+    const previous = runs.at(-1)
+    if (previous && previous.locationKey === locationKey) {
+      previous.end = cursor
+      previous.shots.push(shot)
+    } else {
+      runs.push({ start, end: cursor, locationKey, shots: [shot] })
+    }
+  }
+  return runs
+}
+
+function packedStoryboardSceneField(
+  runs: PackedStoryboardSceneRun[],
+  key: keyof Pick<CompactShot, 'e' | 'l'>,
+  maximum: number,
+) {
+  return compactTimelineValue(runs.map((run) => {
+    const value = [...new Set(run.shots.map((shot) => shot[key].trim()).filter(Boolean))].join('；')
+    return value ? `${formatTimelineSecond(run.start)}~${formatTimelineSecond(run.end)}s：${value}` : ''
+  }).filter(Boolean).join('\n'), maximum)
+}
+
+function packCompactShotGroup(inputShots: CompactShot[], requestedClipSeconds?: number): CompactShot {
+  const shots = inputShots.map((shot) => ({ ...shot }))
+  const sourceSeconds = shots.reduce((total, shot) => total + shot.d, 0)
+  const requiredDialogueSeconds = Math.ceil(packedStoryboardGroupDialogueSeconds(shots))
+  const clipSeconds = Math.max(
+    sourceSeconds,
+    Math.min(15, requestedClipSeconds ?? requiredDialogueSeconds),
+  )
+  let durationSlack = clipSeconds - sourceSeconds
+  while (durationSlack > 0) {
+    const candidate = shots
+      .map((shot, index) => ({ index, duration: shot.d }))
+      .sort((left, right) => left.duration - right.duration || left.index - right.index)[0]
+    if (!candidate) break
+    shots[candidate.index].d++
+    durationSlack--
+  }
+  const spokenDialogues = shots.flatMap((shot) => extractStoryboardShotDialogues(shot.a))
+  const onsiteDialogues = spokenDialogues.filter((dialogue) => !isStoryboardVoiceover(dialogue))
+  const voiceovers = spokenDialogues.filter(isStoryboardVoiceover)
+  const onsiteNames = [...new Set(onsiteDialogues.map((dialogue) => dialogue.speaker))]
+  const voiceoverNames = [...new Set(voiceovers.map((dialogue) => dialogue.speaker))]
+  const sceneRuns = packedStoryboardSceneRuns(shots)
+  const containsSceneChange = sceneRuns.length > 1
+  const packedSceneNote = containsSceneChange
+    ? sceneRuns.map((run) => (
+        `${formatTimelineSecond(run.start)}~${formatTimelineSecond(run.end)}s：${run.shots[0].n}`
+      )).join('\n')
+    : shots[0].n
+  const baseCharacterLock = uniqueActiveCharacterShotField(shots, 2600)
+  const castSchedule = containsSceneChange
+    ? sceneRuns.map((run) => {
+        const names = [...new Set([
+          ...characterNamesFromLock(uniqueCharacterShotField(run.shots, 1200)),
+          ...run.shots.flatMap((shot) => extractStoryboardShotDialogues(shot.a).map((dialogue) => dialogue.speaker)),
+        ])]
+        return names.length > 0
+          ? `${formatTimelineSecond(run.start)}~${formatTimelineSecond(run.end)}s仅允许${names.join('、')}按本段动作入镜`
+          : ''
+      }).filter(Boolean).join('；')
+    : ''
+  let cursor = 0
+  let previousSceneKey = ''
+  const timeline = shots.map((shot) => {
+    const start = cursor
+    cursor += shot.d
+    const currentSceneKey = storyboardLocationFromNote(shot.n)
+    const sceneCue = containsSceneChange
+      ? previousSceneKey && previousSceneKey !== currentSceneKey
+        ? `直接切换到“${visibleStoryboardTimeLocation(shot.n)}”，上一场景的人物和陈设完全退出，禁止叠加或同时出现`
+        : !previousSceneKey
+          ? `场景为“${visibleStoryboardTimeLocation(shot.n)}”`
+          : ''
+      : ''
+    previousSceneKey = currentSceneKey
+    return fuseStoryboardTimelineDetails({
+      duration: shot.d,
+      timeline: shot.v,
+      camera: compactTimelineValue(shot.c, 360),
+      intent: compactTimelineValue(shot.i, 420),
+      actionOrder: compactTimelineValue(shot.s, 900),
+      actionPhysics: compactTimelineValue(shot.m, 800),
+      performance: compactTimelineValue(shot.v, 900),
+      dialogue: compactTimelineValue(shot.a, 1200),
+      openingState: compactTimelineValue([shot.p, shot.f].filter(Boolean).join('；'), 700),
+      endingState: compactTimelineValue(shot.g, 700),
+      sceneCue,
+      offset: start,
+    })
+  }).join('\n')
+
+  return normalizeCompactShot({
+    t: shots.length === 1
+      ? shots[0].t
+      : `${shots[0].t} 至 ${shots[shots.length - 1].t}`.slice(0, 120),
+    n: packedSceneNote,
+    i: compactTimelineValue(shots.map((shot) => shot.i).filter(Boolean).join('；'), 900),
     p: shots[0].p,
-    h: timedField('h', '按时间段锁定出场人物，未写明的角色不得入镜：'),
-    r: timedField('r', '按时间段锁定道具归属和持握位置，不得跨角色转移：'),
-    e: timedField('e', '按时间段锁定场景；同一地点的固定陈设不得重置：'),
-    l: timedField('l', '按时间段锁定光源方向、色温和明暗变化：'),
-    c: `按以下时间顺序切换机位，不得并行呈现：\n${field('c')}`,
+    h: compactTimelineValue([
+      baseCharacterLock,
+      castSchedule ? `跨场景出场时段锁定：${castSchedule}；未到对应时段的人物不得提前出现。` : '',
+    ].filter(Boolean).join('；'), 2900),
+    r: uniqueShotField(shots, 'r', 2100),
+    e: containsSceneChange
+      ? packedStoryboardSceneField(sceneRuns, 'e', 2800)
+      : shots.find((shot) => shot.e.trim())?.e || '',
+    l: containsSceneChange
+      ? packedStoryboardSceneField(sceneRuns, 'l', 1800)
+      : shots.find((shot) => shot.l.trim())?.l || '',
+    c: shots.map((shot) => shot.c).join('\n'),
     f: shots[0].f,
-    s: timedField('s', '严格按以下时间顺序执行动作，前一动作完成后才能开始后一动作：'),
-    m: timedField('m', '按时间段锁定重心、主动肢体、运动路径、接触点、遮挡与结束姿态：'),
-    v: `按以下时间顺序连续表演，保持角色与场景一致：\n${field('v')}`,
-    a: `按以下时间顺序执行动作对白，只有当前时间段角色开口：\n${field('a')}`,
-    q: timedField('q', '按以下时间顺序执行配音，不得串词或交换声线：'),
-    o: timedField('o', '按以下时间顺序保留环境声和必要音效：'),
+    s: shots.map((shot) => shot.s).join('\n'),
+    m: shots.map((shot) => shot.m).join('\n'),
+    v: timeline,
+    a: shots.map((shot) => shot.a).join('\n'),
+    q: spokenDialogues.length > 0
+      ? `${onsiteNames.length > 0 ? `${onsiteNames.join('、')}沿用固定声线和自然语速；无新增旁白、无后期配音感，保留演员现场对白。` : ''}${voiceoverNames.length > 0 ? `${voiceoverNames.join('、')}的原剧本旁白、画外音或【OS】完整保留，禁止画面人物对口型。` : ''}`
+      : '本段无对白，不生成配音、旁白、画外音或内心独白。',
+    o: spokenDialogues.length > 0
+      ? `${onsiteDialogues.length > 0 ? '保留各时间段演员现场对白、' : ''}${voiceovers.length > 0 ? '保留原剧本旁白、画外音和【OS】、' : ''}对应场景环境声和必要音效；无背景音乐、无字幕。`
+      : uniqueShotField(shots, 'o', 2300),
     g: shots[shots.length - 1].g,
     x: shots[shots.length - 1].x,
-    z: timedField('z', '整段视频共同禁止：'),
+    z: uniqueShotField(shots, 'z', 3100),
     d: clipSeconds,
-  }
+  })
 }
 
 const COMPLEX_BODY_MOTION = /奔跑|冲刺|追逐|跳(?:跃|下|起)?|扑向|摔倒|跌倒|翻滚|打斗|搏斗|扭打|踢|挥拳|躲闪|舞蹈|转身奔|run(?:ning)?|jump|fall|fight|roll|dance/iu
@@ -2587,62 +4413,299 @@ function motionAwareShotGroups(shots: CompactShot[]) {
 }
 
 function storyboardLocationFromNote(value: string) {
-  return value.split('\n')[0].split('｜')[1]?.trim() || normalizedStoryboardLocation(value)
+  const firstLine = storyboardSceneNoteSegments(value)[0] || value.trim()
+  const parts = firstLine.split('｜').map((part) => part.trim()).filter(Boolean)
+  const timeMode = /回忆|梦境/u.exec(parts[0] || value)?.[0] || '现实'
+  const physicalLocation = parts.length >= 2 ? parts.slice(1).join('｜') : firstLine || value
+  return `${timeMode}｜${normalizedStoryboardLocation(physicalLocation)}`
 }
 
-function storyboardGroupMergeCost(left: CompactShot[], right: CompactShot[]) {
-  const leftRisk = Math.max(...left.map(storyboardMotionRisk))
-  const rightRisk = Math.max(...right.map(storyboardMotionRisk))
-  const locationChanged = storyboardLocationFromNote(left[left.length - 1].n) !== storyboardLocationFromNote(right[0].n)
-  if (locationChanged) return Number.POSITIVE_INFINITY
-  return (left.length + right.length) * 10
-    + (leftRisk >= 4 ? 500 + leftRisk * 20 : 0)
-    + (rightRisk >= 4 ? 500 + rightRisk * 20 : 0)
-    + (locationChanged ? 800 : 0)
+function storyboardSceneNoteSegments(value: string) {
+  return value
+    .split(/\r?\n+/u)
+    .map((line) => line
+      .replace(/^\d+(?:\.\d+)?~\d+(?:\.\d+)?s[：:]\s*/u, '')
+      .trim())
+    .filter(Boolean)
+}
+
+function storyboardEndLocationFromNote(value: string) {
+  const segments = storyboardSceneNoteSegments(value)
+  return storyboardLocationFromNote(segments.at(-1) || value)
+}
+
+function storyboardAssetSceneName(value: string) {
+  const firstLine = storyboardSceneNoteSegments(value)[0] || value.trim()
+  const parts = firstLine.split('｜').map((part) => part.trim()).filter(Boolean)
+  return (parts.length >= 2 ? parts.slice(1).join('｜') : firstLine)
+    .replace(/^时间(?:地点)?承接(?:已锁定剧本|当前剧本场次)[，,：:\s]*/u, '')
+    .trim()
+}
+
+function storyboardAssetSceneNames(value: string) {
+  return [...new Set(storyboardSceneNoteSegments(value)
+    .map((segment) => storyboardAssetSceneName(segment))
+    .filter(Boolean))]
+}
+
+function storyboardEndAssetSceneName(value: string) {
+  return storyboardAssetSceneNames(value).at(-1) || storyboardAssetSceneName(value)
+}
+
+function visibleStoryboardTimeLocation(value: string) {
+  return value
+    .split(/\r?\n/u)
+    .map((line) => line.replace(
+      /^(\d+(?:\.\d+)?~\d+(?:\.\d+)?s[：:]\s*)?时间(?:地点)?承接(?:已锁定剧本|当前剧本场次)｜/u,
+      '$1',
+    ))
+    .join('\n')
+    .trim()
+}
+
+function visibleStoryboardStartTimeLocation(value: string) {
+  const first = storyboardSceneNoteSegments(value)[0] || value
+  return visibleStoryboardTimeLocation(first)
+}
+
+function firstStoryboardTimedField(value: string) {
+  return value
+    .split(/\r?\n/u, 1)[0]
+    .replace(/^\d+(?:\.\d+)?~\d+(?:\.\d+)?s[：:]\s*/u, '')
+    .trim()
+}
+
+function minimumPackedStoryboardBeatDuration(shot: CompactShot) {
+  const dialogues = extractStoryboardShotDialogues(shot.a)
+  const dialogueSeconds = dialogues.reduce(
+    (total, dialogue) => total + estimatedDialogueSeconds(dialogue.text),
+    dialogues.length > 0 ? 0.5 + Math.max(0, dialogues.length - 1) * 0.5 : 0,
+  )
+  return Math.max(3, Math.min(6, Math.ceil(dialogueSeconds)))
+}
+
+function packedStoryboardGroupDialogueSeconds(shots: CompactShot[]) {
+  const dialogues = shots.flatMap((shot) => extractStoryboardShotDialogues(shot.a))
+  return dialogues.reduce(
+    (total, dialogue) => total + estimatedDialogueSeconds(dialogue.text),
+    dialogues.length > 0 ? 0.5 + Math.max(0, dialogues.length - 1) * 0.5 : 0,
+  )
+}
+
+function packedStoryboardGroupFits(shots: CompactShot[], clipSeconds: number) {
+  const duration = shots.reduce((total, shot) => total + shot.d, 0)
+  return duration <= clipSeconds && packedStoryboardGroupDialogueSeconds(shots) <= clipSeconds + 0.05
+}
+
+function compressPackedStoryboardGroup(shots: CompactShot[], clipSeconds: number) {
+  const compressed = shots.map((shot) => ({ ...shot }))
+  let overflow = compressed.reduce((total, shot) => total + shot.d, 0) - clipSeconds
+  if (overflow > 3) return null
+  while (overflow > 0) {
+    const candidate = compressed
+      .map((shot, index) => ({
+        index,
+        reducible: shot.d - minimumPackedStoryboardBeatDuration(shot),
+        duration: shot.d,
+      }))
+      .filter((item) => item.reducible > 0)
+      .sort((left, right) => right.reducible - left.reducible || right.duration - left.duration || left.index - right.index)[0]
+    if (!candidate) return null
+    compressed[candidate.index].d--
+    overflow--
+  }
+  return packedStoryboardGroupFits(compressed, clipSeconds) ? compressed : null
+}
+
+function mergeAdjacentStoryboardGroups(groups: CompactShot[][], clipSeconds: number) {
+  const merged: CompactShot[][] = []
+  let current: CompactShot[] = []
+  for (const shot of groups.flat()) {
+    const candidate = [...current, shot]
+    const compressed = candidate.length <= STORYBOARD_MAX_TIMELINE_BEATS_PER_CLIP
+      && storyboardGroupCharacterNames(candidate).length <= STORYBOARD_MAX_CHARACTERS_PER_CLIP
+      ? compressPackedStoryboardGroup(candidate, clipSeconds)
+      : null
+    if (compressed) {
+      current = compressed
+      continue
+    }
+    if (current.length > 0) merged.push(current)
+    current = [{ ...shot }]
+  }
+  if (current.length > 0) merged.push(current)
+  return merged
+}
+
+function balancedSceneShotGroups(shots: CompactShot[], clipSeconds: number) {
+  if (shots.length === 0) return []
+  const sourceDuration = shots.reduce((total, shot) => total + shot.d, 0)
+  const compressionAllowance = Math.max(1, Math.floor(sourceDuration / clipSeconds))
+  const durationGroupCount = Math.max(1, Math.ceil((sourceDuration - compressionAllowance) / clipSeconds))
+  const groupCount = Math.max(
+    durationGroupCount,
+    Math.ceil(shots.length / STORYBOARD_MAX_TIMELINE_BEATS_PER_CLIP),
+  )
+  const baseSize = Math.floor(shots.length / groupCount)
+  let largerGroups = shots.length % groupCount
+  const initialGroups: CompactShot[][] = []
+  let cursor = 0
+  for (let index = 0; index < groupCount; index++) {
+    const size = baseSize + (largerGroups > 0 ? 1 : 0)
+    if (largerGroups > 0) largerGroups--
+    initialGroups.push(shots.slice(cursor, cursor + size).map((shot) => ({ ...shot })))
+    cursor += size
+  }
+
+  const groupDuration = (group: CompactShot[]) => group.reduce((total, shot) => total + shot.d, 0)
+  const groups = initialGroups.flatMap((group) => {
+    let groupCursor = group.length - 1
+    while (groupDuration(group) > clipSeconds) {
+      const shot = group[groupCursor]
+      if (shot.d > minimumPackedStoryboardBeatDuration(shot)) shot.d--
+      groupCursor = (groupCursor - 1 + group.length) % group.length
+      if (group.every((item) => item.d <= minimumPackedStoryboardBeatDuration(item))) break
+    }
+    if (packedStoryboardGroupFits(group, clipSeconds)
+      && storyboardGroupCharacterNames(group).length <= STORYBOARD_MAX_CHARACTERS_PER_CLIP) {
+      return [group]
+    }
+
+    const splitGroups: CompactShot[][] = []
+    let current: CompactShot[] = []
+    for (const shot of group) {
+      if (current.length > 0 && (
+        !packedStoryboardGroupFits([...current, shot], clipSeconds)
+        || storyboardGroupCharacterNames([...current, shot]).length > STORYBOARD_MAX_CHARACTERS_PER_CLIP
+      )) {
+        splitGroups.push(current)
+        current = []
+      }
+      current.push(shot)
+    }
+    if (current.length > 0) splitGroups.push(current)
+    return splitGroups
+  })
+
+  const targetDuration = Math.max(4, Math.min(sourceDuration, groups.length * clipSeconds))
+  let currentDuration = groups.reduce((total, group) => total + groupDuration(group), 0)
+  let guard = 0
+  while (currentDuration < targetDuration && guard < 500) {
+    guard++
+    const candidate = groups
+      .map((group, index) => ({ group, index, duration: groupDuration(group) }))
+      .filter((item) => item.duration < clipSeconds && item.group.some((shot) => shot.d < 6))
+      .sort((left, right) => left.duration - right.duration || left.index - right.index)[0]
+    if (!candidate) break
+    const shot = candidate.group.find((item) => item.d < 6)
+    if (!shot) break
+    shot.d++
+    currentDuration++
+  }
+  return groups
 }
 
 export function packStoryboardVideoClips(
   shots: CompactShotInput[],
   clipSeconds = STORYBOARD_VIDEO_CLIP_SECONDS,
-  episodeMaxSeconds = STORYBOARD_EPISODE_MAX_SECONDS,
+  episodeMaxSeconds?: number | null,
 ) {
   if (shots.length === 0) return []
-  const normalized = stitchStoryboardContinuity(shots)
+  const normalized = stitchStoryboardContinuity(splitOverlongStoryboardDialogueShots(shots))
   const safeClipSeconds = Math.max(4, Math.min(15, Math.round(clipSeconds)))
-  const maxClipCount = Math.max(1, Math.floor(episodeMaxSeconds / safeClipSeconds))
-  const groups = motionAwareShotGroups(normalized)
-  while (groups.length > maxClipCount) {
-    let mergeIndex = 0
-    let lowestCost = Number.POSITIVE_INFINITY
-    for (let index = 0; index < groups.length - 1; index++) {
-      const cost = storyboardGroupMergeCost(groups[index], groups[index + 1])
-      if (cost < lowestCost) {
-        lowestCost = cost
-        mergeIndex = index
-      }
-    }
-    if (!Number.isFinite(lowestCost)) {
-      break
-    }
-    groups.splice(mergeIndex, 2, [...groups[mergeIndex], ...groups[mergeIndex + 1]])
-  }
-  const minimumClipSeconds = 4
-  if (groups.length * minimumClipSeconds > episodeMaxSeconds) {
+  const safeEpisodeMaxSeconds = Number.isFinite(episodeMaxSeconds) && Number(episodeMaxSeconds) > 0
+    ? Math.max(safeClipSeconds, Math.round(Number(episodeMaxSeconds)))
+    : null
+  const minimumEpisodeSeconds = normalized.length * 3
+  if (safeEpisodeMaxSeconds !== null && minimumEpisodeSeconds > safeEpisodeMaxSeconds) {
     throw new Error(
-      `STORYBOARD_EPISODE_SCENE_DENSITY: 当前集有 ${groups.length} 个不能合并的独立场景，按最短 ${minimumClipSeconds} 秒仍超过 ${episodeMaxSeconds} 秒`,
+      `STORYBOARD_EPISODE_SCENE_DENSITY: 当前集有 ${normalized.length} 个子镜头，按最短 3 秒仍超过 ${safeEpisodeMaxSeconds} 秒`,
     )
   }
-  const availableSeconds = Math.min(episodeMaxSeconds, groups.length * safeClipSeconds)
-  const baseDuration = Math.floor(availableSeconds / groups.length)
-  let remainder = availableSeconds - baseDuration * groups.length
-  const durations = groups.map(() => {
-    const duration = baseDuration + (remainder > 0 ? 1 : 0)
-    remainder = Math.max(0, remainder - 1)
-    return Math.max(minimumClipSeconds, Math.min(safeClipSeconds, duration))
-  })
-  return stitchStoryboardContinuity(
-    groups.map((group, index) => packCompactShotGroup(group, durations[index])),
+  const sourceSeconds = normalized.reduce((total, shot) => total + shot.d, 0)
+  const durationFitted = safeEpisodeMaxSeconds !== null && sourceSeconds > safeEpisodeMaxSeconds
+    ? fitStoryboardDuration(normalized, safeEpisodeMaxSeconds)
+    : normalized
+  const dialogueFitted = stitchStoryboardContinuity(splitOverlongStoryboardDialogueShots(durationFitted))
+  const dialogueFittedMinimumSeconds = dialogueFitted.length * 3
+  if (safeEpisodeMaxSeconds !== null && dialogueFittedMinimumSeconds > safeEpisodeMaxSeconds) {
+    throw new Error(
+      `STORYBOARD_EPISODE_SCENE_DENSITY: 长对白拆分后有 ${dialogueFitted.length} 个子镜头，按最短 3 秒仍超过 ${safeEpisodeMaxSeconds} 秒`,
+    )
+  }
+  const dialogueFittedSeconds = dialogueFitted.reduce((total, shot) => total + shot.d, 0)
+  const finalDurationFitted = safeEpisodeMaxSeconds !== null && dialogueFittedSeconds > safeEpisodeMaxSeconds
+    ? fitStoryboardDuration(dialogueFitted, safeEpisodeMaxSeconds)
+    : dialogueFitted
+  const sceneRuns: CompactShot[][] = []
+  let currentScene: CompactShot[] = []
+  for (const shot of finalDurationFitted) {
+    const previous = currentScene.at(-1)
+    const sameScene = !previous
+      || storyboardLocationFromNote(previous.n) === storyboardLocationFromNote(shot.n)
+    if (currentScene.length > 0 && !sameScene) {
+      sceneRuns.push(currentScene)
+      currentScene = []
+    }
+    currentScene.push(shot)
+  }
+  if (currentScene.length > 0) sceneRuns.push(currentScene)
+  const sameSceneGroups = sceneRuns.flatMap((sceneShots) => balancedSceneShotGroups(sceneShots, safeClipSeconds))
+  const groups = mergeAdjacentStoryboardGroups(sameSceneGroups, safeClipSeconds)
+
+  let expansionBudget = Math.max(
+    0,
+    (safeEpisodeMaxSeconds ?? Number.POSITIVE_INFINITY) - groups.reduce((total, group) => (
+      total + group.reduce((groupTotal, shot) => groupTotal + shot.d, 0)
+    ), 0),
   )
+  const packed = groups.map((group) => {
+    const sourceDuration = group.reduce((total, shot) => total + shot.d, 0)
+    const requiredDuration = Math.min(15, Math.ceil(packedStoryboardGroupDialogueSeconds(group)))
+    const desiredDuration = Math.max(sourceDuration, requiredDuration, safeClipSeconds)
+    const addedDuration = Math.min(expansionBudget, desiredDuration - sourceDuration)
+    expansionBudget -= addedDuration
+    return packCompactShotGroup(group, sourceDuration + addedDuration)
+  })
+
+  return stitchStoryboardContinuity(packed)
+}
+
+function directorPromptSentence(parts: Array<string | null | undefined>, fallback: string) {
+  const value = parts
+    .map((part) => part?.replace(/\r/gu, '').replace(/\n+/gu, '；').trim() || '')
+    .filter(Boolean)
+    .join('；')
+    .replace(/[；;\s]+$/gu, '')
+  if (!value) return fallback
+  return /[。！？.!?]$/u.test(value) ? value : `${value}。`
+}
+
+export function buildDirectorStoryboardPrompt(input: {
+  number: number
+  shot: CompactShotInput
+  visibleTimeLocation: string
+  environmentLock: string
+  lightingLock: string
+}) {
+  const timeLocation = input.visibleTimeLocation.replace(/\s*｜\s*/gu, '，')
+  return [
+    `分镜${input.number}：`,
+    `景别机位运动：${directorPromptSentence([input.shot.c], '中景固定机位。')}`,
+    `画面内容：${directorPromptSentence([
+      timeLocation,
+      input.environmentLock,
+      input.lightingLock,
+      input.shot.f,
+      input.shot.v,
+    ], input.shot.t || '当前分镜画面。')}`,
+    `动作对白：${directorPromptSentence([
+      input.shot.s,
+      input.shot.m,
+      input.shot.a,
+      input.shot.q,
+    ], '本镜无对白，人物动作按画面内容执行。')}`,
+  ].join('\n')
 }
 
 export function materializeStoryboards(input: {
@@ -2652,19 +4715,20 @@ export function materializeStoryboards(input: {
 }) {
   const styleLock = buildStyleLock(input.visualStyle, input.customStylePrompt, 'video')
   const shots = stitchStoryboardContinuity(input.shots)
-  return shots.map((shot, index): GeneratedStoryboard => {
-    const next = shots[index + 1]
-    const transition = storyboardField(
-      shot.x,
-      next
-        ? `本镜动作完成后保持尾帧状态，摄影机和人物只按下一镜明确要求变化。`
-        : `本镜在尾帧状态自然停留，作为本集当前段落收束。`,
-    )
-    const transitionWithContinuity = next
-      ? `${transition} 下一镜必须逐项承接本镜尾帧，并以“${next.f}”作为开场构图；禁止重置站位、服装、道具、陈设或光线。`
-      : transition
+  return shots.map((shot, index) => {
+    const assetSceneNames = storyboardAssetSceneNames(shot.n)
+    const assetSceneName = assetSceneNames[0] || storyboardAssetSceneName(shot.n)
+    const endingAssetSceneName = assetSceneNames.at(-1) || assetSceneName
+    const sceneNotes = storyboardSceneNoteSegments(shot.n)
+      .map((segment) => visibleStoryboardTimeLocation(segment))
+      .join('；')
+    const visibleTimeLocation = visibleStoryboardTimeLocation(shot.n)
+    const visibleStartTimeLocation = visibleStoryboardStartTimeLocation(shot.n)
+    const containsSceneChange = assetSceneNames.length > 1
+    const dedupedCharacterLock = uniqueCharacterShotField([shot], 1200)
+    const characterNames = characterNamesFromLock(dedupedCharacterLock)
     const characterLock = storyboardField(
-      shot.h,
+      dedupedCharacterLock,
       `本镜出场人物的姓名、年龄、面容、身材比例、发型和服装严格沿用资产库主图；未在剧本中出现的人物不得入镜。`,
     )
     const propLock = storyboardField(
@@ -2679,73 +4743,95 @@ export function materializeStoryboards(input: {
       shot.l,
       `沿用场景既定光源方向、色温、亮度和人物受光关系，除非动作顺序明确要求，不得突变。`,
     )
-    const actionSequence = storyboardField(
-      shot.s,
-      `先保持首帧状态；随后严格按剧本完成${shot.a}；最后停在尾帧状态。所有动作依次发生，不并行、不倒序。`,
-    )
-    const motionPhysics = storyboardField(
-      shot.m,
-      `人物先保持稳定起始姿态，再转移重心；每次只有一侧主动肢体沿连续可见路径运动，到达明确接触点或停点后完成缓冲并稳定。双脚着地时不滑移，关节活动符合人体结构；人物之间不发生剧本外身体接触，身体、衣物、头发、家具和道具互不穿透。`,
-    )
-    const voice = storyboardField(
-      shot.q,
-      /无对白|全程不说话/u.test(shot.a)
-        ? `本镜无角色对白，不生成口型；如有【OS】或画外音，只生成画外声音。`
-        : `严格按人物年龄、性别和剧本身份使用固定声线；逐字说出本镜对白，口型同步，不串词。`,
-    )
-    const sound = storyboardField(
-      shot.o,
-      `保留与空间和动作一致的自然环境声与必要音效。无背景音乐，无字幕。`,
-    )
-    const baseProhibitions = storyboardField(
-      shot.z,
-      `禁止人物面容、年龄、发型和服装变化；禁止角色交换位置；禁止道具换手、转移、复制、漂浮或消失；禁止新增人物和无关物品；禁止镜头突然换角度；禁止字幕、背景音乐、水印和 UI。`,
-    )
-    const temporalProhibition = /回忆|梦境/u.test(shot.n)
-      ? `禁止现实人物、现实陈设与回忆或梦境中的人物、环境同时存在；转场完成后才进入当前时空，禁止人物复制、闪白和从瞳孔内部穿越。`
-      : ''
-    const explicitNegativeTerms = `负面缺陷词：肢体融合、关节反折、多余手指、多余手臂、多余腿、身体穿透、衣物穿模、头发穿模、脚底滑移、人物瞬移、人物复制、面容漂移、比例突变、道具漂浮、道具变形、道具换手、背景跳变、镜头抖动失控。`
-    const prohibitions = `${temporalProhibition
-      ? `${baseProhibitions}；${temporalProhibition}`
-      : baseProhibitions}；${explicitNegativeTerms}`
+    const conciseScene = conciseStoryboardSceneSection({
+      timeLocation: visibleTimeLocation,
+      sceneName: assetSceneName,
+      environment: environmentLock,
+      lighting: lightingLock,
+    })
+    const detailedTimeline = normalizeStoryboardCameraCast(fuseStoryboardTimelineDetails({
+      duration: shot.d,
+      timeline: shot.v,
+      camera: compactTimelineValue(shot.c, 900),
+      intent: compactTimelineValue(shot.i, 900),
+      actionOrder: compactTimelineValue(shot.s, 2400),
+      actionPhysics: compactTimelineValue(shot.m, 2200),
+      performance: compactTimelineValue(shot.v, 4000),
+      dialogue: compactTimelineValue(shot.a, 4000),
+      openingState: compactTimelineValue([shot.p, shot.f].filter(Boolean).join('；'), 1600),
+      endingState: compactTimelineValue(shot.g, 1800),
+    }), characterNames)
+    const previousShot = shots[index - 1]
+    const previousScene = previousShot ? storyboardEndAssetSceneName(previousShot.n) : ''
+    const transitionType: ContinuityTransitionType = !previousShot
+      ? 'scene_start'
+      : /回忆|梦境|数日后|翌日|时间跳转/u.test(shot.n)
+        ? 'time_jump'
+        : previousScene !== assetSceneName
+          ? 'scene_change'
+          : /正反打|反打|越轴/u.test([shot.c, shot.x, shot.f].join('\n'))
+            ? 'reverse_shot'
+            : 'same_scene_continuous'
+    const continuityIn = inferStoryboardContinuityState({
+      transitionType,
+      scene: assetSceneName,
+      camera: shot.c,
+      frame: [shot.p, shot.f].filter(Boolean).join('；'),
+      action: '',
+      propState: propLock,
+      characterNames,
+    })
+    const continuityOut = inferStoryboardContinuityState({
+      transitionType,
+      scene: endingAssetSceneName,
+      camera: shot.c,
+      frame: shot.g,
+      action: [shot.s, shot.v, shot.g].filter(Boolean).join('；'),
+      propState: propLock,
+      characterNames,
+    })
 
     return {
       title: shot.t,
-      notes: `${shot.n}\n接续上一镜尾帧：${shot.p}`,
+      notes: containsSceneChange ? sceneNotes : assetSceneName,
       imagePrompt: [
         styleLock,
-        `时间地点：${shot.n}`,
+        `时间地点：${visibleStartTimeLocation}`,
         `人物锁定：${characterLock}`,
         `道具锁定：${propLock}`,
-        `环境锁定：${environmentLock}`,
-        `照明锁定：${lightingLock}`,
+        `环境锁定：${firstStoryboardTimedField(environmentLock)}`,
+        `照明锁定：${firstStoryboardTimedField(lightingLock)}`,
+        containsSceneChange ? '首帧只呈现时间轴第一段场景及当时出场人物，后续场景和人物不得提前出现。' : '',
         `首帧画面：${shot.f}`,
         `电影级首帧构图，人物和资产形象与资产库主图一致，无文字、无水印、无 UI。`,
-      ].join('\n'),
-      videoPrompt: [
-        `【分镜 ${index + 1}｜${shot.d}秒｜16:9】`,
-        `镜头时长：${shot.d}秒`,
-        '画幅比例：16:9',
-        `时间地点：${shot.n}`,
-        `接续上一镜尾帧：${shot.p}`,
-        `人物锁定：${characterLock}`,
-        `道具锁定：${propLock}`,
-        `场景连续性：${environmentLock}；${lightingLock}`,
-        `景别运镜：${shot.c}`,
-        `首帧：${shot.f}`,
-        `对白声音：${voice}；${sound}`,
-        `尾帧衔接：${shot.g}；${transitionWithContinuity}`,
-        `禁止项：${prohibitions}`,
-        '',
-        '主要动作与画面：',
-        `动作对白：${shot.a}`,
-        `动作顺序：${actionSequence}`,
-        `动作物理：${motionPhysics}`,
-        `画面描述：${shot.v}`,
-      ].join('\n'),
+      ].filter(Boolean).join('\n'),
+      directorPrompt: buildDirectorStoryboardPrompt({
+        number: index + 1,
+        shot,
+        visibleTimeLocation,
+        environmentLock,
+        lightingLock,
+      }),
+      videoPrompt: buildNaturalStoryboardPrompt({
+        visualStyle: input.visualStyle,
+        customStylePrompt: input.customStylePrompt,
+        style: styleLock,
+        people: [
+          compactTimelineValue(characterLock, 900),
+          `初始位置：${compactTimelineValue([shot.p, shot.f].filter(Boolean).join('；'), 600)}`,
+        ].filter(Boolean).join('\n'),
+        scene: conciseScene,
+        detailedTimeline,
+        duration: shot.d,
+        aspectRatio: '16:9',
+        characterNames,
+      }),
+      detailedTimeline,
       duration: shot.d,
       aspectRatio: '16:9',
       generateAudio: true,
+      continuityIn,
+      continuityOut,
     }
   })
 }
@@ -2756,7 +4842,7 @@ async function saveStoryboardCheckpoint(
   checkpoint: z.output<typeof storyboardCheckpointSchema>,
   progress: number,
   detail: {
-    phase: 'preparing' | 'generating' | 'retrying' | 'saving' | 'finalizing'
+    phase: 'preparing' | 'generating' | 'retrying' | 'reviewing' | 'repairing' | 'verifying' | 'saving' | 'finalizing'
     completedEpisodes: number
     totalEpisodes: number
     completedSegments: number
@@ -2766,6 +4852,12 @@ async function saveStoryboardCheckpoint(
     segmentParallelism: number
     currentSegment?: number
     currentSegmentTotal?: number
+    reviewRound?: number
+    maximumReviewRounds?: number
+    modifiedShots?: number
+    remainingIssues?: number
+    fatalIssues?: number
+    warning?: string
     activeRoutes?: Array<{
       episodeNumber: number
       provider: TextProviderLabel
@@ -2825,6 +4917,7 @@ async function renumberGeneratedStoryboards(projectId: string) {
 async function processStoryboardGeneration(task: {
   id: string
   projectId: string
+  createdById: string
   payload: Prisma.JsonValue | null
 }) {
   const payload = payloadRecord(task.payload)
@@ -2865,16 +4958,13 @@ async function processStoryboardGeneration(task: {
     throw new Error('项目已有 AI 分镜；确认替换后再重新生成')
   }
   const sourceFingerprint = createHash('sha256').update(JSON.stringify({
-    pipelineVersion: 'storyboard-first-atomic-shots-v10',
+    pipelineVersion: 'storyboard-first-shotlab-scene-anchored-v14-compact-pipe-locations',
     visualStyle: project.visualStyle,
     customStylePrompt: project.customStylePrompt,
     episodes: episodes.map((episode) => ({ id: episode.id, updatedAt: episode.updatedAt.toISOString() })),
     assets: assets.map((asset) => ({ id: asset.id, updatedAt: asset.updatedAt.toISOString() })),
   })).digest('hex')
-  const parsedCheckpoint = storyboardCheckpointSchema.safeParse(payload.storyboardCheckpoint)
-  const checkpoint = parsedCheckpoint.success && parsedCheckpoint.data.sourceFingerprint === sourceFingerprint
-    ? parsedCheckpoint.data
-    : { version: 5 as const, sourceFingerprint, completedEpisodeIds: [], segments: [] }
+  const checkpoint = restoreStoryboardCheckpoint(payload.storyboardCheckpoint, sourceFingerprint)
   const existingByEpisode = new Map<string, string[]>()
   for (const storyboard of existingGenerated) {
     if (!storyboard.episodeId) continue
@@ -2896,6 +4986,9 @@ async function processStoryboardGeneration(task: {
       && !completedEpisodeIds.has(segment.episodeId)
       && Boolean(chunks?.[segment.segmentIndex])
   })
+  checkpoint.episodeReviews = checkpoint.episodeReviews.filter((review) => (
+    episodeIds.has(review.episodeId) && !completedEpisodeIds.has(review.episodeId)
+  ))
   const totalSegments = Math.max(
     1,
     episodes.reduce((total, episode) => total + (chunksByEpisode.get(episode.id)?.length || 0), 0),
@@ -2956,8 +5049,17 @@ async function processStoryboardGeneration(task: {
   }
 
   function persistStoryboardState(
-    phase: 'preparing' | 'generating' | 'retrying' | 'saving' | 'finalizing',
-    current?: { segment: number; segmentTotal: number },
+    phase: 'preparing' | 'generating' | 'retrying' | 'reviewing' | 'repairing' | 'verifying' | 'saving' | 'finalizing',
+    current?: {
+      segment?: number
+      segmentTotal?: number
+      reviewRound?: number
+      maximumReviewRounds?: number
+      modifiedShots?: number
+      remainingIssues?: number
+      fatalIssues?: number
+      warning?: string
+    },
   ) {
     checkpoint.completedEpisodeIds = [...completedEpisodeIds]
     const completedSegments = completedSegmentCount()
@@ -2975,7 +5077,14 @@ async function processStoryboardGeneration(task: {
       activeRoutes: [...activeRoutes.values()].sort((left, right) => left.episodeNumber - right.episodeNumber),
       parallelism,
       segmentParallelism,
-      ...(current ? { currentSegment: current.segment, currentSegmentTotal: current.segmentTotal } : {}),
+      ...(typeof current?.segment === 'number' ? { currentSegment: current.segment } : {}),
+      ...(typeof current?.segmentTotal === 'number' ? { currentSegmentTotal: current.segmentTotal } : {}),
+      ...(typeof current?.reviewRound === 'number' ? { reviewRound: current.reviewRound } : {}),
+      ...(typeof current?.maximumReviewRounds === 'number' ? { maximumReviewRounds: current.maximumReviewRounds } : {}),
+      ...(typeof current?.modifiedShots === 'number' ? { modifiedShots: current.modifiedShots } : {}),
+      ...(typeof current?.remainingIssues === 'number' ? { remainingIssues: current.remainingIssues } : {}),
+      ...(typeof current?.fatalIssues === 'number' ? { fatalIssues: current.fatalIssues } : {}),
+      ...(current?.warning ? { warning: current.warning } : {}),
     }
     checkpointWrite = checkpointWrite.then(() => saveStoryboardCheckpoint(
       task.id,
@@ -2993,6 +5102,7 @@ async function processStoryboardGeneration(task: {
     episode: (typeof episodes)[number],
     retryPass = false,
     route: StoryboardTextRoute,
+    allowResidualFinalize = false,
   ) {
     activeEpisodeNumbers.add(episode.episodeNumber)
     await persistStoryboardState(retryPass ? 'retrying' : 'generating')
@@ -3018,13 +5128,13 @@ async function processStoryboardGeneration(task: {
       selectedImageId: null,
       updatedAt: episode.updatedAt,
     }))
-    const episodeLocations = matchedAssetLocations.length > 0
-      ? matchedAssetLocations
-      : scriptedLocationAssets
+    const episodeLocations = scriptLocations.length > 0
+      ? scriptedLocationAssets
+      : matchedAssetLocations
     const relatedAssetMap = new Map(
       [
         ...initiallyRelatedAssets,
-        ...(matchedAssetLocations.length > 0 ? episodeLocations : []),
+        ...episodeLocations,
       ].map((asset) => [asset.id, asset]),
     )
     const relatedAssets = [...relatedAssetMap.values()]
@@ -3041,9 +5151,7 @@ async function processStoryboardGeneration(task: {
     }
     const allAssetNames = [
       ...[...indexedAssets.values()].map((asset) => ({ type: asset.type, name: asset.name })),
-      ...(matchedAssetLocations.length === 0
-        ? scriptLocations.map((location) => ({ type: AssetType.location, name: location.name }))
-        : []),
+      ...episodeLocations.map((location) => ({ type: AssetType.location, name: location.name })),
     ]
 
     async function generateSegment(script: string, segment?: {
@@ -3065,9 +5173,17 @@ async function processStoryboardGeneration(task: {
         locationContext,
         episodeLocations.length,
       )
-      const allowedLocations = segmentLocationMatches.length > 0
-        ? segmentLocationMatches
-        : episodeLocations
+      const explicitSegmentLocations = extractScriptSceneLocations(script)
+      const exactSegmentLocations = episodeLocations.filter((location) => (
+        explicitSegmentLocations.some((explicit) => (
+          normalizedStoryboardLocation(location.name) === normalizedStoryboardLocation(explicit.name)
+        ))
+      ))
+      const allowedLocations = exactSegmentLocations.length > 0
+        ? exactSegmentLocations
+        : segmentLocationMatches.length > 0
+          ? segmentLocationMatches
+          : episodeLocations
       const allowedLocationNames = new Set(allowedLocations.map((location) => location.name))
       const segmentPromptAssets = promptAssets.filter((asset) => (
         asset.type !== AssetType.location || allowedLocationNames.has(asset.name)
@@ -3089,7 +5205,7 @@ async function processStoryboardGeneration(task: {
           targetShotCount,
           segment,
         }),
-        schema: compactStoryboardSchemaForTarget(targetShotCount),
+        schema: compactStoryboardSchema,
         maxOutputTokens: Math.min(8_000, Math.max(script.length <= 200 ? 2_600 : 4_000, targetShotCount * 900)),
         timeoutMs: route.timeoutMs,
         maxAttempts: route.maxAttempts,
@@ -3101,14 +5217,46 @@ async function processStoryboardGeneration(task: {
         allowFallback: route.allowFallback,
         allowTertiary: route.allowTertiary,
       })
-      const dialogues = extractRequiredStoryboardDialogueLines(script)
-      let joined = parsed.shots.map((item) => item.a).join('\n')
-      let missing = dialogues.filter((dialogue) => dialogueMissing(joined, dialogue.text))
+      if (projectStyle.visualStyle === VisualStyle.overseas_live_action) {
+        const chineseDialogueShots = parsed.shots.flatMap((shot, index) => (
+          extractStoryboardShotDialogues(shot.a).some((dialogue) => /\p{Script=Han}/u.test(dialogue.text))
+            ? [{ shotNumber: index + 1, a: shot.a }]
+            : []
+        ))
+        if (chineseDialogueShots.length > 0) {
+          const translated = await callStructuredText({
+            system: 'You are an American TV dialogue translator. Return strict JSON only. Translate spoken dialogue into concise natural American English while preserving every speaker, meaning, order, and dialogue marker. Do not change action fields.',
+            prompt: `Translate only the a fields listed below. Character names before the colon may remain unchanged, but every spoken word after the colon must be natural American English. Do not add, remove, merge, reorder, or explain any line.\n\nSource script for meaning:\n${script}\n\nCurrent dialogue fields:\n${JSON.stringify(chineseDialogueShots)}`,
+            schema: storyboardDialogueTranslationSchema,
+            maxOutputTokens: Math.min(3_000, 900 + chineseDialogueShots.length * 500),
+            timeoutMs: Math.min(route.timeoutMs, 60_000),
+            maxAttempts: 1,
+            reasoningEffort: 'low',
+            primaryKeyIndex: route.primaryKeyIndex,
+            fallbackKeyIndex: route.fallbackKeyIndex,
+            tertiaryKeyIndex: route.tertiaryKeyIndex,
+            allowPrimary: route.allowPrimary,
+            allowFallback: route.allowFallback,
+            allowTertiary: route.allowTertiary,
+          })
+          const translations = new Map(translated.translations.map((item) => [item.shotNumber, item.a]))
+          parsed = {
+            shots: parsed.shots.map((shot, index) => ({
+              ...shot,
+              a: translations.get(index + 1) || shot.a,
+            })),
+          }
+        }
+      }
+      const dialogues = projectStyle.visualStyle === VisualStyle.overseas_live_action
+        ? []
+        : extractScriptDialogueLines(script)
+      const missing = dialogues.filter((dialogue) => storyboardDialogueMissing(parsed.shots, dialogue))
       if (allowRepair && missing.length > 0) {
         let supplementalShots: CompactShot[] = []
         try {
           const supplemental = await callStructuredText({
-            system: '你是分镜对白补录导演。只生成遗漏对白对应的补充镜头，并逐字复制指定对白；禁止返回空数组。',
+            system: '你是分镜对白补录导演。只生成遗漏对白、旁白、画外音或【OS】对应的补充镜头；逐字保留说话人、顺序和完整原文，过长时只能拆镜，禁止删改；禁止返回空数组。',
             prompt: buildMissingDialogueShotsPrompt({
               episodeNumber: episode.episodeNumber,
               script,
@@ -3131,11 +5279,10 @@ async function processStoryboardGeneration(task: {
           if (nonRetryableTextApiError(error)) throw error
         }
 
-        const supplementalText = () => supplementalShots.map((item) => item.a).join('\n')
-        const unresolved = missing.filter((dialogue) => dialogueMissing(supplementalText(), dialogue.text))
+        const unresolved = missing.filter((dialogue) => storyboardDialogueMissing(supplementalShots, dialogue))
         for (const dialogue of unresolved) {
           const single = await callStructuredText({
-            system: '你是分镜对白补录导演。必须为唯一指定对白输出一个镜头，逐字复制对白，shots 禁止为空。',
+            system: '你是分镜对白补录导演。必须为唯一指定对白输出一个镜头，完整保留关键语义并使用自然可表演的台词，shots 禁止为空。',
             prompt: `${buildMissingDialogueShotsPrompt({
               episodeNumber: episode.episodeNumber,
               script,
@@ -3164,24 +5311,97 @@ async function processStoryboardGeneration(task: {
             missing,
           }),
         }
-        joined = parsed.shots.map((item) => item.a).join('\n')
-        missing = dialogues.filter((dialogue) => dialogueMissing(joined, dialogue.text))
       }
-      if (missing.length > 0) {
-        throw new Error(`第 ${episode.episodeNumber} 集当前段仍遗漏 ${missing.length} 句对白`)
-      }
-      return stitchStoryboardContinuity(
-        enforceStoryboardLocationAssets(
-          compactStoryboardShots(parsed.shots, targetShotCount),
-          allowedLocations,
-        ),
-        segment?.previousShotTail,
+      let atomicShots = enforceStoryboardLocationAssets(
+        compactStoryboardShots(parsed.shots, targetShotCount),
+        allowedLocations,
       )
+      const atomicityIssues = storyboardAtomicityIssues(atomicShots, allowedLocations)
+      if (atomicityIssues.length > 0) {
+        const issueLines = atomicityIssues.map((issue) => (
+          `镜头 ${issue.index + 1}《${issue.title}》：${issue.reasons.join('；')}`
+        ))
+        const repaired = await callStructuredText({
+          system: '你是分镜原子化审片导演。只拆分不合格镜头，禁止合并、改序、删改任何现场对白、旁白、画外音或【OS】；同一原子分镜可按剧本顺序包含多位现场对白说话人，对白过长时只能拆镜。',
+          prompt: buildStoryboardAtomicRepairPrompt({
+            episodeNumber: episode.episodeNumber,
+            script,
+            currentJson: JSON.stringify({ shots: atomicShots }),
+            issues: issueLines,
+            minimumShotCount: targetShotCount,
+          }),
+          schema: compactStoryboardSchema,
+          maxOutputTokens: Math.min(8_000, Math.max(4_000, targetShotCount * 900)),
+          timeoutMs: route.timeoutMs,
+          maxAttempts: 1,
+          reasoningEffort: 'low',
+          primaryKeyIndex: route.primaryKeyIndex,
+          fallbackKeyIndex: route.fallbackKeyIndex,
+          tertiaryKeyIndex: route.tertiaryKeyIndex,
+          allowPrimary: route.allowPrimary,
+          allowFallback: route.allowFallback,
+          allowTertiary: route.allowTertiary,
+        })
+        atomicShots = enforceStoryboardLocationAssets(repaired.shots, allowedLocations)
+        const repairedMissing = dialogues.filter((dialogue) => storyboardDialogueMissing(atomicShots, dialogue))
+        if (repairedMissing.length > 0) {
+          const supplemental = await callStructuredText({
+            system: '你是分镜对白补录导演。原子化重拆后只补录遗漏的现场对白、旁白、画外音或【OS】；同一 4 秒原子镜头可按剧本顺序包含多位现场对白说话人，逐字保留完整原文，过长时只能拆镜。',
+            prompt: buildMissingDialogueShotsPrompt({
+              episodeNumber: episode.episodeNumber,
+              script,
+              missing: repairedMissing,
+            }),
+            schema: compactStoryboardAllowEmptySchema,
+            maxOutputTokens: Math.min(4_000, 1_200 + repairedMissing.length * 700),
+            timeoutMs: Math.min(route.timeoutMs, 60_000),
+            maxAttempts: 1,
+            reasoningEffort: 'low',
+            primaryKeyIndex: route.primaryKeyIndex,
+            fallbackKeyIndex: route.fallbackKeyIndex,
+            tertiaryKeyIndex: route.tertiaryKeyIndex,
+            allowPrimary: route.allowPrimary,
+            allowFallback: route.allowFallback,
+            allowTertiary: route.allowTertiary,
+          })
+          const supplementalShots = supplemental.shots.map((shot) => ({ ...shot, d: 4 }))
+          const unresolved = repairedMissing.filter((dialogue) => storyboardDialogueMissing(supplementalShots, dialogue))
+          for (const dialogue of unresolved) {
+            const single = await callStructuredText({
+              system: '你是分镜对白补录导演。必须为唯一指定对白输出一个 4 秒原子镜头，保留关键语义并确保自然语速。',
+              prompt: `${buildMissingDialogueShotsPrompt({
+                episodeNumber: episode.episodeNumber,
+                script,
+                missing: [dialogue],
+              })}\n\n【再次确认】只输出一个 4 秒镜头，shots 数组必须恰好包含一项。`,
+              schema: compactStoryboardSchema,
+              maxOutputTokens: 1_800,
+              timeoutMs: Math.min(route.timeoutMs, 60_000),
+              maxAttempts: 1,
+              reasoningEffort: 'low',
+              primaryKeyIndex: route.primaryKeyIndex,
+              fallbackKeyIndex: route.fallbackKeyIndex,
+              tertiaryKeyIndex: route.tertiaryKeyIndex,
+              allowPrimary: route.allowPrimary,
+              allowFallback: route.allowFallback,
+              allowTertiary: route.allowTertiary,
+            })
+            supplementalShots.push({ ...enforceSupplementalDialogue(single.shots[0], dialogue), d: 4 })
+          }
+          atomicShots = enforceStoryboardLocationAssets(insertMissingDialogueShots({
+            current: atomicShots,
+            supplemental: supplementalShots,
+            script,
+            missing: repairedMissing,
+          }), allowedLocations)
+        }
+      }
+      return stitchStoryboardContinuity(atomicShots, segment?.previousShotTail)
     }
 
     try {
       const chunks = chunksByEpisode.get(episode.id) || [episode.content]
-      const episodeTargetShotCount = targetStoryboardShotCount(episode.content, 20)
+      const episodeTargetShotCount = targetStoryboardShotCount(episode.content, 18)
       const segmentShotTargets = allocateStoryboardShotTargets(chunks, episodeTargetShotCount)
       const groups: Array<CompactShot[] | undefined> = Array.from({ length: chunks.length })
       const pendingIndexes: number[] = []
@@ -3257,22 +5477,554 @@ async function processStoryboardGeneration(task: {
         completedGroups.flat(),
         episode.content,
       )
-      const atomicShots = compactStoryboardShots(
+      let atomicShots = compactStoryboardShots(
         stitchStoryboardContinuity(voiceoverReducedShots),
         episodeTargetShotCount,
       )
-      const durationFittedShots = fitStoryboardDuration(atomicShots, 90)
+      atomicShots = stitchStoryboardContinuity(splitOverlongStoryboardDialogueShots(atomicShots))
+      const normalizeFinalReviewShots = (shots: CompactShot[]) => repairStoryboardDirectorCoverage(
+        stitchStoryboardContinuity(
+          normalizeStoryboardSpokenAudioRules(
+            dedupeStoryboardDialogueShots(
+              splitOverlongStoryboardDialogueShots(
+                enforceStoryboardLocationAssets(
+                  suppressNonessentialStoryboardVoiceovers(
+                    projectStyle.visualStyle === VisualStyle.overseas_live_action
+                      ? normalizeOverseasStoryboardDialogueTerms(shots)
+                      : shots,
+                    episode.content,
+                  ),
+                  episodeLocations,
+                ).map((shot) => ({
+                  ...shot,
+                  d: Math.max(4, Math.min(6, shot.d)),
+                  e: conciseStoryboardSceneFacts(shot.e, 160)
+                    || `${shot.n}。仅保留该地点的空间结构、固定陈设、材质、天气、空气状态和静态光线。`,
+                })),
+              ),
+              {
+                script: episode.content,
+                visualStyle: projectStyle.visualStyle,
+              },
+            ),
+          ),
+        ),
+      )
+      const runFinalEpisodeReview = async (
+        shots: CompactShot[],
+        issues: string[] = [],
+        verificationRound?: number,
+      ) => {
+        const reviewed = await callStructuredText({
+          system: '你是短剧分镜总审片导演。必须逐行对照整集锁定剧本，只输出结构化问题报告。不得修改镜头、不得输出补丁，也不得为通过检查改写剧本。',
+          prompt: buildStoryboardFinalReviewPrompt({
+            episodeNumber: episode.episodeNumber,
+            script: episode.content,
+            currentJson: JSON.stringify({ shots }),
+            targetShotCount: Math.max(episodeTargetShotCount, shots.length),
+            visualStyle: projectStyle.visualStyle,
+            allowedLocationNames: episodeLocations.map((location) => location.name),
+            issues,
+            verificationRound,
+          }),
+          schema: storyboardFinalReviewReportSchema,
+          maxOutputTokens: Math.min(4_500, Math.max(1_800, episodeTargetShotCount * 180)),
+          timeoutMs: route.timeoutMs,
+          maxAttempts: 1,
+          reasoningEffort: 'low',
+          primaryKeyIndex: route.primaryKeyIndex,
+          fallbackKeyIndex: route.fallbackKeyIndex,
+          tertiaryKeyIndex: route.tertiaryKeyIndex,
+          allowPrimary: route.allowPrimary,
+          allowFallback: route.allowFallback,
+          allowTertiary: route.allowTertiary,
+        })
+        if (!reviewed.passed && reviewed.issues.length === 0 && issues.length === 0) {
+          return { passed: true, issues: [] }
+        }
+        return reviewed
+      }
+
+      const runFinalEpisodeRepair = async (
+        shots: CompactShot[],
+        issues: StoryboardFinalReviewIssue[],
+        repairRound: number,
+      ) => callStructuredText({
+        system: '你是短剧分镜修复导演。复查问题已经确定；必须逐项执行修改并返回可应用补丁，不能只重复问题，不能改写锁定剧本。',
+        prompt: buildStoryboardFinalRepairPrompt({
+          episodeNumber: episode.episodeNumber,
+          script: episode.content,
+          currentJson: JSON.stringify({ shots }),
+          targetShotCount: Math.max(episodeTargetShotCount, shots.length),
+          visualStyle: projectStyle.visualStyle,
+          allowedLocationNames: episodeLocations.map((location) => location.name),
+          issues,
+          repairRound,
+        }),
+        schema: storyboardFinalReviewPatchSchema,
+        maxOutputTokens: Math.min(6_000, Math.max(2_400, episodeTargetShotCount * 320)),
+        timeoutMs: route.timeoutMs,
+        maxAttempts: 1,
+        reasoningEffort: 'low',
+        primaryKeyIndex: route.primaryKeyIndex,
+        fallbackKeyIndex: route.fallbackKeyIndex,
+        tertiaryKeyIndex: route.tertiaryKeyIndex,
+        allowPrimary: route.allowPrimary,
+        allowFallback: route.allowFallback,
+        allowTertiary: route.allowTertiary,
+      })
+
+      const localFinalReviewIssues = (shots: CompactShot[]) => {
+        const createIssue = (
+          problem: string,
+          category: StoryboardFinalReviewIssue['category'],
+          severity: StoryboardFinalReviewIssue['severity'],
+          shotNumber?: number,
+        ): StoryboardFinalReviewIssue => ({
+          severity,
+          category,
+          shotNumbers: shotNumber ? [shotNumber] : [],
+          scriptEvidence: '以本集锁定剧本和相邻镜头状态为准',
+          problem,
+          repairInstruction: problem,
+        })
+        const atomicity = storyboardAtomicityIssues(shots, episodeLocations)
+          .flatMap((issue) => issue.reasons.map((reason) => createIssue(
+            `镜头 ${issue.index + 1}《${issue.title}》：${reason}`,
+            'prompt_conflict',
+            'fatal',
+            issue.index + 1,
+          )))
+        const continuity = storyboardContinuityIssues(shots)
+          .flatMap((issue) => issue.reasons.map((reason) => createIssue(
+            `镜头 ${issue.index + 1}《${issue.title}》：${reason}`,
+            'continuity',
+            'fatal',
+            issue.index + 1,
+          )))
+        const episodeReview = storyboardEpisodeReviewIssues(shots, {
+          script: episode.content,
+          visualStyle: projectStyle.visualStyle,
+        }).flatMap((issue) => issue.reasons.map((reason) => {
+          const category = finalReviewCategory(undefined, reason)
+          return createIssue(
+            `镜头 ${issue.index + 1}《${issue.title}》：${reason}`,
+            category,
+            category === 'directing' ? 'warning' : 'fatal',
+            issue.index + 1,
+          )
+        }))
+        const directorReview = storyboardDirectorIssues(shots)
+          .flatMap((issue) => issue.reasons.map((reason) => createIssue(
+            `镜头 ${issue.index + 1}《${issue.title}》：${reason}`,
+            'directing',
+            'warning',
+            issue.index + 1,
+          )))
+        const dynamicScenes = shots.flatMap((shot, index) => (
+          storyboardSceneHasDynamicContent(shot.e)
+            ? [createIssue(
+                `镜头 ${index + 1}《${shot.t}》：场景描述含人物动作、表情、对白、接触或剧情过程；必须移入视频分镜，e 只保留静态环境`,
+                'scene',
+                'fatal',
+                index + 1,
+              )]
+            : []
+        ))
+        const missingDialogue = projectStyle.visualStyle === VisualStyle.overseas_live_action
+          ? []
+          : extractScriptDialogueLines(episode.content)
+            .filter((dialogue) => storyboardDialogueMissing(shots, dialogue))
+            .map((dialogue) => createIssue(
+              `遗漏现场对白“${dialogue.speaker}：${dialogue.text}”`,
+              'dialogue',
+              'fatal',
+            ))
+        return dedupeStoryboardFinalReviewIssues([
+          ...atomicity,
+          ...continuity,
+          ...episodeReview,
+          ...directorReview,
+          ...dynamicScenes,
+          ...missingDialogue,
+        ])
+      }
+
+      const reviewBaselineShots = normalizeFinalReviewShots(atomicShots)
+      const maximumFinalReviewRounds = 3
+      const savedReviewState = checkpoint.episodeReviews.find((review) => review.episodeId === episode.id)
+      let reviewStage = savedReviewState?.stage || null
+      let reviewRound = savedReviewState?.round || 0
+      let noChangeAttempts = savedReviewState?.noChangeAttempts || 0
+      let modifiedShots = savedReviewState?.modifiedShots || 0
+      let currentReviewShots = savedReviewState?.currentShots || reviewBaselineShots
+      let currentReviewIssues = savedReviewState?.currentIssues || []
+      let bestReviewShots = savedReviewState?.bestShots || currentReviewShots
+      let bestReviewIssues = savedReviewState?.bestIssues || currentReviewIssues
+
+      const saveEpisodeReviewState = async (
+        phase: 'reviewing' | 'repairing' | 'verifying',
+        warning?: string,
+      ) => {
+        checkpoint.episodeReviews = checkpoint.episodeReviews.filter((review) => review.episodeId !== episode.id)
+        checkpoint.episodeReviews.push({
+          episodeId: episode.id,
+          stage: reviewStage || 'reviewed',
+          round: reviewRound,
+          noChangeAttempts,
+          modifiedShots,
+          currentShots: currentReviewShots,
+          currentIssues: currentReviewIssues,
+          bestShots: bestReviewShots,
+          bestIssues: bestReviewIssues,
+        })
+        await persistStoryboardState(phase, {
+          reviewRound,
+          maximumReviewRounds: maximumFinalReviewRounds,
+          modifiedShots,
+          remainingIssues: currentReviewIssues.length,
+          fatalIssues: currentReviewIssues.filter((issue) => issue.severity === 'fatal').length,
+          warning,
+        })
+      }
+
+      const mergeReviewIssues = (
+        shots: CompactShot[],
+        report: StoryboardFinalReviewReport,
+      ) => {
+        const actionableProblems = new Set(actionableStoryboardFinalReviewIssues(
+          report.issues.map((issue) => issue.problem),
+          {
+            script: episode.content,
+            shots,
+            allowedLocationNames: episodeLocations.map((location) => location.name),
+          },
+        ))
+        const semanticIssues = report.issues.filter((issue) => actionableProblems.has(issue.problem))
+        return dedupeStoryboardFinalReviewIssues([
+          ...localFinalReviewIssues(shots),
+          ...semanticIssues,
+        ])
+      }
+
+      if (!reviewStage) {
+        const localIssues = localFinalReviewIssues(currentReviewShots)
+        await persistStoryboardState('reviewing', {
+          reviewRound,
+          maximumReviewRounds: maximumFinalReviewRounds,
+          modifiedShots,
+          remainingIssues: localIssues.length,
+          fatalIssues: localIssues.filter((issue) => issue.severity === 'fatal').length,
+        })
+        const report = await runFinalEpisodeReview(
+          currentReviewShots,
+          localIssues.map((issue) => issue.problem).slice(0, 24),
+        )
+        currentReviewIssues = mergeReviewIssues(currentReviewShots, report)
+        bestReviewShots = currentReviewShots
+        bestReviewIssues = currentReviewIssues
+        reviewStage = 'reviewed'
+        await saveEpisodeReviewState('reviewing')
+      }
+
+      let finalReviewWarnings: StoryboardFinalReviewIssue[] = []
+      while (true) {
+        if (shouldFinalizeStoryboardReviewLocally({
+          stage: reviewStage,
+          round: reviewRound,
+          maximumRounds: maximumFinalReviewRounds,
+        })) {
+          currentReviewIssues = localFinalReviewIssues(currentReviewShots)
+          const preferred = preferStoryboardReviewCandidate({
+            currentShots: currentReviewShots,
+            currentIssues: currentReviewIssues,
+            bestShots: bestReviewShots,
+            bestIssues: bestReviewIssues,
+          })
+          bestReviewShots = preferred.shots
+          bestReviewIssues = preferred.issues
+          atomicShots = bestReviewShots
+          currentReviewShots = bestReviewShots
+          currentReviewIssues = bestReviewIssues
+          reviewStage = 'verified'
+          finalReviewWarnings = nonBlockingStoryboardReviewWarnings(bestReviewIssues)
+          await saveEpisodeReviewState(
+            'verifying',
+            `已完成 ${maximumFinalReviewRounds} 轮返工和本地完整校验，保存问题最少的版本；剩余 ${bestReviewIssues.length} 项转为人工确认，不再因外部复核超时阻断下一步`,
+          )
+          break
+        }
+
+        if (reviewStage === 'repaired') {
+          const localIssues = localFinalReviewIssues(currentReviewShots)
+          await persistStoryboardState('verifying', {
+            reviewRound,
+            maximumReviewRounds: maximumFinalReviewRounds,
+            modifiedShots,
+            remainingIssues: localIssues.length,
+            fatalIssues: localIssues.filter((issue) => issue.severity === 'fatal').length,
+          })
+          let verificationWarning: string | undefined
+          try {
+            const report = await runFinalEpisodeReview(
+              currentReviewShots,
+              localIssues.map((issue) => issue.problem).slice(0, 24),
+              reviewRound,
+            )
+            currentReviewIssues = mergeReviewIssues(currentReviewShots, report)
+          } catch (error) {
+            if (!canUseLocalStoryboardVerificationFallback(error)) throw error
+            currentReviewIssues = localIssues
+            verificationWarning = `第 ${reviewRound} 轮外部验收暂时不可用，已用本地完整校验继续返工；最新修复稿和 ${localIssues.length} 项检查结果均已保存`
+          }
+          const preferred = preferStoryboardReviewCandidate({
+            currentShots: currentReviewShots,
+            currentIssues: currentReviewIssues,
+            bestShots: bestReviewShots,
+            bestIssues: bestReviewIssues,
+          })
+          bestReviewShots = preferred.shots
+          bestReviewIssues = preferred.issues
+          reviewStage = 'verified'
+          await saveEpisodeReviewState('verifying', verificationWarning)
+        }
+
+        if (currentReviewIssues.length === 0) {
+          atomicShots = currentReviewShots
+          break
+        }
+
+        if (noChangeAttempts >= 3) {
+          if (!allowResidualFinalize && storyboardFinalReviewHasFatalIssues(bestReviewIssues)) {
+            noChangeAttempts = 0
+            reviewStage = 'verified'
+            await saveEpisodeReviewState(
+              'repairing',
+              '当前文字线路连续返回无变化补丁，已保存最新修复稿并切换备用线路继续修改',
+            )
+            throw new Error('STORYBOARD_REPAIR_NO_PROGRESS: 当前文字线路连续返回无变化补丁')
+          }
+          atomicShots = bestReviewShots
+          currentReviewShots = bestReviewShots
+          currentReviewIssues = bestReviewIssues
+          reviewStage = 'verified'
+          finalReviewWarnings = nonBlockingStoryboardReviewWarnings(bestReviewIssues)
+          await saveEpisodeReviewState(
+            'verifying',
+            `连续 3 次返工没有继续改善，已保存当前最佳版本；剩余 ${bestReviewIssues.length} 项转为人工确认，不阻断下一步`,
+          )
+          break
+        }
+
+        if (reviewRound >= maximumFinalReviewRounds) {
+          atomicShots = bestReviewShots
+          currentReviewShots = bestReviewShots
+          currentReviewIssues = bestReviewIssues
+          reviewStage = 'verified'
+          finalReviewWarnings = nonBlockingStoryboardReviewWarnings(bestReviewIssues)
+          await saveEpisodeReviewState(
+            'verifying',
+            `已完成 ${maximumFinalReviewRounds} 轮返工并保存最佳版本；剩余 ${bestReviewIssues.length} 项转为人工确认，不阻断下一步`,
+          )
+          break
+        }
+
+        await persistStoryboardState('repairing', {
+          reviewRound: reviewRound + 1,
+          maximumReviewRounds: maximumFinalReviewRounds,
+          modifiedShots,
+          remainingIssues: currentReviewIssues.length,
+          fatalIssues: currentReviewIssues.filter((issue) => issue.severity === 'fatal').length,
+        })
+        let patch: z.output<typeof storyboardFinalReviewPatchSchema>
+        try {
+          patch = await runFinalEpisodeRepair(
+            currentReviewShots,
+            currentReviewIssues,
+            reviewRound + 1,
+          )
+        } catch (error) {
+          if (!canUseLocalStoryboardVerificationFallback(error)) throw error
+          if (!allowResidualFinalize) {
+            reviewStage = 'verified'
+            await saveEpisodeReviewState(
+              'repairing',
+              '当前修改线路暂时不可用，已保存最新修复稿并切换备用线路继续修改',
+            )
+            throw error
+          }
+          atomicShots = bestReviewShots
+          currentReviewShots = bestReviewShots
+          currentReviewIssues = bestReviewIssues
+          reviewStage = 'verified'
+          finalReviewWarnings = nonBlockingStoryboardReviewWarnings(bestReviewIssues)
+          await saveEpisodeReviewState(
+            'verifying',
+            `已完成 ${reviewRound} 轮有效返工；后续修改线路暂时不可用，已保存问题最少的版本，剩余 ${bestReviewIssues.length} 项作为人工修改建议，不阻断下一步`,
+          )
+          break
+        }
+        const repairedShots = normalizeFinalReviewShots(
+          applyStoryboardFinalReviewPatch(currentReviewShots, patch),
+        )
+        const changedShots = storyboardShotChangeCount(currentReviewShots, repairedShots)
+        if (changedShots === 0) {
+          noChangeAttempts++
+          await saveEpisodeReviewState(
+            'repairing',
+            !allowResidualFinalize
+              ? '当前文字线路返回空补丁或修改后内容没有变化，已保存检查点并切换备用线路'
+              : undefined,
+          )
+          if (!allowResidualFinalize) {
+            noChangeAttempts = 0
+            reviewStage = 'verified'
+            await saveEpisodeReviewState('repairing')
+            throw new Error('STORYBOARD_REPAIR_EMPTY_PATCH: 当前文字线路没有产生有效修改')
+          }
+          continue
+        }
+        currentReviewShots = repairedShots
+        reviewRound++
+        modifiedShots += changedShots
+        noChangeAttempts = 0
+        reviewStage = 'repaired'
+        currentReviewIssues = localFinalReviewIssues(currentReviewShots)
+        await saveEpisodeReviewState('verifying')
+      }
+
+      atomicShots = normalizeFinalReviewShots(atomicShots)
+      let videoReadyShots = packStoryboardVideoClips(atomicShots)
+      const deterministicallyStitchedShots = stitchStoryboardContinuity(videoReadyShots)
+      const originalPackedContinuityIssues = storyboardContinuityIssues(videoReadyShots)
+      const stitchedPackedContinuityIssues = storyboardContinuityIssues(deterministicallyStitchedShots)
+      if (stitchedPackedContinuityIssues.length <= originalPackedContinuityIssues.length) {
+        videoReadyShots = deterministicallyStitchedShots
+      }
+      const packedContinuityIssues = storyboardContinuityIssues(videoReadyShots)
+      if (packedContinuityIssues.length > 0) {
+        finalReviewWarnings = dedupeStoryboardFinalReviewIssues([
+          ...finalReviewWarnings,
+          ...nonBlockingStoryboardReviewWarnings(packedContinuityIssues.flatMap((issue) => (
+            issue.reasons.map((reason) => ({
+              severity: 'fatal' as const,
+              category: 'continuity' as const,
+              shotNumbers: [issue.index + 1],
+              scriptEvidence: '以锁定剧本和相邻镜头状态为准',
+              problem: `分镜 ${issue.index + 1}《${issue.title}》：${reason}`,
+              repairInstruction: reason,
+            }))
+          ))),
+        ])
+      }
 
       await persistStoryboardState('saving')
-      const items = materializeStoryboards({
-        shots: durationFittedShots,
+      const materializedItems = materializeStoryboards({
+        shots: videoReadyShots,
         visualStyle: projectStyle.visualStyle,
         customStylePrompt: projectStyle.customStylePrompt,
       })
-      const createdIds = await prisma.$transaction(async (tx) => {
-        await tx.storyboard.deleteMany({
-          where: { projectId: task.projectId, episodeId: episode.id, generatedByAI: true },
+      if (materializedItems.length === 0) {
+        throw new Error(`STORYBOARD_OUTPUT_EMPTY: 第 ${episode.episodeNumber} 集没有可保存的分镜内容`)
+      }
+      const finalDialogueDocuments: FinalStoryboardDialogueDocument[] = materializedItems.map((item, index) => ({
+        id: `generated-${index + 1}`,
+        number: index + 1,
+        title: item.title,
+        videoPrompt: item.videoPrompt,
+      }))
+      const finalDialogueRepair = repairExactFinalStoryboardDialogueDuplicates(
+        finalDialogueDocuments,
+        episode.content,
+      )
+      if (finalDialogueRepair.issues.length > 0) {
+        throw new Error(
+          `STORYBOARD_FINAL_DIALOGUE_INVALID: 最终可生成提示词仍有重复台词，已阻止覆盖正式分镜。${finalDialogueRepair.issues.slice(0, 6).map((issue) => issue.message).join('；')}`,
+        )
+      }
+      const repairedPromptById = new Map(finalDialogueRepair.documents.map((item) => [item.id, item.videoPrompt]))
+      const items = materializedItems.map((item, index) => ({
+        ...item,
+        videoPrompt: repairedPromptById.get(`generated-${index + 1}`) || item.videoPrompt,
+      }))
+      const timelineDetailIssues = items.flatMap((item, index) => (
+        storyboardTimelineDetailIssues(item.detailedTimeline).map((issue) => ({
+          storyboardNumber: index + 1,
+          ...issue,
+        }))
+      ))
+      if (timelineDetailIssues.length > 0) {
+        const detailWarnings = timelineDetailIssues.slice(0, 12).map((issue) => {
+          const details = [
+            issue.missing.length > 0 ? `缺少${issue.missing.join('、')}` : '',
+            issue.insufficient.length > 0 ? `${issue.insufficient.join('、')}过短` : '',
+          ].filter(Boolean).join('；')
+          const problem = `分镜${issue.storyboardNumber} ${issue.range}：${details}`
+          return {
+            severity: 'warning' as const,
+            category: 'directing' as const,
+            shotNumbers: [issue.storyboardNumber],
+            scriptEvidence: '以锁定剧本中的动作、人物关系和情绪触发为准',
+            problem,
+            repairInstruction: `补充本段独有的动作起点、移动路径、接触或停点、可见表演变化和结束状态；不得重复其他时间段内容。`,
+          }
         })
+        finalReviewWarnings = dedupeStoryboardFinalReviewIssues([
+          ...finalReviewWarnings,
+          ...detailWarnings,
+        ])
+      }
+      const structuredContinuityIssues = items.flatMap((item, index) => (
+        index === 0
+          ? []
+          : storyboardContinuityStateIssues(
+              items[index - 1].continuityOut,
+              item.continuityIn,
+              item.continuityOut,
+            )
+              .map((issue) => `分镜${index + 1}：${issue}`)
+      ))
+      if (structuredContinuityIssues.length > 0) {
+        finalReviewWarnings = dedupeStoryboardFinalReviewIssues([
+          ...finalReviewWarnings,
+          ...nonBlockingStoryboardReviewWarnings(structuredContinuityIssues.map((problem) => ({
+            severity: 'fatal' as const,
+            category: 'continuity' as const,
+            shotNumbers: [],
+            scriptEvidence: '以锁定剧本和相邻镜头状态为准',
+            problem,
+            repairInstruction: problem,
+          }))),
+        ])
+      }
+      const createdIds = await prisma.$transaction(async (tx) => {
+        const previousStoryboards = await tx.storyboard.findMany({
+          where: { projectId: task.projectId, episodeId: episode.id, generatedByAI: true },
+          include: {
+            videos: true,
+          },
+          orderBy: { episodeSceneNumber: 'asc' },
+        })
+        const previousIndexById = new Map(previousStoryboards.map((storyboard, index) => [storyboard.id, index]))
+        for (const previous of previousStoryboards) {
+          await createStoryboardRevision(tx, previous, {
+            source: 'before_ai_regeneration',
+            reason: `第 ${episode.episodeNumber} 集 AI 分镜重新生成前留存`,
+            sourceTaskId: task.id,
+            createdById: task.createdById,
+            validationReport: { finalDialogueIssues: [], preservedBeforeReplacement: true },
+          })
+        }
+        for (let index = 0; index < previousStoryboards.length; index++) {
+          await tx.storyboard.update({
+            where: { id: previousStoryboards[index].id },
+            data: {
+              sceneNumber: -1_000_000_000 + episode.episodeNumber * 1_000 + index,
+              selectedVideoId: null,
+            },
+          })
+        }
+
         const ids: string[] = []
         for (let index = 0; index < items.length; index++) {
           const item = items[index]
@@ -3286,13 +6038,66 @@ async function processStoryboardGeneration(task: {
               sceneNumber: 1_000_000 + episode.episodeNumber * 100 + index + 1,
               notes: item.notes || null,
               imagePrompt: item.imagePrompt || null,
+              directorPrompt: item.directorPrompt,
               videoPrompt: item.videoPrompt,
               duration: item.duration,
               aspectRatio: item.aspectRatio,
               generateAudio: item.generateAudio,
+              continuityIn: item.continuityIn,
+              continuityOut: item.continuityOut,
             },
           })
           ids.push(created.id)
+          await createStoryboardRevision(tx, created, {
+            source: 'ai_generated_baseline',
+            reason: `第 ${episode.episodeNumber} 集 AI 分镜通过最终提示词校验`,
+            sourceTaskId: task.id,
+            createdById: task.createdById,
+            validationReport: {
+              finalDialogueIssues: [],
+              autoRepairedExactDuplicateDocumentIds: finalDialogueRepair.changedDocumentIds,
+            },
+          })
+        }
+
+        for (let previousIndex = 0; previousIndex < previousStoryboards.length; previousIndex++) {
+          const previous = previousStoryboards[previousIndex]
+          const replacementId = ids[Math.min(previousIndex, ids.length - 1)]
+          if (!replacementId) continue
+          for (const video of previous.videos) {
+            const mappedSourceIds = [...new Set(video.sourceStoryboardIds.flatMap((sourceId) => {
+              const sourceIndex = previousIndexById.get(sourceId)
+              const replacementSourceId = sourceIndex === undefined
+                ? replacementId
+                : ids[Math.min(sourceIndex, ids.length - 1)]
+              return replacementSourceId ? [replacementSourceId] : []
+            }))]
+            await tx.storyboardVideo.update({
+              where: { id: video.id },
+              data: {
+                storyboardId: replacementId,
+                sourceStoryboardIds: mappedSourceIds.length > 0 ? mappedSourceIds : [replacementId],
+              },
+            })
+          }
+          if (previous.selectedVideoId && previous.videos.some((video) => video.id === previous.selectedVideoId)) {
+            const replacement = await tx.storyboard.findUnique({
+              where: { id: replacementId },
+              select: { selectedVideoId: true },
+            })
+            if (!replacement?.selectedVideoId) {
+              await tx.storyboard.update({
+                where: { id: replacementId },
+                data: { selectedVideoId: previous.selectedVideoId },
+              })
+            }
+          }
+        }
+
+        if (previousStoryboards.length > 0) {
+          await tx.storyboard.deleteMany({
+            where: { id: { in: previousStoryboards.map((storyboard) => storyboard.id) } },
+          })
         }
         return ids
       }, { timeout: 30_000 })
@@ -3301,13 +6106,19 @@ async function processStoryboardGeneration(task: {
       }
       completedEpisodeIds.add(episode.id)
       checkpoint.segments = checkpoint.segments.filter((segment) => segment.episodeId !== episode.id)
+      checkpoint.episodeReviews = checkpoint.episodeReviews.filter((review) => review.episodeId !== episode.id)
       activeEpisodeNumbers.delete(episode.episodeNumber)
       activeRoutes.delete(episode.episodeNumber)
-      await persistStoryboardState('generating')
+      await persistStoryboardState('generating', finalReviewWarnings.length > 0
+        ? { warning: `第 ${episode.episodeNumber} 集已返工并保存；仍有 ${finalReviewWarnings.length} 项待人工确认，可继续下一步` }
+        : undefined)
       return {
         episodeId: episode.id,
+        episodeNumber: episode.episodeNumber,
         relatedAssetCount: relatedAssets.length,
         storyboardIds: createdIds,
+        reviewWarnings: finalReviewWarnings,
+        modifiedShots,
       }
     } catch (error) {
       throw error
@@ -3315,6 +6126,11 @@ async function processStoryboardGeneration(task: {
   }
 
   let relatedAssetCount = 0
+  let totalModifiedShots = 0
+  const reviewWarnings: Array<{
+    episodeNumber: number
+    issues: StoryboardFinalReviewIssue[]
+  }> = []
   const finalFailures: Array<{ episode: (typeof episodes)[number]; error: unknown }> = []
 
   async function generateEpisodeAcrossKeyPool(episode: (typeof episodes)[number]) {
@@ -3341,7 +6157,12 @@ async function processStoryboardGeneration(task: {
         ...(previousFailureReason ? { reason: previousFailureReason } : {}),
       })
       try {
-        return await generateEpisodeStoryboards(episode, pass > 0, route)
+        return await generateEpisodeStoryboards(
+          episode,
+          pass > 0,
+          route,
+          pass === routes.length - 1,
+        )
       } catch (error) {
         lastError = error
         previousFailureReason = storyboardRouteFailureReason(error)
@@ -3374,6 +6195,13 @@ async function processStoryboardGeneration(task: {
         finalFailures.push({ episode: result.episode, error: result.error })
       } else {
         relatedAssetCount += result.result.relatedAssetCount
+        totalModifiedShots += result.result.modifiedShots
+        if (result.result.reviewWarnings.length > 0) {
+          reviewWarnings.push({
+            episodeNumber: result.result.episodeNumber,
+            issues: result.result.reviewWarnings,
+          })
+        }
       }
     }
   }
@@ -3388,13 +6216,49 @@ async function processStoryboardGeneration(task: {
 
   await persistStoryboardState('finalizing')
   const storyboardIds = await renumberGeneratedStoryboards(task.projectId)
+  const warningCount = reviewWarnings.reduce((total, item) => total + item.issues.length, 0)
+  const fatalIssueCount = reviewWarnings.reduce((total, item) => (
+    total + item.issues.filter((issue) => issue.severity === 'fatal').length
+  ), 0)
+  const warningSuggestions = [...new Set(reviewWarnings.flatMap((item) => (
+    item.issues.map((issue) => {
+      const shotLabel = issue.shotNumbers.length > 0
+        ? `分镜 ${issue.shotNumbers.slice(0, 4).join('、')}`
+        : '整集'
+      return `第 ${item.episodeNumber} 集 ${shotLabel}：${issue.repairInstruction || issue.problem}`
+    })
+  )))].slice(0, 6)
   return {
     storyboardCount: storyboardIds.length,
     episodeCount: episodes.length,
     storyboardIds,
     parallelism,
     relatedAssetCount,
-    pipelineVersion: 'atomic-storyboards-90s-v6',
+    modifiedShots: totalModifiedShots,
+    reviewWarnings,
+    storyboardProgress: {
+      phase: 'finalizing',
+      completedEpisodes: episodes.length,
+      totalEpisodes: episodes.length,
+      completedSegments: totalSegments,
+      totalSegments,
+      activeEpisodeNumbers: [],
+      activeRoutes: [],
+      parallelism,
+      segmentParallelism,
+      modifiedShots: totalModifiedShots,
+      remainingIssues: warningCount,
+      fatalIssues: fatalIssueCount,
+      ...(warningCount > 0
+        ? {
+            warning: fatalIssueCount > 0
+              ? `分镜已保存最新返工稿；仍有 ${fatalIssueCount} 项剧情或执行问题未完成自动修复，另有 ${warningCount - fatalIssueCount} 项导演建议，可继续手动调整`
+              : `分镜已自动返工并保存最佳版本；仍有 ${warningCount} 项导演建议，可继续下一步`,
+            suggestions: warningSuggestions,
+          }
+        : {}),
+    },
+    pipelineVersion: 'cine-lock-emotional-storyboards-v12-scene-heading-repair',
   }
 }
 

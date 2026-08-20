@@ -22,3 +22,9 @@ dist
 __pycache__/
 *.pyc
 public/jennifer-spritesheet.webp
+.diagnostics/
+.impeccable/
+.tmp-*/
+.tmp-*
+skills/
+todo.md

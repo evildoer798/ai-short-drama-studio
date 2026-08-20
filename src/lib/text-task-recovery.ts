@@ -12,6 +12,7 @@ const TEXT_TASK_TYPES = new Set<GenerationTaskType>([
 const ACTIVE_QUEUE_STATES = new Set(['active', 'waiting', 'delayed', 'prioritized', 'waiting-children'])
 export const TEXT_TASK_STALE_AFTER_MS = 2 * 60_000
 export const TEXT_TASK_AUTO_RECOVERY_LIMIT = 5
+const DETERMINISTIC_TEXT_API_FAILURE = /TEXT_API_FAILED:\s*(400|401|402|403|404|405|422)\b/i
 
 type RecoveryPayload = Record<string, unknown> & {
   textAutoRecovery?: {
@@ -33,9 +34,13 @@ function recoveryAttempts(payload: unknown) {
     : 0
 }
 
+export function isDeterministicTextApiFailure(error: string | null) {
+  return Boolean(error && DETERMINISTIC_TEXT_API_FAILURE.test(error))
+}
+
 export function isRecoverableTextTaskFailure(error: string | null) {
   if (!error) return true
-  if (/TEXT_API_FAILED:\s*(401|402|403)|PROJECT_NOT_FOUND|项目不存在|SCENE_CONSISTENCY_MISSING/i.test(error)) {
+  if (isDeterministicTextApiFailure(error) || /PROJECT_NOT_FOUND|项目不存在|SCENE_CONSISTENCY_MISSING/i.test(error)) {
     return false
   }
   return /TEXT_|SCENE_CONSISTENCY_MISMATCH|timeout|timed?\s*out|aborted|fetch|socket|ECONN|ENOTFOUND|429|502|503|504|模型|文本 API|JSON|队列|网关|内容审核|moderation/i.test(error)

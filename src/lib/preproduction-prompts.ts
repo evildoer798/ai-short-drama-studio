@@ -4,7 +4,12 @@ import {
   SCRIPT_ENDING_HOOK,
   SCRIPT_MAIN_TIMELINE_START,
 } from './script-quality'
-import { buildStyleLock, getVisualStylePreset } from './visual-styles'
+import {
+  buildCharacterIdentityAnchor,
+  buildConciseImageStyle,
+  buildStyleLock,
+  getVisualStylePreset,
+} from './visual-styles'
 
 export type NovelChunk = {
   index: number
@@ -97,17 +102,76 @@ export function extractSourceDialogues(content: string): SourceDialogue[] {
 }
 
 export function dialogueMissing(content: string, dialogue: string) {
-  const normalize = (value: string) => value.replace(/[\s“”「」『』'"，。！？：；、,.!?:;]/g, '')
+  const normalize = (value: string) => {
+    const normalized = value
+      .replace(/[\s“”「」『』'"，。！？：；、,.!?:~～…@￥&]/gu, '')
+      .replace(/^嗯+/gu, '')
+      .replace(/没没(?:啊)?/gu, '没有')
+    return normalized.length > 2 ? normalized.replace(/[啊呀呢吧]+$/gu, '') : normalized
+  }
   const source = normalize(dialogue)
-  return source.length >= 2 && !normalize(content).includes(source)
+  if (source.length < 2) return false
+  if (normalize(content).includes(source)) return false
+
+  const lcsRatio = (candidate: string) => {
+    let previous = new Uint16Array(candidate.length + 1)
+    for (let sourceIndex = 0; sourceIndex < source.length; sourceIndex++) {
+      const current = new Uint16Array(candidate.length + 1)
+      for (let candidateIndex = 0; candidateIndex < candidate.length; candidateIndex++) {
+        current[candidateIndex + 1] = source[sourceIndex] === candidate[candidateIndex]
+          ? previous[candidateIndex] + 1
+          : Math.max(previous[candidateIndex + 1], current[candidateIndex])
+      }
+      previous = current
+    }
+    return previous[candidate.length] / source.length
+  }
+  const bigramCoverage = (candidate: string) => {
+    if (source.length < 2) return candidate.includes(source) ? 1 : 0
+    const bigrams = new Set(Array.from(
+      { length: source.length - 1 },
+      (_value, index) => source.slice(index, index + 2),
+    ))
+    let matched = 0
+    for (const bigram of bigrams) if (candidate.includes(bigram)) matched++
+    return matched / Math.max(1, bigrams.size)
+  }
+  const numericFacts = dialogue.match(/(?:\d+(?:\.\d+)?|[一二三四五六七八九十百千万]+)(?:万|岁|年|块|元)/gu) || []
+  const scriptedDialogues = extractScriptDialogueLines(content).map((item) => item.text)
+  const quotedDialogues = [...content.matchAll(/[“「『]([^”」』]{1,800})[”」』]/gu)]
+    .map((match) => match[1].trim())
+  const baseCandidates = [...scriptedDialogues, ...quotedDialogues]
+  if (baseCandidates.length === 0) {
+    baseCandidates.push(...content
+      .split(/\r?\n|(?<=[。！？!?])/u)
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0 && value.length <= 1_000))
+  }
+  const candidates = baseCandidates.flatMap((value, index) => [
+    value,
+    baseCandidates.slice(index, Math.min(baseCandidates.length, index + 3)).join(''),
+  ])
+
+  const meaningCovered = candidates.some((value) => {
+    const candidate = normalize(value)
+    if (!candidate || numericFacts.some((fact) => !value.includes(fact))) return false
+    if (candidate.includes(source)) return true
+    const retainedLength = Math.min(1, candidate.length / source.length)
+    const lcs = lcsRatio(candidate)
+    const bigrams = bigramCoverage(candidate)
+    if (source.length <= 8) return lcs >= 0.75 && retainedLength >= 0.6
+    if (source.length <= 20) return lcs >= 0.48 && bigrams >= 0.3 && retainedLength >= 0.4
+    return lcs >= 0.45 && bigrams >= 0.28 && retainedLength >= 0.35
+  })
+  return !meaningCovered
 }
 
 export function extractScriptDialogueLines(content: string) {
   return content.split(/\r?\n/).flatMap((line) => {
-    const match = line.trim().match(/^([^：:\n【]{1,32})(【OS】)?[：:]\s*(.{1,800})$/)
+    const match = line.trim().match(/^([\p{L}\p{N}·•.'’ _-]{1,32})(?:[（(][^）)\n]{1,40}[）)])?(【OS】)?[：:]\s*(.{1,800})$/u)
     if (!match) return []
     const speaker = match[1].trim()
-    if (/^(场次|时间|地点|内景|外景|画面|动作|场景|备注|音效)$/.test(speaker)) return []
+    if (/^(场次|场号|时间|地点|内景|外景|画面|动作|场景|备注|音效|出场人物|登场人物|人物|角色)$/.test(speaker)) return []
     return [{ speaker, os: Boolean(match[2]), text: match[3].trim() }]
   })
 }
@@ -330,7 +394,7 @@ export function buildEpisodeDraftPrompt(input: {
 
 写作格式：
 1. 采用“场次 + 时间/内外景 + 地点 + 动作 + 对白”的剧本结构，镜头参数留到后续分镜阶段处理。
-2. 按剧情顺序提炼本章的关键事件、人物关系和信息揭示；优先沿用推动剧情的原文对白，并用必要动作连接。
+2. 按剧情顺序提炼本章的关键事件、人物关系和信息揭示；原文对白可以改写为更自然、精炼、适合演员表演的剧本对白，允许删除语气词、口头重复和不影响剧情的修饰，但必须保留说话人、先后顺序、关键事实、情绪意图和剧情作用，并用必要动作连接。
 3. 将叙述优先改写为可见动作、表情、视线、环境反应或人物现场对白。原则上不写旁白；只有人物无法说出口、画面无法表达且删去会导致关键信息断裂时，才允许使用一句简短【OS】，不得用【OS】重复解释画面已经表现的内容。
 4. 清楚标记人物出场、转场和时间变化；人物使用全名。每个物理拍摄空间建立一个至少四个字的全剧唯一标准场景名，场次标题和正文每次出现都逐字复用该名称；同一空间不得换简称或近义名，不同空间不得共用名称。场景结构、固定陈设、材质和基础光线沿用一致描述。
 5. 对白格式为“人物全名：对白”；内心独白格式为“人物全名【OS】：内容”。
@@ -400,7 +464,7 @@ ${input.issues.map((issue, index) => `${index + 1}. ${issue}`).join('\n')}
 2. 上一集材料只用于确认开场状态；从上一集最后一个已完成动作之后开始，禁止复制、概述、闪回或复演上一集的动作、对白和信息揭示。
 3. 下一集材料是禁区，只用于识别停止位置；不得提前演出其动作、对白、揭示或结果。
 4. 正文硬性控制在 ${minimumChars} 至 ${maximumChars} 个汉字、2 至 4 个场次，保持“场次 + 时间/内外景 + 标准地点 + 动作 + 对白”的剧本结构。先在内部完成字数压缩再输出，content 超过 ${maximumChars} 个汉字即视为修订失败；禁止输出字数统计过程。
-5. 所有角色使用全剧标准姓名，叙述改为可见动作与现场对白，非必要不使用旁白或【OS】。
+5. 所有角色使用全剧标准姓名，叙述改为可见动作与现场对白，非必要不使用旁白或【OS】。小说转剧本允许口语化、合并同义句和精简过长对白，但不得改变关键事实、人物关系、事件顺序、说话人或情绪作用。
 6. 结尾必须单独写 ${SCRIPT_ENDING_HOOK}，用剧情中的危机、选择、新信息、关系变化或未完成动作结束；禁止“敬请期待”“下集预告”等说明性套话。
 7. ${input.episodeNumber === 1
     ? `标题后先写 ${SCRIPT_COLD_OPEN_START}，从候选中选一个后续高冲突瞬间，控制在 80 至 160 个汉字且不交代结果；紧接着写 ${SCRIPT_MAIN_TIMELINE_START} 回到原著开端，前 20 秒触发核心矛盾。`
@@ -460,7 +524,7 @@ export function buildDialogueRepairPrompt(input: {
   episodeContent: string
   missingDialogues: SourceDialogue[]
 }) {
-  return `请把对白清单中尚未出现在剧本里的句子，安排到对应人物、场次和动作语境中。沿用现有剧本的情节、场次和表达，并返回整合后的完整剧本。
+  return `请把对白清单中尚未被剧本覆盖的关键信息，安排到对应人物、场次和动作语境中。允许改写为更短、更自然的可表演对白，但必须保留说话人、关键事实、先后顺序、情绪意图和剧情作用。沿用现有剧本的情节与场次，并返回整合后的完整剧本。
 
 【待整合对白】
 ${input.missingDialogues.map((item) => `- ${item.text}\n  语境：${item.context}`).join('\n')}
@@ -500,11 +564,11 @@ ${input.content}
 请返回 JSON 对象：{"content":"修订后的完整剧本"}`
 }
 
-const CHARACTER_PROMPT_RULES = `人物设定图必须以白色背景身份卡呈现：上方为正面、侧面、背面三个全身核心视角，完整展示身形、固定服装和标志特征；左侧包含面部微距特写与毛发、皮肤、服饰的标准色值配色板；底部拆分配饰、关键道具和身份识别元素；右侧为全身比例参照、明确身高和头身比。三视图的脸型、年龄、发型、服装、体型必须完全一致。最高品质、细节丰富、可供后续视频稳定复用。`
+const CHARACTER_PROMPT_RULES = `白色背景人物设定板：上方为正面、侧面、背面三个全身视角；左侧为面部特写与毛发、皮肤、服装标准色值；底部展示关键配饰和身份部件；右侧标注身高与头身比。各视图的脸型、年龄、发型、体型和固定服装一致。为人物建立可跨镜头复现的面部身份锚点，至少明确脸型、眉眼、鼻唇结构和一项细微识别特征；同项目角色至少在其中三项形成可见差异。`
 
-const LOCATION_PROMPT_RULES = `场景必须绝对真空与匿名，画面和提示词中严禁出现人物、人影或角色姓名。名称至少四个字且具有唯一辨识度。提示词必须以“不能出现其他人, 无人, 纯场景,”开头，并完整包含环境类型、具体时刻与天气、空间氛围、前中后景主要特征、材质、光源方向、色彩影调、摄影机质感、焦段、光圈、景深、对焦位置、背景虚化与焦外质感；同时要求四宫格四视图：高角度航拍俯瞰、低角度仰视、侧面视角、反面视角。结尾包含 no humans, empty, landscape only。杜绝游戏 CG 感、塑料感、过度美化、错误透视、过曝和主体模糊。`
+const LOCATION_PROMPT_RULES = `电影级场景设定图：建筑与环境为画面主体，写清具体空间、年代美学、前中后景、材质纹理、时间天气、空气状态、光源方向、色彩影调和情绪反差；根据场景选择摄影机、焦段、光圈、景深、对焦点、背景虚化与焦外质感。四宫格呈现高角度航拍俯瞰、低角度仰视、侧面和背面视角。`
 
-const PROP_PROMPT_RULES = `道具设定必须精准遵循剧本用途与年代，独立展示完整造型、尺寸参照、正侧背与关键局部，细腻描述材质纹理、真实光泽、磨损、污渍、雕花或制造痕迹，配色明确，商业静物摄影质感，背景干净，无人物、无手持、无粗糙瑕疵，适合后续视频稳定复用。`
+const PROP_PROMPT_RULES = `干净背景道具设定板：遵循剧本用途与年代，展示完整造型、尺寸参照、正侧背视图和关键局部，写清材质纹理、真实光泽、磨损或制造痕迹与固定配色。`
 
 export function buildAssetExtractionPrompt(input: {
   script: string
@@ -520,10 +584,10 @@ export function buildAssetExtractionPrompt(input: {
       .join('\n')
     : '暂无，按本集剧本建立稳定名称。'
   const characterRules = input.compactOutput
-    ? '记录年龄、性别、体型、面部、发型、固定服装、身份气质与关键配饰；不要重复固定排版规则。'
+    ? '记录年龄、性别、体型、面部、发型、固定服装、身份气质与关键配饰；为每名角色提炼至少三项区别于其他角色的面部身份锚点；固定排版由系统补充。'
     : `合并同一人物的全部信息，严格依据全剧年龄、外观、固定服装、身份、性格和人物弧光。${CHARACTER_PROMPT_RULES}`
   const locationRules = input.compactOutput
-    ? '记录环境类型、时间天气、空间氛围、前中后景、材质、光源与色调；不得出现人物或角色姓名。'
+    ? '记录环境类型、时间天气、空间氛围、前中后景、材质、光源与色调；只写建筑和环境事实。'
     : `同一地点只建立一项稳定资产，不因不同镜头重复。${LOCATION_PROMPT_RULES}`
   const propRules = input.compactOutput
     ? '只记录有剧情或连续性作用的器物，写清用途、年代、尺寸、材质、配色、磨损与身份标识。'
@@ -540,7 +604,7 @@ ${input.compactOutput ? '此步骤只提取事实，最终统一画风由系统�
 - 不臆造剧本未提供的身份事实；确需补全的可视细节要与年代、题材和剧情一致。
 - tags 使用短词，最多 8 个。description 用于制作人员快速确认，prompt 必须是完整可复制的中文生图提示词。
 - 只提取本集实际出现或明确被使用的资产；若与下方已有资产是同一对象，必须原样复用已有名称，不得用昵称、称谓或英文名另建重复资产。
-${input.compactOutput ? '- 快速直接输出，不写分析过程。description 控制在 40-120 个中文字；每项 prompt 只写该资产独有的可视事实，控制在 40-120 个中文字；tags 最多 6 个。固定画风、版式、镜头和反向约束由系统自动补全。' : ''}
+${input.compactOutput ? '- 快速直接输出，不写分析过程。description 控制在 40-120 个中文字；每项 prompt 只写该资产独有的可视事实，控制在 40-120 个中文字；tags 最多 6 个。固定画风、版式和镜头规则由系统自动补全。' : ''}
 
 已有或前序已识别资产：
 ${knownAssets}
@@ -559,7 +623,7 @@ const ASSET_TYPE_LABELS: Record<AssetType, string> = {
 }
 
 const ASSET_INVENTORY_RULES: Record<AssetType, string> = {
-  [AssetType.character]: '只提取本集实际出现、说话或明确参与动作的角色。记录姓名、年龄、性别、身份、体型、面部、发型、固定服装、气质和关键配饰；同一角色不得因昵称、称谓或英文名重复创建。不同角色即使职业、族裔、服装或道具相同也不得合并；未命名角色必须使用“地点或剧情身份 + 年龄层 + 职业”的稳定称谓，与已有具名角色明确隔离。',
+  [AssetType.character]: '只提取本集实际出现、说话或明确参与动作的角色。记录姓名、年龄、性别、身份、体型、面部、发型、固定服装、气质和关键配饰；每名角色至少记录三项可稳定复现的面部身份锚点，并与已有角色在脸型、眉眼、鼻唇或细微识别特征上形成可见差异。同一角色不得因昵称、称谓或英文名重复创建。不同角色即使职业、族裔、服装或道具相同也不得合并；未命名角色必须使用“地点或剧情身份 + 年龄层 + 职业”的稳定称谓，与已有具名角色明确隔离。',
   [AssetType.location]: '只提取本集实际发生剧情的拍摄空间。名称必须逐字复用已锁定剧本场次中的全剧唯一标准场景名，至少四个字并具有辨识度；同一物理空间不得另起简称或近义名，不同空间不得合并。描述环境类型、具体时段、天气、空间氛围、结构、前中后景、固定陈设、主要材质、光源和色调，严禁写入人物姓名、人影、人物动作或仅在单镜变化的临时状态。',
   [AssetType.prop]: '只提取预计会跨集反复出现、需要保持固定外观的核心道具。普通杯子、餐具、手机、纸张、文具、食品、零钱、包装和一次性背景小物件不建项；记录用途、年代、尺寸、材质、颜色、磨损和识别标志。',
 }
@@ -587,6 +651,7 @@ export function buildAssetInventoryPrompt(input: {
 - 严格依据剧本，不补造未出现的人物、地点、器物或身份事实。
 - 分镜已经先于资产规划完成；分镜锚点与剧本一致时，必须逐字复用其中的角色名和标准场景名，不得另起近义名称。场景资产应吸收分镜“环境锁定”中的固定空间事实，但必须删除人物、动作和临时物品状态。
 - 与已有资产属于同一对象时，必须逐字复用已有名称；不确定是否同一对象时，以剧本证据为准，不要强行合并。
+- assets 数组中的每一项都必须明确保留 type:"${input.type}"，即使本次只提取一种类型也不得省略或改成其他类型。
 - description 只写可用于后续视觉设计的事实，控制在 40-160 个中文字；tags 最多 6 个短词。
 - 没有该类型资产时返回空数组。不要解释、不要分析过程、不要 Markdown。
 
@@ -631,6 +696,7 @@ export function buildAssetCurationPrompt(input: {
 - ${ASSET_CURATION_RULES[input.type]}
 - 不得新增候选中不存在的资产，不得补造剧情事实。
 - 同一对象的昵称、称谓、英文名或近义名称只保留一项；与已有资产相同的对象必须逐字复用已有名称。
+- assets 数组中的每一项都必须明确保留 type:"${input.type}"，不得省略或改成其他类型。
 - description 合并候选中已有的可见事实，控制在 40-180 个中文字；tags 最多 8 个。
 - 没有制片价值的候选直接删除。不要输出删除理由、分析过程或 Markdown。
 
@@ -684,6 +750,11 @@ export function buildSingleAssetPrompt(input: {
     : input.asset.type === AssetType.location
       ? LOCATION_PROMPT_RULES
       : PROP_PROMPT_RULES
+  const promptLength = input.asset.type === AssetType.location
+    ? '280-620 个中文字；正文为一段完整场景描述，末尾用一行“镜头参数：摄影机、焦段、光圈、景深、对焦点、背景虚化、焦外质感”收束'
+    : input.asset.type === AssetType.character
+      ? '220-520 个中文字'
+      : '160-380 个中文字'
 
   return `你是电影级${label}视觉设定导演。请只为下面这一项资产生成可直接用于生图模型的完整提示词。
 
@@ -701,15 +772,61 @@ ${productionRules}
 
 要求：
 - 只扩写可见、可拍摄、可执行的视觉细节，不改变名称，不杜撰身份、剧情、时代或人物关系。
-- description 写成 60-260 个中文字的制作摘要；tags 最多 10 个短词。
-- prompt 必须完整包含统一画风、主体细节、构图、材质、光线、色彩、镜头参数和该类型的制作规则，可独立复制生图。
+- description 写成 60-180 个中文字的制作摘要；tags 最多 10 个短词。
+- prompt 控制在 ${promptLength}，完整包含统一画风、主体细节、构图、材质、光线、色彩、镜头参数和该类型制作规则，可独立复制生图。
+- 不重复题目、规则说明或同义风格词；反向约束不单独成段，画质要求统一使用正向描述。
 - 只输出严格 JSON，不要解释、不要推理过程、不要 Markdown。
 
 输出格式：
 {"description":"完整制作摘要","tags":["标签"],"prompt":"完整中文生图提示词"}`
 }
 
-export const STORYBOARD_SYSTEM_PROMPT = '你是一位深耕电影三十余年的世界级导演和分镜师。你把已锁定剧本转换为可拍摄、可直接提交视频模型的电影级分镜，保留人物现场对白，坚持用画面讲故事，默认不使用旁白、画外音或内心独白；只有删除后会造成关键事实无法理解且该事实无法视觉化时，才保留原剧本中的最短一句，不输出解释。'
+export const STORYBOARD_DIRECTOR_SKILL_RULES = `【CINE-LOCK 导演情绪设计】
+- 开始拆镜前先在内部确定每场的观众情绪、情绪视点角色、触发事件和场尾变化，再按剧情顺序拆镜；漂亮画面不得取代剧本的情感因果。
+- 每镜 i 字段必须简写为“意图：揭示/羞辱/反应/升级/反转/决断/转场/钩子之一；情绪视点：人物标准全名或场景；触发：本镜唯一触发；情绪落点：本镜结束时观众应读到的可见变化”。
+- 情绪视点角色必须得到画面优先级。决定性台词或动作发生时，不得连续用背影、遮挡或远景隐藏该角色；触发发生后的同镜或紧接下一镜，必须给正脸或清晰侧脸至少 1 秒可读反应，写明视线、眉眼、嘴角、呼吸或身体停顿中的具体变化。
+- 说话者负责信息，倾听者负责情感。同一原子分镜可按剧本顺序包含多位现场对白说话人；任一时刻只让当前说话者同步口型，其他人物做倾听反应，并保留受影响角色的情绪落点。
+- 景别随情绪强度推进：空间建立可用全景，关系冲突用双人中景或过肩，关键触发切中近景，情绪落点优先近景或特写。除有明确导演理由外，同一场景不得连续三个子镜头使用相同景别、角度和运动。
+- 每镜只承担一个叙事意图、一个可见主动作和一个明确情绪落点；尾帧情绪必须交给下一镜继续，不得无原因重置。导演设计只能强化原剧本，不得改变事件、人物、对白含义或因果。`
+
+export const STORYBOARD_SYSTEM_PROMPT = `你是一位深耕电影30余年的世界顶级导演，请将我接下来提供的【小说/书籍内容】改写成适合即梦生成动漫视频的剧本文案，要求如下：
+
+1. 分镜结构
+- 第一原则：不允许对剧本内容进行任何删改，必须保留人物之间的所有对话，充分保证剧情连贯性。
+- 按剧本情节顺序编排，每一分镜对应关键剧情节点并标注清晰序号；每个分镜明确“时间（白天/夜晚/深夜）+ 场景地点 + 镜头类型（全景/近景/特写/中景）”。
+- 禁止在画面叙述中使用“我、他、她、对方”等代称，必须精确写出人物全名；原对白中的人称保持原样。
+
+2. 画面内容
+- 精准呈现人物动作、表情神态和环境细节，还原回忆与现实场景的切换。动作必须合理、连续、可见，禁止“踏风而来”等不合理动作词。
+- 详细分析核心场景并给出稳定、可复用的场景描述。同一标准场景在前后镜头中的空间结构、固定陈设、材质、光线和色彩不得改变。
+
+3. 输出格式
+- 内容字段只写纯中文，不使用表格。每个原子分镜约对应70个中文字的源剧本，必须在完整句子和完整动作处断镜。
+- 同一原子分镜可以按剧本顺序包含多名角色的连续对话；任一时刻只让当前说话者开口，其他人物只做与剧情一致的倾听、视线和表情反应。
+
+4. 氛围适配
+- 贴合剧情氛围，通过风声、尘土、月色、药材香气等环境细节强化情绪张力；镜头转换流畅自然，符合动漫视频的视觉呈现逻辑。
+
+5. 音画配合
+- 内心独白标注【OS】；画外音默认采用年轻女声，音调中等或偏低，音色清澈柔和、冷静偏软，发音干净利落，无沙哑、无鼻音，吐字清晰，气息平稳，并根据旁白内容调整气音和语速。
+- 角色台词按性别和年龄锁定音色：男主为青年男声，音调偏低、音色冷硬偏沉、字正腔圆；长辈为中年男声，音调偏低、音色沉稳偏硬、带轻微胸腔共鸣；女性为青年女声，音调中等、音色温润偏软。
+- 除小说明确设定的台词外，画面角色全程不说话；台词和内心独白必须与画面节奏严格对应，不得出现口型与台词脱节。为每个实际说话角色生成稳定、可跨镜复用的配音规范。
+
+6. AI电影级分镜提示词
+- 严格遵循无字幕、无背景音乐要求。
+- 光影风格：伦勃朗光为主，关键帧叠加逆光轮廓光；室内或森林场景加入丁达尔效应。
+- 运镜风格：大量手持跟拍镜头，保留轻微自然抖动和强烈电影纪实感。
+- 画面质感：电影级浅景深、8K超高清、HDR10+；动作关键处允许120fps慢动作捕捉。
+- 写实细节：人物自然眨眼、呼吸时胸腔起伏、发丝随动作或气流飘动、眼神自然流转、衣服褶皱随肢体变化，并遵循真实物理运动。
+- 禁用元素：无任何字幕、无任何背景音乐、无水印、无UI元素。
+
+7. 输出示例
+分镜1：
+景别机位运动：俯拍全景，大广角快速下压。
+画面内容：夜晚，古朴静谧的农家小院，院中摆放着一张灰白色粗糙石桌，桌上散落着几卷泛黄的医书，月光如霜洒在青砖地上。
+动作对白：秦绾绾趴在院中的石桌上熟睡，眉头微微蹙起，神色疲惫；裴九棠端着一碗汤，轻轻走到秦绾绾身边，眼神温柔，带着几分小心翼翼。男主采用青年男声，音调偏低，音色冷硬偏沉；女性采用青年女声，音调中等，音色温润偏软。
+
+系统内部以严格 JSON 传输上述纯中文分镜字段，不输出表格、Markdown、解释或推理过程。每3个连续原子分镜按原顺序合成为1条15秒视频提示词；每条视频提示词开头固定包含【风格基调】【本分镜人物】【场景】，随后输出【视频分镜】。人物与场景资产优先自动识别，也允许人工用“@资产名称”补充。`
 
 export const STORYBOARD_GLOBAL_RULES = `【所有分镜默认生效的电影级参数】
 - 光影：伦勃朗光为主，关键帧叠加逆光轮廓光；室内或森林场景按需要加入丁达尔效应。
@@ -721,11 +838,16 @@ export const STORYBOARD_GLOBAL_RULES = `【所有分镜默认生效的电影级�
 - 接触与遮挡：人物触碰人物、道具或家具前，先写清主动方、使用哪只手、接近路径和唯一接触点；接触后保持受力关系，完成后才松开。关键手部、脚部与道具尽量保持可见；被遮挡的肢体不得在遮挡后换手、增生、消失或改变姿态。
 - 镜头负荷：一个子镜头只使用一种主要摄影机运动。人物存在奔跑、跌倒、打斗、拥抱、递接物品等复杂动作时，优先中景、全身景别的固定机位或单向稳定跟拍，确保主动肢体、双脚和接触点不被裁出画面；禁止同时环绕、甩镜、急推拉或无依据变焦。
 - 连续性：下一镜首帧必须从上一镜尾帧的角色站位、身体朝向、手部状态、视线、服装、发型、道具归属、场景陈设和光线开始；只有动作顺序明确写出的项目才允许变化。
+- 不可逆状态：坠落、倒地、离场、死亡、物体脱手、门已关闭、画面切黑等完成后，后续镜头不得把人物或物体恢复到动作前状态；只有明确写出回忆、倒叙、时间倒回或重新起身等可见过程时才允许改变。每个不可逆动作只出现一次，并放在所有相关对白和反应之后。
 - 人物身份隔离：同职业、同族裔、同款服装或相似道具不代表同一人物；只有剧本明确说明为同一人时才允许复用姓名和人物资产。未命名人物须使用包含地点、年龄层或剧情身份的稳定称谓，禁止把甲角色的伤势、经历、车辆或随身物品转移给乙角色。
+- 人物数量与出镜：每个标准角色名只对应一名演员；一个独立分镜累计最多 4 名角色，每个时间段优先只保留 1-2 名核心人物，剧情确有必要时才允许 3-4 人。说话者、动作执行者、动作对象和承担情绪反应的人优先入镜；普通同学、路人、围观者、等待者和不参与本段剧情的人全部删除或保持画外。人物资产设定板中的正面、侧面、背面、全身和面部特写都是同一个人，不代表多名演员。每个时间段必须明确镜内角色、画外角色、人数和相对站位；仅被提及、被望向或在画外说话的角色不得自动入镜。禁止同一角色的分身、双胞胎、替身、镜像、倒影、海报或背景重复人像。
 - 视觉锁定：已有资产主图时，人物面容、年龄、身材和服装必须与主图一致；尚未规划资产时，严格沿用剧本已经明确的姓名、年龄、外形、服装和场景事实，后续资产规划必须反向复用本分镜标准名称。角色专属道具不得换手、转移到其他角色、漂浮、复制或无故消失；不得新增剧本之外的人物或物品。
 - 时空转换：现实、回忆和梦境必须通过明确的尾帧与镜间衔接顺序转换；前一时空完全退出后才能出现后一时空，禁止两个时空的人物或陈设同时存在，禁止闪白和从瞳孔内部穿越。
 - 15 秒成片：当提示词包含多个带时间段的子镜头时，严格按时间顺序依次表演和切换，不并行、不倒序；只有当前时间段指定的角色开口，其余角色只做符合剧情的反应。
-- 画外音控制：默认无旁白、无画外音、无内心独白。情绪、动作、环境、转场和画面已经能表达的信息一律不配画外音；不得新增原剧本没有的画外声音。
+- 对白时长：按自然表演速度为对白预留时间，中文约每秒 4 个汉字，英语约每秒 2.5 个单词，并为说话人切换、停顿和反应至少预留 0.5 秒；对白放不下时必须拆镜或重新分配秒数，禁止加速念词。同一句对白在同一 15 秒段内只能出现一次。
+- 声音一致：存在现场对白时写“无新增旁白、无后期配音感，保留演员现场对白”，不得同时写“无配音”“无对白”或“说话人无对白”；原剧本已有旁白、画外音和【OS】必须照常保留并与现场对白分轨呈现。完全无任何原文声音的镜头才允许写“不生成配音”。
+- 原子分镜：每个独立保存的分镜只能包含一个物理地点和一个连续机位，时长 4-6 秒，约对应 70 个中文字的源剧本。同一镜可按剧本顺序包含多位说话人，换人时明确当前口型与倾听反应；地点变化、现实与回忆切换、机位切换或第二个复杂身体动作必须另起分镜。不得用斜杠标题、蒙太奇、快切或“随后切到另一地点”把多个镜头伪装成一镜。
+- 画外音控制：完整保留原剧本明确存在的旁白、画外音和【OS】，并锁定声音规范；不得新增原剧本没有的画外声音。画面已经能表达的信息不额外重复配音。
 - 禁用：无任何字幕、无任何背景音乐、无水印、无 UI 元素。保留剧本明确要求的人声、环境音和必要音效。`
 
 export type ScriptSceneLocation = {
@@ -740,14 +862,27 @@ function normalizedScriptSceneName(value: string) {
 export function extractScriptSceneLocations(script: string): ScriptSceneLocation[] {
   const source = script.replace(/\r\n/g, '\n')
   const pipeHeadingPattern = /^(?:#{1,3}\s*)?(?:场次|场景)[^\n｜|]{0,24}[｜|]\s*([^｜|\n]+)[｜|]\s*([^｜|\n]+)[｜|]\s*([^\n]+)$/gmu
+  const compactPipeHeadingPattern = /^(?:#{1,3}\s*)?(?:场次|场景)[^\n｜|]{0,24}[｜|]\s*([^｜|\n]+)[｜|]\s*([^｜|\n]+)$/gmu
   const bracketHeadingPattern = /^(?:#{1,3}\s*)?[【[]\s*(?:场次|场景)\s*[^】\]\n]*[】\]]\s*([^\n]+)$/gmu
+  const numberedBracketHeadingPattern = /^(?:#{1,3}\s*)?[【[]\s*场\s*\d+\s*[】\]]\s*([^\n]+)$/gmu
   const colonHeadingPattern = /^(?:#{1,3}\s*)?(?:场次|场景)\s*[^：:\n]{0,16}[：:]\s*([^\n]+)$/gmu
-  const headings = [
+  const plainNumberedHeadingPattern = /^场\s*\d+(?:\s*[-—]\s*\d+)?\s*\n\s*([^\n]+)$/gmu
+  const inlineUnderwaterLocationPattern = /^[△\s]*(深海之下|海底深处|水下深处|深海深处)[，,]/gmu
+  const inlineFlashbackLocationPattern = /^[△\s]*[^\n]*(?:脑海中闪过|记忆闪回|闪回)[^\n]{0,100}((?:白色|地下|秘密|废弃)?实验室)[^\n]*$/gmu
+  const inlineExteriorLocationPattern = /^[△\s]*(木屋外|庄园外|营地外|屋外|门外)[，,]/gmu
+  const inlineExitToExteriorPattern = /^[△ \t]*[^\n]{0,100}?(?:走出|离开)\s*([\p{Script=Han}A-Za-z0-9·]{2,24}?(?:庄园|木屋|营地|大楼|主屋))[。；，,]/gmu
+  const detectedHeadings = [
     ...[...source.matchAll(pipeHeadingPattern)].map((match) => ({
       index: match.index || 0,
       raw: match[0],
       name: match[3],
       context: `${match[1].trim()}，${match[2].trim()}`,
+    })),
+    ...[...source.matchAll(compactPipeHeadingPattern)].map((match) => ({
+      index: match.index || 0,
+      raw: match[0],
+      name: match[2],
+      context: match[1].trim(),
     })),
     ...[...source.matchAll(bracketHeadingPattern)].map((match) => ({
       index: match.index || 0,
@@ -755,35 +890,114 @@ export function extractScriptSceneLocations(script: string): ScriptSceneLocation
       name: match[1],
       context: match[1].trim(),
     })),
+    ...[...source.matchAll(numberedBracketHeadingPattern)].map((match) => {
+      const parts = match[1].split(/[\/／｜|]+/u).map((part) => part.trim()).filter(Boolean)
+      return {
+        index: match.index || 0,
+        raw: match[0],
+        name: parts.at(-1) || match[1],
+        context: parts.slice(0, -1).join('，') || match[1].trim(),
+      }
+    }),
     ...[...source.matchAll(colonHeadingPattern)].map((match) => ({
       index: match.index || 0,
       raw: match[0],
       name: match[1],
       context: match[1].trim(),
     })),
+    ...[...source.matchAll(plainNumberedHeadingPattern)].map((match) => {
+      const parts = match[1].trim().split(/[\s/／｜|]+/u).filter(Boolean)
+      const hasTimeAndInterior = parts.length >= 3
+        && /^(?:日|夜|晨|凌晨|清晨|上午|中午|下午|黄昏|傍晚|深夜|白天|夜晚)$/u.test(parts[0])
+        && /^(?:内|外|内景|外景)$/u.test(parts[1])
+      return {
+        index: match.index || 0,
+        raw: match[0],
+        name: hasTimeAndInterior ? parts.slice(2).join('') : parts.at(-1) || match[1],
+        context: hasTimeAndInterior ? `${parts[0]}，${parts[1]}` : match[1].trim(),
+      }
+    }),
+    ...[...source.matchAll(inlineUnderwaterLocationPattern)].map((match) => ({
+      index: match.index || 0,
+      raw: match[0],
+      name: match[1],
+      context: '剧本明确由上一地点切入独立水下空间',
+    })),
+    ...[...source.matchAll(inlineFlashbackLocationPattern)].map((match) => ({
+      index: match.index || 0,
+      raw: match[0],
+      name: `${match[1]}（闪回）`,
+      context: '回忆，内景',
+    })),
+    ...[...source.matchAll(inlineExteriorLocationPattern)].map((match) => ({
+      index: match.index || 0,
+      raw: match[0],
+      name: match[1],
+      context: '剧本明确切入独立外景',
+    })),
+    ...[...source.matchAll(inlineExitToExteriorPattern)].map((match) => ({
+      index: match.index || 0,
+      raw: match[0],
+      name: `${match[1]}外`,
+      context: '剧本人物从室内明确走出建筑，切入独立外景',
+    })),
   ].sort((left, right) => left.index - right.index)
+  const headings = detectedHeadings.flatMap((heading, index) => {
+    if (!heading.name.endsWith('（闪回）')) return [heading]
+    const bodyStart = heading.index + heading.raw.length
+    const bodyEnd = detectedHeadings[index + 1]?.index ?? source.length
+    const flashbackBody = source.slice(bodyStart, bodyEnd)
+    const returnMatch = flashbackBody.match(/^[\s△]*【闪回结束】[^\n]*$/mu)
+    const previousPhysicalScene = detectedHeadings
+      .slice(0, index)
+      .reverse()
+      .find((candidate) => !candidate.name.endsWith('（闪回）'))
+    if (!returnMatch || !previousPhysicalScene) return [heading]
+    return [heading, {
+      index: bodyStart + (returnMatch.index || 0),
+      raw: returnMatch[0],
+      name: previousPhysicalScene.name,
+      context: previousPhysicalScene.context,
+    }]
+  }).sort((left, right) => left.index - right.index)
   const locations = new Map<string, ScriptSceneLocation>()
 
   for (let index = 0; index < headings.length; index++) {
     const heading = headings[index]
-    let name = heading.name
+    let rawName = heading.name
       .replace(/^[【\[]|[】\]]$/g, '')
       .replace(/[。；;]+$/g, '')
       .trim()
-    if (!name) continue
-    if ([...name].length < 4) name = `${name}核心场景`
+    if (!rawName) continue
+    if ([...rawName].length < 2) rawName = `${rawName}核心场景`
+
+    const physicalModes = heading.context.match(/(?:内景?|外景?)/gu) || []
+    const splitNames = physicalModes.length >= 2 && rawName.includes('及')
+      ? rawName.split(/\s*及\s*/u).map((name) => name.trim()).filter(Boolean)
+      : [rawName]
+    const names = splitNames.length >= 2 ? splitNames : [rawName]
 
     const bodyStart = heading.index + heading.raw.length
     const bodyEnd = headings[index + 1]?.index ?? source.length
-    const sceneExcerpt = source.slice(bodyStart, bodyEnd)
+    const compactSceneBody = source.slice(bodyStart, bodyEnd)
       .replace(/\s+/g, ' ')
       .trim()
-      .slice(0, 320)
-    const description = `${heading.context}。${sceneExcerpt || '空间结构、固定陈设、材质和基础光线严格依据已锁定剧本。'}`
-    const key = normalizedScriptSceneName(name)
-    const current = locations.get(key)
-    if (!current || description.length > current.description.length) {
-      locations.set(key, { name, description })
+    const sceneExcerpt = compactSceneBody.length <= 640
+      ? compactSceneBody
+      : `${compactSceneBody.slice(0, 320)} ${compactSceneBody.slice(-320)}`
+    for (const name of names) {
+      const compoundContext = names.length > 1 ? `复合场次中的独立空间“${name}”` : ''
+      const description = `${heading.context}${compoundContext ? `，${compoundContext}` : ''}。${sceneExcerpt || '空间结构、固定陈设、材质和基础光线严格依据已锁定剧本。'}`
+      const key = normalizedScriptSceneName(name)
+      const current = locations.get(key)
+      if (!current) {
+        locations.set(key, { name, description })
+      } else if (!current.description.includes(description)) {
+        locations.set(key, {
+          name: current.name,
+          description: `${current.description} ${description}`.slice(0, 1_400),
+        })
+      }
     }
   }
 
@@ -812,7 +1026,9 @@ export function buildStoryboardGenerationPrompt(input: {
     ? input.scriptLocations
     : extractScriptSceneLocations(input.script)
   const relatedAssets = input.assets.length > 0
-    ? input.assets.map((asset) => `- ${asset.type}｜${asset.name}：${asset.description}`).join('\n')
+    ? input.assets.map((asset) => (
+      `- ${asset.type}｜${asset.name}：${asset.description.replace(/\s+/gu, ' ').trim().slice(0, 180)}`
+    )).join('\n')
     : '- 当前处于先分镜、后资产规划流程；人物、场景和道具只能依据已锁定剧本中的明确事实，不得补造。'
   const indexedAssetNames = input.allAssetNames?.length
     ? input.allAssetNames
@@ -825,47 +1041,40 @@ export function buildStoryboardGenerationPrompt(input: {
   const allowedLocations = input.assets.filter((asset) => asset.type === AssetType.location)
   const locationSources = allowedLocations.length > 0 ? allowedLocations : scriptLocations
   const locationCatalog = locationSources.length > 0
-    ? locationSources.map((asset) => `- ${asset.name}：${asset.description}`).join('\n')
+    ? locationSources.map((asset) => (
+      `- ${asset.name}：${asset.description.replace(/\s+/gu, ' ').trim().slice(0, 180)}`
+    )).join('\n')
     : '- 当前段没有解析到场次标题；只能逐字使用本段剧本明确写出的具体地点，不得临时杜撰。'
-  const locationRule = allowedLocations.length > 0
-    ? 'n 必须严格使用“时间｜场景资产标准名”，场景名只能逐字选自“本段允许的场景资产”，不得使用简称、近义名、临时地点或全项目其他场景；e 必须复用所选场景资产的空间结构、固定陈设、材质和基础光线。'
-    : 'n 必须严格使用“时间｜剧本标准场景名”，场景名只能逐字选自“本段允许的剧本标准场景”；这是后续资产规划必须复用的唯一名称，不得使用简称、近义名或临时地点。e 必须依据剧本写清该空间的固定结构、陈设、材质和基础光线。'
-  const locationCatalogTitle = allowedLocations.length > 0
-    ? '【本段允许的场景资产｜唯一地点白名单】'
-    : '【本段允许的剧本标准场景｜唯一地点白名单】'
   const segmentContext = input.segment
     ? `【当前处理范围】
 这是本集第 ${input.segment.index}/${input.segment.total} 段。只为“本段剧本”生成镜头，前后内容仅供动作连续性参考，不得重复生成。
 ${input.segment.previousTail ? `前段结尾参考：${input.segment.previousTail}` : '这是本集开头。'}
 ${input.segment.previousShotTail ? `上一段最后一个已生成镜头的尾帧（当前首镜必须逐项承接）：${input.segment.previousShotTail}` : ''}
-${input.segment.nextHead ? `后段开头参考：${input.segment.nextHead}` : '这是本集结尾。'}
+${input.segment.nextHead ? '后段另有剧本内容；当前段不得提前生成、概括或复述后段事件。' : '这是本集结尾。'}
 `
     : ''
-  const targetShotRule = input.targetShotCount
-    ? `8. 本段必须生成至少 ${input.targetShotCount} 个原子镜头，允许为保留对白增加到 ${input.targetShotCount + 1} 个。按剧情节点、人物反应、视线变化和动作阶段合理拆镜，不得用重复画面或空镜凑数。`
-    : '8. 优先合并连续动作和同一人物连续台词，避免为同一剧情节点生成重复反应镜头。'
+  const overseasDialogue = input.visualStyle === VisualStyle.overseas_live_action
+  const dialogueOutputExample = overseasDialogue
+    ? '人物全名：自然美式英语现场对白；仅必要时使用最短英语画外音，否则无对白'
+    : '人物全名：完整原台词；原文内心独白标注【OS】；原文无对白时写无对白'
+  const dialogueModeRule = overseasDialogue
+    ? '当前为海外真人短剧：a 字段只能写自然、简洁的美式英语，完整对应源剧本对白的语义、说话人和先后顺序，禁止出现中文台词。'
+    : '当前为中文剧本：a 字段必须逐字保留人物全名、原台词、旁白、画外音和【OS】，不得删词、改写、合并、串词或换说话人。'
+  const locationCatalogTitle = allowedLocations.length > 0
+    ? '【本段可用场景资产】'
+    : '【本段剧本场景】'
+  const segmentLabel = input.segment
+    ? `第 ${input.segment.index}/${input.segment.total} 段`
+    : '完整段落'
 
-  return `请把第 ${input.episodeNumber} 集《${input.episodeTitle}》拆成电影级可拍摄分镜。
+  return `${STORYBOARD_SYSTEM_PROMPT}
 
-【统一画风锁定】
-${buildStyleLock(input.visualStyle, input.customStylePrompt, 'video')}
+【本次生成任务】
+请处理第 ${input.episodeNumber} 集《${input.episodeTitle}》的${segmentLabel}，只依据下方锁定剧本生成分镜。系统会把每 3 个连续原子分镜合成为一条 15 秒视频；不得提前生成本段之外的剧情。
 ${segmentContext}
 
-【不可违反】
-1. 严格按剧本顺序，不删减、不调换剧情；人物在场说出的对白必须逐字保留。旁白、画外音和人物【OS】不属于强制逐字保留项，默认全部省略并改写为可见动作、表情、视线、道具反应或环境变化。只有同时满足“内容逐字来自原剧本、包含画面与现场对白都无法呈现的客观事实、删除后会造成剧情理解断裂”三个条件时，才允许保留一句最短必要画外音；情绪感叹、动作解释、气氛渲染、转场连接和画面复述一律删除。
-2. 每镜承载约 70 个中文字；一个分镜最多只允许一个人物说话，多人对话必须拆镜。
-3. 每镜写清时间、准确地点、人物锁定、道具锁定、环境与照明锁定、景别机位运动、首帧、严格动作顺序、动作物理、画面表演、对白配音、声音、尾帧、镜间衔接和禁止项；系统会组装为可逐项编辑的 Shotlab 式分镜字段“镜头时长、画幅比例、画面描述、景别运镜、首尾帧衔接”。${locationRule} 地点变化必须另起镜头，单镜不得混合两个物理空间。
-4. 叙述必须使用剧本中的人物标准全名；已有资产时逐字复用资产名。不用“我、他、她”代替人物；对白内部原有人称不改。
-4.1 同职业、同族裔、同款服装或相似道具不代表同一人物；只有剧本明确说明为同一人时才能复用人物资产。未命名人物使用包含地点、年龄层或剧情身份的稳定称谓，禁止把甲角色的伤势、经历、车辆或随身物品转移给乙角色。
-5. 不新造主要资产；现场对白安排同步口型，旁白和【OS】不得让画面人物错误开口。禁止使用画外音解释角色正在做什么、重复已出现的对白、复述画面可见事实、渲染可以通过表情表现的情绪，或仅用于连接镜头。系统会在保存前自动移除擅自新增、未逐字取自剧本或不含必要客观事实的画外音。
-6. 当前输出的是独立保存的原子分镜，每镜按 4-6 秒的内容密度书写，每集至少形成约 20 个分镜并覆盖 90 秒剧情。视频生成阶段由使用者选择同一集内 3-4 个相邻分镜，系统再按比例组成最长 15 秒的视频任务；严禁跨集组合。只写本镜独有内容，统一画风和通用电影参数由系统自动补齐，不要在每镜重复。
-7. v 字段必须写出角色本镜的“初始神态 -> 触发动作或对白 -> 可见变化”，包含视线落点，以及眉眼或嘴角的微表情。根据剧情使用克制、戒备、试探、迟疑、错愕、压抑、讥讽、心虚、愤怒、松动等具体状态；同一角色相邻镜头要有连续而不重复的情绪递进，禁止连续多镜只写“神情冷淡”“面无表情”或同一个固定表情，禁止脱离剧情随机变脸。
-7.1 每镜 g 是可直接作为下一镜首帧的精确尾帧状态，必须写清人物位置、朝向、手部、视线、关键服装道具、焦点和背景；下一镜 p 必须逐项复述上一镜 g，不得自行重置。
-7.2 h 只锁定本镜出场人物，并写清全名、年龄外形、固定发型服装和相对位置；r 明确“道具只属于谁、戴在哪只手或拿在哪只手”，没有关键道具就写“无关键道具”；e、l 必须保持同一场景陈设和光源方向不跳变。
-7.3 s 必须使用“先……；随后……；然后……；最后……”列出唯一执行顺序，每一步只包含一个主要动作，并给复杂动作预留准备和落稳时间；未写入 s 的换位、触碰、换手、换装、增删物品和转场一律禁止。
-7.4 m 专门描述动作物理：起始姿态和重心、哪一侧肢体主动、连续运动路径、人物或物体间接触点、遮挡期间必须保持的姿态、结束时双脚/手部/道具的位置。无身体接触时也要写“人物之间无身体接触并保持最小间距”。禁止只写“动作自然流畅”。
-7.5 c 每个子镜头最多一种主要摄影机运动；复杂肢体动作、人物接触或递接道具时优先中景或全身景别的固定机位或稳定单向跟拍，确保主动肢体、双脚和接触点始终在画内。每个原子镜头最多一个复杂身体动作，或最多三个不发生身体接触的轻微动作。z 除剧情专属错误外，列出易失败缺陷词：肢体融合、关节反折、多余手指、多余肢体、身体穿透、衣物穿模、脚底滑移、人物瞬移、道具漂浮、道具变形、人物复制、面容漂移、背景跳变。
-${targetShotRule}
+【项目画风补充】
+${buildStyleLock(input.visualStyle, input.customStylePrompt, 'video')}
 
 【本段相关资产】
 ${relatedAssets}
@@ -876,14 +1085,188 @@ ${locationCatalog}
 【全项目资产名称索引】
 ${allAssetNames}
 
-【输出约束】
-只输出一行严格 JSON，不要 Markdown、解释或重复规则。每个字段只写本镜必要事实，使用短字段以加快返回：
-{"shots":[{"t":"镜头标题","n":"时间｜准确地点","p":"承接上一镜尾帧状态；首镜写本段开场状态","h":"出场人物外形服装与相对站位锁定","r":"关键道具归属、佩戴或持握位置锁定","e":"场景空间与固定陈设锁定","l":"光源方向、色温与明暗锁定","c":"景别、机位与唯一运动","f":"首帧精确构图","s":"严格按先后排列的动作步骤","m":"重心、主动肢体路径、接触点、遮挡和结束姿态","v":"神态变化、视线与可见画面细节；优先替代非必要画外音","a":"人物全名：逐字现场对白；仅必要时最短画外音，否则无对白","q":"说话人声线、语气、重音与停顿；无对白则不生成配音","o":"环境声与必要音效，无背景音乐无字幕","g":"尾帧精确构图和人物状态","x":"如何从本镜尾帧自然进入下一镜","z":"剧情专属禁止项和具体负面缺陷词","d":5}]}
+【输出格式】
+只输出一行严格 JSON，不要 Markdown、解释或推理。每个原子分镜约 4-6 秒，必须保留 i/p/h/r/e/l/c/f/s/m/v/a/q/o/g/x/z/d 字段；同一原子分镜允许多位现场对白说话人按剧本顺序依次说话。${dialogueModeRule} q 字段写每位说话人的配音规范，o 字段严格写无背景音乐、无字幕。
+{"shots":[{"t":"分镜标题","n":"时间｜场景地点","i":"剧情节点与情绪","p":"首帧承接状态","h":"本分镜人物及站位","r":"道具归属","e":"固定场景描述","l":"光影","c":"景别、机位、运镜","f":"首帧画面","s":"动作顺序","m":"动作物理","v":"画面内容、表情和反应","a":"${dialogueOutputExample}","q":"角色配音规范","o":"环境声；无背景音乐、无字幕","g":"尾帧状态","x":"镜头衔接","z":"禁用元素","d":5}]}
 
-字段要求：t 简短；n 必含时间和地点；p/h/r/e/l/f/s/m/g/x/z 不得省略；c 对应“景别机位运动”；v 对应“画面内容”，必须包含有剧情触发依据的神态变化链与视线；a 对应“动作对白”，每镜至多一人说话，非必要旁白/画外音/【OS】必须写成“无对白”并把信息转入 v；q 只描述本镜实际声音，无对白时不得虚构配音；d 为 4-6 的整数，优先 4-5 秒，便于每 3-4 镜组合为一条 15 秒视频。shots 必须至少包含一个镜头。系统会强制校正镜间首尾帧连续性，并自动组装成完整中文分镜模板。
+【本段锁定剧本】
+${input.script}`
+}
+
+export function buildStoryboardAtomicRepairPrompt(input: {
+  episodeNumber: number
+  script: string
+  currentJson: string
+  issues: string[]
+  minimumShotCount: number
+}) {
+  return `第 ${input.episodeNumber} 集当前分镜中存在把多个镜头压进一镜的问题。请只做原子化重拆，不改变剧本事件顺序，不删减或改写现场对白，不新增剧本内容。
+
+【必须修复的问题】
+${input.issues.map((issue) => `- ${issue}`).join('\n')}
+
+【原子分镜硬规则】
+1. 每镜只有一个物理地点；地点变化、现实与回忆切换必须另起分镜。
+2. 每镜只有一个连续机位和一种主要摄影机运动；快切、蒙太奇、多角度、跳切、从全景切特写等必须拆成多个分镜。
+3. 每镜只有一个主要身体动作；同一镜可按剧本顺序包含多位对白说话人，换人时明确当前说话者口型，其他人物只保留倾听反应。
+4. 每镜 4-6 秒、约对应 70 个中文字的源剧本，标题不得使用“/”“至”“→”串联多个剧情节点。
+5. 每镜必须保留 i/p/h/r/e/l/c/f/s/m/v/a/q/o/g/x/z/d 全字段；i 保留导演意图、情绪视点、触发和情绪落点，相邻镜头的 p 和 f 必须承接上一镜 g。
+6. 修复后以约 ${input.minimumShotCount} 镜为目标，允许上下浮动 2 镜；只修复真正不合格的镜头，禁止额外扩写、重复反应、重复建立场景或用空镜凑数。
+7. 人物现场对白、旁白、画外音和【OS】均按原剧本完整保留，不得精简、改写或调换；【OS】必须显式标注。
 
 【本段剧本】
-${input.script}`
+${input.script}
+
+【待修复分镜 JSON】
+${input.currentJson}
+
+只输出一行严格 JSON，不要解释：{"shots":[{"t":"单一动作标题","n":"时间｜唯一准确地点","i":"意图、情绪视点、触发和情绪落点","p":"承接上一镜尾帧","h":"本镜人物锁定","r":"道具锁定","e":"唯一场景锁定","l":"照明锁定","c":"单一景别机位运动","f":"首帧","s":"单一主要动作顺序","m":"动作物理","v":"当前说话者神态、其他人物倾听反应与画面","a":"按顺序写每位说话人的完整原台词、原文【OS】或无对白","q":"每位说话人或画外音的配音规范","o":"环境声与必要音效","g":"尾帧","x":"进入下一镜的衔接","z":"禁止项","d":5}]}`
+}
+
+export function buildStoryboardContinuityRepairPrompt(input: {
+  episodeNumber: number
+  script: string
+  currentJson: string
+  issues: string[]
+  targetShotCount: number
+}) {
+  return `第 ${input.episodeNumber} 集分镜在合并为 15 秒视频段前未通过时空与声音审片。请只修复列出的问题，保持剧本事件顺序、人物身份、场景、现场对白、旁白、画外音、【OS】和因果关系，不新增剧情，不删改原文内容。
+
+【必须修复的问题】
+${input.issues.map((issue) => `- ${issue}`).join('\n')}
+
+【连续性硬规则】
+1. 逐镜建立“开场状态 -> 动作/对白 -> 尾帧状态”。下一镜必须从上一镜尾帧继续，不得重置人物位置、身体状态、手部、道具或画面明暗。
+2. 坠落、倒地、离场、死亡、物体脱手、门关闭、画面切黑都是不可逆动作；完成后不得回到动作前状态。只有剧本明确写出回忆、倒叙、时间倒回或重新起身时才允许恢复。
+3. 同一剧情链必须先完成对白，再执行坠落、离场、切黑等不可逆动作。不可逆动作之后只允许继续该动作或进入剧本明确的新时空。
+4. 同一句对白在同一 15 秒段内只出现一次。严格按剧本顺序逐字保留说话人和完整原台词，旁白、画外音和【OS】也必须保留并显式标注；不得把后面的对白插到已经发生的坠落或切黑之后。
+5. 中文对白按每秒约 4 个汉字、英语对白按每秒约 2.5 个单词核算，并为换人、停顿和反应预留至少 0.5 秒。放不下时拆成多个 4-6 秒原子镜头或重新分配秒数，禁止删词、改写或加速念词。同一原子镜头可按剧本顺序包含多位现场对白说话人。
+6. 有现场对白时，q/o 统一表达“无新增旁白、无后期配音感，保留演员现场对白”，不得同时出现“无配音”“无对白”或“说话人无对白”。原剧本已有旁白、画外音和【OS】必须照常保留；完全无任何原文声音的镜头才写不生成配音。
+7. 修复后保持约 ${input.targetShotCount} 个原子镜头；每镜 4-6 秒、一个地点、一个连续机位、最多一个复杂身体动作，保留 i/p/h/r/e/l/c/f/s/m/v/a/q/o/g/x/z/d 全字段。i 必须明确导演意图、情绪视点、触发和情绪落点。s 必须包含 2-4 个不重复的可见动作节拍并写清执行者、移动路径、接触或停点和稳定结束姿态；m 只保留本镜独有的重心、主动肢体、接触点与道具位置；v 写出触发前后的可见表演变化，禁止用空泛情绪词代替动作。
+
+【本集锁定剧本】
+${input.script}
+
+【待修复分镜 JSON】
+${input.currentJson}
+
+只输出一行严格 JSON，不要解释：{"shots":[{"t":"单一剧情节拍","n":"时间｜准确地点","i":"意图、情绪视点、触发和情绪落点","p":"承接上一镜尾帧","h":"人物及站位锁定","r":"道具归属锁定","e":"静态场景摘要","l":"光线锁定","c":"单一景别机位运动","f":"首帧","s":"按先后顺序的动作","m":"动作物理","v":"表演与画面","a":"保留关键语义的自然对白或无对白","q":"说话人声线或无对白不配音","o":"现场声音与必要音效","g":"不可重置的尾帧状态","x":"进入下一镜的衔接","z":"禁止项","d":5}]}`
+}
+
+export function buildStoryboardFinalReviewPrompt(input: {
+  episodeNumber: number
+  script: string
+  currentJson: string
+  targetShotCount: number
+  visualStyle: VisualStyle
+  allowedLocationNames: string[]
+  issues?: string[]
+  verificationRound?: number
+}) {
+  const overseasDialogue = input.visualStyle === VisualStyle.overseas_live_action
+  const hasMarkedColdOpen = input.script.includes('【倒叙冷开场】')
+    && input.script.includes('【回到主线】')
+  const languageRule = overseasDialogue
+    ? '所有演员现场对白和必要画外音必须是自然、简洁的美式英语，完整对应源剧本语义、说话人和先后顺序；人物标准名可保留原文，但台词内容不得出现中文。美式英语允许不改变语义的同义表达、缩写和自然标点差异，不得把某一种英文译法当成唯一原文，也不得仅因省略号、逗号或同义词不同判错。'
+    : '所有演员现场对白、旁白、画外音和【OS】必须逐字对应锁定剧本的说话人、先后顺序和完整内容；任何删词、改写、合并、串词、换说话人或漏掉【OS】标记都必须判错。'
+  const locationCatalog = input.allowedLocationNames.length > 0
+    ? input.allowedLocationNames.map((name) => `- ${name}`).join('\n')
+    : '- 只能使用锁定剧本明确出现的地点'
+  const issueBlock = input.issues?.length
+    ? `【程序复检发现的问题｜必须纳入审片结论】\n${input.issues.map((issue) => `- ${issue}`).join('\n')}\n\n`
+    : ''
+  const coldOpenRule = hasMarkedColdOpen
+    ? '本集剧本明确包含【倒叙冷开场】和【回到主线】：必须同时保留冷开场预演与主线后段的完整事件，不得把两者判为普通重复，不得删除任一处。两次坠落、对白或白狼闪现分别属于不同叙事时间；只需确保各自内部顺序一致，并通过明确时间转换隔开。'
+    : '只有剧本明确标记的冷开场、倒叙、回忆或重放才允许事件重现。'
+
+  const stageLabel = input.verificationRound
+    ? `这是第 ${input.verificationRound} 轮修改后的再次验收。`
+    : '这是初稿的首次整集复查。'
+
+  return `第 ${input.episodeNumber} 集分镜已经完成当前版本。现在必须回到整集锁定剧本，从第一行到最后一行做一次最终审片。${stageLabel}本次调用只负责找出仍然存在的问题，不得输出分镜补丁、修改后的镜头或完整分镜，不要解释审片过程。
+
+${issueBlock}${STORYBOARD_DIRECTOR_SKILL_RULES}
+
+【最终审片清单】
+1. 剧情顺序：先按锁定剧本建立从开场到结尾的事件索引，再逐镜核对。禁止把后段事件提前、把前段事件放到后面、遗漏因果步骤，或让冷开场之外的内容倒序。${coldOpenRule}
+2. 去重：同一对白、同一反应、同一揭示、同一建立场景和同一不可逆动作不得重复生成。若剧本只出现一次，分镜也只能出现一次；不得用近义改写规避去重。
+2.1 导演情绪：逐场确认观众跟随的情绪视点角色和情绪变化。决定性台词或动作出现时，受影响角色必须在同镜或紧接下一镜获得至少 1 秒正脸或清晰侧脸反应；不得让说话者占满全镜，不得连续以背影、遮挡或远景隐藏情绪视点角色。检查 i 中的意图、情绪视点、触发和情绪落点是否都能在 f/v/g 中看见。
+2.2 镜头语法：景别和角度必须随建立关系、触发冲突、情绪反应、决断或钩子推进。无明确理由时，同一场景不得连续三个镜头采用相同景别、角度和运动；不得把本应属于主角的反应特写交给对手。
+3. 状态连续：逐镜核对人物位置、朝向、手部、伤势、衣着、道具归属、门窗状态、画面明暗和场景陈设。坠落、倒地、离场、死亡、物体脱手、门关闭、切黑等动作完成后不得恢复旧状态；所有相关对白必须在不可逆动作前完成。
+4. 场景一致：每个原子分镜只能使用一个物理地点和一个连续机位；e、n、人物站位和动作必须属于同一地点。e 只能包含时间地点、空间结构、固定陈设、材质、天气、空气状态和静态光线；只要 e 出现人物姓名、动作、表情、视线、姿态、身体接触、对白或剧情过程，一律判为 fatal，并要求把这些内容移入 s/m/v/a/g。地点变化必须另起分镜，不得把前一场景人物或陈设带入下一场景。地点名称只能使用下方白名单。
+5. 对白与时长：同一原子分镜可按剧本顺序包含多位现场对白说话人，任一时刻只让当前说话者同步口型，其他人物只做倾听反应。中文按每秒约 4 个汉字、英语按每秒约 2.5 个单词，并为换人、停顿和反应预留至少 0.5 秒；放不下必须拆镜或调整为 4-6 秒，禁止删词、改写或快读。标题带“对白续镜”的相邻镜头共同承载一条长对白，必须按顺序拼接各镜 a 字段后再判断原台词是否逐字完整；断点必须位于标点、短语或完整意群边界，不得从词语中间截断。每个续镜只说自己分配到的片段，禁止把完整长句复制到每个续镜。${languageRule}
+6. 声音：有现场对白时 q/o 必须写“无新增旁白、无后期配音感，保留演员现场对白”，不得出现“无配音”“无对白”或“说话人无对白”；原剧本已有旁白、画外音和【OS】必须完整保留并禁止画面人物错误对口型。完全无任何原文声音的镜头才允许不生成配音。全部镜头不要字幕、不要任何画面文字、不要背景音乐。
+7. 资产与人物数量：人物、场景和关键道具名称必须复用剧本或资产标准名；不得换人、合并不同人物、改变族裔年龄、转移专属道具或新增主要资产。逐镜检查 h 中每个角色只声明一次；同一角色只能定义一次固定声音。一个独立分镜累计超过 4 名角色，或任一时间段出现与剧情无关的人物，均判为 fatal：修复时优先保留说话者、动作执行者、动作对象和情绪反应者，删除或画外化普通同学、路人、围观者和等待者；仍超过 4 人时拆镜。逐时间段检查镜内角色、画外角色、人数和站位，画面优先只保留 1-2 名核心人物。人物三视图或多视角设定板只代表同一个演员，禁止同一角色分身、替身、镜像、倒影或背景重复；仅被提及、被望向或在画外说话的角色不得自动入镜。海外真人短剧必须保持北美真人影视语境、人物固定美式声线和英语对白。
+8. 结尾钩子：最后几个镜头必须完整呈现锁定剧本已有的结尾悬念、反转或钩子；不得提前结束，也不得新增剧本之外的钩子。
+9. 结构：保持约 ${input.targetShotCount} 个 4-6 秒原子分镜，允许为对白自然时长上下浮动 3 镜。每镜保留 i/p/h/r/e/l/c/f/s/m/v/a/q/o/g/x/z/d 全字段，相邻镜头的 p/f 必须承接上一镜 g。禁止用空镜、重复反应或重复对白凑数。
+10. 严重级别：剧情、对白、人物、场景、时序、连续性、时长不可执行和提示词矛盾均为 fatal；只有不影响剧本事实与生成正确性的镜头丰富度、构图偏好或轻微导演表现建议可标为 warning。不得把 fatal 降级为 warning。
+11. 问题结构：category 只能是 plot、dialogue、character、scene、continuity、duration、prompt_conflict、directing。shotNumbers 使用下方当前镜头编号；scriptEvidence 必须引用或准确概括锁定剧本依据；repairInstruction 必须明确说明下一阶段应该怎样修改。passed 只有在 issues 为空时才能为 true。
+
+【允许的标准场景名称】
+${locationCatalog}
+
+【本集锁定剧本】
+${input.script}
+
+【待审片的完整分镜 JSON｜镜头数组下标依次对应编号 1、2、3……】
+${input.currentJson}
+
+只输出一行严格 JSON，不要解释：{"passed":false,"issues":[{"severity":"fatal","category":"dialogue","shotNumbers":[2,3],"scriptEvidence":"锁定剧本中的对应对白与顺序","problem":"具体问题","repairInstruction":"需要执行的具体修改"}]}
+完全没有问题时输出：{"passed":true,"issues":[]}`
+}
+
+export type StoryboardFinalReviewPromptIssue = {
+  severity: 'fatal' | 'warning'
+  category: 'plot' | 'dialogue' | 'character' | 'scene' | 'continuity' | 'duration' | 'prompt_conflict' | 'directing'
+  shotNumbers: number[]
+  scriptEvidence: string
+  problem: string
+  repairInstruction: string
+}
+
+export function buildStoryboardFinalRepairPrompt(input: {
+  episodeNumber: number
+  script: string
+  currentJson: string
+  targetShotCount: number
+  visualStyle: VisualStyle
+  allowedLocationNames: string[]
+  issues: StoryboardFinalReviewPromptIssue[]
+  repairRound: number
+}) {
+  const overseasDialogue = input.visualStyle === VisualStyle.overseas_live_action
+  const languageRule = overseasDialogue
+    ? '现场对白必须使用自然、简洁的美式英语，保持锁定剧本的语义、说话人和顺序；不得出现中文字幕或中文台词。'
+    : '现场对白、旁白、画外音和【OS】必须逐字保持锁定剧本的说话人、顺序和完整内容；对白过长时只能拆镜，禁止删词、改写、串词、换说话人或丢失【OS】标记。'
+  const locationCatalog = input.allowedLocationNames.length > 0
+    ? input.allowedLocationNames.map((name) => `- ${name}`).join('\n')
+    : '- 只能使用锁定剧本明确出现的地点'
+
+  return `第 ${input.episodeNumber} 集正在执行第 ${input.repairRound} 轮整集分镜修复。复查阶段已经列出问题；本次调用只负责根据这些问题生成可执行的小型补丁，不得再次只做检查，也不得为了通过验收改写锁定剧本。
+
+【必须执行的复查结果】
+${JSON.stringify(input.issues)}
+
+【修复硬规则】
+1. 逐项落实 repairInstruction；剧情事实、事件顺序、人物身份、说话人、场景和因果关系必须以锁定剧本为唯一依据，不新增剧情。
+2. 同一原子分镜可按剧本顺序包含多位现场对白说话人，换人时明确当前说话者口型和其他人物倾听反应。对白放不下时拆成多个 4-6 秒续镜；长对白必须在标点、短语或完整意群边界断开并按顺序分配，禁止删词、改写、从词语中间截断或复制完整台词。
+3. 修复人物站位、朝向、接触状态、道具归属、运动方向和不可逆动作时，下一镜必须从上一镜尾帧继续，不得无过程换位或状态复原。
+4. 每个镜头只能包含一个物理地点；地点变化必须另起分镜。场景名只能使用白名单。e 只保留时间地点、空间结构、固定陈设、材质、天气、空气状态和静态光线；删除其中所有人物动作、表情、视线、接触、对白和剧情过程，并将确属本镜的内容移入 s/m/v/a/g。${languageRule}
+5. 有现场对白时保留演员现场对白；无新增旁白、无后期配音感、无字幕、无画面文字、无背景音乐。原剧本已有旁白、画外音和【OS】必须完整保留，对应音频保持开启。
+6. 保持约 ${input.targetShotCount} 个原子镜头，允许为对白自然时长上下浮动 3 镜。新增镜头必须包含 i/p/h/r/e/l/c/f/s/m/v/a/q/o/g/x/z/d 全字段。每镜累计最多 4 名角色，每个画面优先只保留 1-2 名核心人物；删除或画外化无对白、无动作、无情绪作用的普通同学、路人、围观者和等待者，仍超过 4 人时拆镜。
+7. 只修改复查问题涉及的镜头。replacements 只返回变化字段；insertions 只补遗漏内容；remove 只删重复或剧本外镜头；order 只用于纠正事件顺序。不得返回空补丁或把原内容原样写回。
+8. 本次修复结果必须交给下一阶段重新验收，passed 固定写 false，issues 固定为空。
+
+【允许的标准场景名称】
+${locationCatalog}
+
+【本集锁定剧本】
+${input.script}
+
+【当前完整分镜 JSON｜镜头编号从 1 开始】
+${input.currentJson}
+
+只输出一行严格 JSON，不要解释：{"passed":false,"issues":[],"order":[],"remove":[],"replacements":[{"shotNumber":2,"shot":{"a":"修正后的现场对白","s":"修正后的连续动作","g":"修正后的尾帧状态"}}],"insertions":[]}`
 }
 
 export function buildStoryboardDialogueRepairPrompt(input: {
@@ -892,7 +1275,7 @@ export function buildStoryboardDialogueRepairPrompt(input: {
   currentJson: string
   missing: Array<{ speaker: string; os: boolean; text: string }>
 }) {
-  return `第 ${input.episodeNumber} 集当前剧本段的分镜遗漏了以下对白或独白。请修正当前段的紧凑分镜 JSON；必要时拆出新镜头，每镜最多一人说话，不删改已有对白。保留并补全每镜“初始神态 -> 对白或动作触发 -> 可见变化”的表演链，写明视线及眉眼或嘴角微表情，相邻镜头不得无理由重复同一表情。每镜继续保留 p/h/r/e/l/c/f/s/m/v/a/q/o/g/x/z/d 全部字段。
+  return `第 ${input.episodeNumber} 集当前剧本段的分镜遗漏了以下对白或独白。请修正当前段的紧凑分镜 JSON；同一原子分镜可按剧本顺序包含多位现场对白说话人，换人时明确当前口型和倾听反应。逐字保留说话人、顺序和完整原台词；对白过长时只能在完整意群边界拆成续镜，禁止删词或改写。旁白、画外音和【OS】必须完整保留，【OS】显式标注。保留并补全每镜“初始神态 -> 对白或动作触发 -> 可见变化”的表演链，写明视线及眉眼或嘴角微表情，相邻镜头不得无理由重复同一表情。每镜继续保留 i/p/h/r/e/l/c/f/s/m/v/a/q/o/g/x/z/d 全部字段。
 
 遗漏内容：
 ${input.missing.map((item) => `- ${item.speaker}${item.os ? '【OS】' : ''}：${item.text}`).join('\n')}
@@ -903,7 +1286,7 @@ ${input.script}
 当前分镜 JSON：
 ${input.currentJson}
 
-只输出修正后的完整紧凑 JSON，不要解释：{"shots":[{"t":"...","n":"...","p":"...","h":"...","r":"...","e":"...","l":"...","c":"...","f":"...","s":"...","m":"...","v":"...","a":"...","q":"...","o":"...","g":"...","x":"...","z":"...","d":5}]}`
+只输出修正后的完整紧凑 JSON，不要解释：{"shots":[{"t":"...","n":"...","i":"意图、情绪视点、触发和情绪落点","p":"...","h":"...","r":"...","e":"...","l":"...","c":"...","f":"...","s":"...","m":"...","v":"...","a":"...","q":"...","o":"...","g":"...","x":"...","z":"...","d":5}]}`
 }
 
 export function buildMissingDialogueShotsPrompt(input: {
@@ -914,10 +1297,10 @@ export function buildMissingDialogueShotsPrompt(input: {
   return `只为第 ${input.episodeNumber} 集当前剧本段中遗漏的对白生成补充镜头，不要重写其他镜头。
 
 硬性要求：
-1. 每条遗漏对白单独生成一个镜头，a 字段必须逐字包含“人物全名：原对白”，不得概括、同义改写或省略。
-2. 动作、时间和地点必须来自本段剧本；神态必须写成“初始神态 -> 遗漏对白触发 -> 可见变化”，写清视线以及眉眼或嘴角微变化，并符合对白的情绪语境；每镜只能有一个人物说话。
+1. a 字段必须逐句写“人物全名：完整原台词”，逐字保留原对白的说话人、顺序和全部内容；旁白、画外音和【OS】也必须完整补齐，【OS】显式标注。同一原子分镜可按剧本顺序包含多位现场对白说话人；过长对白只能在完整意群边界拆成续镜，禁止删词或改写。
+2. 动作、时间和地点必须来自本段剧本；神态必须写成“初始神态 -> 对白触发 -> 可见变化”，写清当前说话者口型、其他人物的倾听反应、视线以及眉眼或嘴角微变化。
 3. 必须提供人物、道具、环境、照明、首尾帧和禁止项，确保补充镜头插入后不改变相邻镜头的服装、站位、道具归属和场景陈设。
-4. 只输出严格 JSON，不要解释：{"shots":[{"t":"镜头标题","n":"时间｜准确地点","p":"承接状态","h":"人物锁定","r":"道具锁定","e":"环境锁定","l":"照明锁定","c":"景别、机位与运动","f":"首帧","s":"动作顺序","m":"动作物理与接触约束","v":"人物动作表情与环境","a":"人物全名：逐字对白","q":"配音要求","o":"声音设计","g":"尾帧","x":"镜间衔接","z":"禁止项与负面缺陷词","d":4}]}
+4. 只输出严格 JSON，不要解释：{"shots":[{"t":"镜头标题","n":"时间｜准确地点","i":"意图、情绪视点、触发和情绪落点","p":"承接状态","h":"人物锁定","r":"道具锁定","e":"环境锁定","l":"照明锁定","c":"景别、机位与运动","f":"首帧","s":"动作顺序","m":"动作物理与接触约束","v":"人物动作表情与环境","a":"人物全名：保留关键语义的自然对白","q":"配音要求","o":"声音设计","g":"尾帧","x":"镜间衔接","z":"禁止项与负面缺陷词","d":4}]}
 
 【必须补齐的对白】
 ${input.missing.map((item) => `- ${item.speaker}${item.os ? '【OS】' : ''}：${item.text}`).join('\n')}
@@ -926,35 +1309,104 @@ ${input.missing.map((item) => `- ${item.speaker}${item.os ? '【OS】' : ''}：$
 ${input.script}`
 }
 
+function truncatePromptAtBoundary(value: string, maxLength: number) {
+  const normalized = value.replace(/\s+/g, ' ').trim()
+  if (normalized.length <= maxLength) return normalized
+  const slice = normalized.slice(0, maxLength)
+  const boundaries = ['。', '；', '，', ',', '、'].map((mark) => slice.lastIndexOf(mark))
+  const boundary = Math.max(...boundaries)
+  return `${(boundary >= Math.floor(maxLength * 0.6) ? slice.slice(0, boundary + 1) : slice).trim()}。`
+}
+
+function compactAssetPromptFacts(value: string, maxLength: number, type: AssetType) {
+  const normalized = value
+    .replace(/(镜头参数\s*[:：])/gu, '\n$1')
+    .replace(/\n{2,}/g, '\n')
+    .trim()
+  const seen = new Set<string>()
+  const segments = normalized
+    .split(/(?<=[。！？；\n])/u)
+    .map((segment) => segment.replace(/\s+/g, ' ').trim())
+    .filter((segment) => {
+      if (!segment) return false
+      const key = segment.toLocaleLowerCase().replace(/[\s\p{P}\p{S}]+/gu, '')
+      if (!key || seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+  if (type !== AssetType.location) {
+    return truncatePromptAtBoundary(segments.join(''), maxLength)
+  }
+
+  const cameraPattern = /镜头参数|摄影机|焦段|光圈|景深|对焦|背景虚化|焦外/u
+  const camera = segments.filter((segment) => cameraPattern.test(segment)).join('')
+  const visual = segments.filter((segment) => !cameraPattern.test(segment)).join('')
+  const cameraBudget = camera ? Math.min(190, Math.floor(maxLength * 0.34)) : 0
+  const visualBudget = Math.max(80, maxLength - cameraBudget - (camera ? 1 : 0))
+  return [
+    truncatePromptAtBoundary(visual, visualBudget),
+    camera ? truncatePromptAtBoundary(camera, cameraBudget) : '',
+  ].filter(Boolean).join('\n')
+}
+
 export function enforceAssetPrompt(input: {
   type: AssetType
   name: string
   prompt: string
   characterNames: string[]
   visualStyle: VisualStyle
+  customStylePrompt?: string | null
   preserveName?: boolean
 }) {
   let name = input.name.trim()
   let prompt = input.prompt.trim()
   const style = getVisualStylePreset(input.visualStyle)
-  if (input.type === AssetType.character && !prompt.includes('人物设定图必须以白色背景身份卡呈现')) {
-    prompt = `${CHARACTER_PROMPT_RULES}\n${prompt}`
-  }
-  if (input.type === AssetType.location && !prompt.includes('场景必须绝对真空与匿名')) {
-    prompt = `${LOCATION_PROMPT_RULES}\n${prompt}`
-  }
-  if (input.type === AssetType.prop && !prompt.includes('道具设定必须精准遵循剧本用途与年代')) {
-    prompt = `${PROP_PROMPT_RULES}\n${prompt}`
-  }
-  if (!prompt.includes(style.label)) prompt = `【${style.label}】${style.prompt}\n${prompt}`
   if (input.type === AssetType.location) {
     if (!input.preserveName && [...name].length < 4) name = `${name}核心场景`
     for (const characterName of input.characterNames) {
-      prompt = prompt.split(characterName).join('角色')
+      prompt = prompt.split(characterName).join('')
     }
-    const prefix = '不能出现其他人, 无人, 纯场景,'
-    if (!prompt.startsWith(prefix)) prompt = `${prefix} ${prompt}`
-    if (!/no humans/i.test(prompt)) prompt += '，no humans, empty, landscape only'
   }
-  return { name, prompt }
+
+  prompt = prompt
+    .replace(style.prompt, '')
+    .replace(CHARACTER_PROMPT_RULES, '')
+    .replace(LOCATION_PROMPT_RULES, '')
+    .replace(PROP_PROMPT_RULES, '')
+    .replace(/【(?:真人写实|2D\s*动漫|3D\s*CG\s*动漫|Q\s*版风格)】/giu, '')
+    .replace(/不能出现其他人\s*[,，]\s*无人\s*[,，]\s*纯场景\s*[,，]?/giu, '')
+    .replace(/no\s+humans\s*[,，]?\s*empty\s*[,，]?\s*landscape\s+only[。.]?/giu, '')
+    .replace(/(?:严禁|禁止|不得|不能|不要|杜绝|避免)[^。！？；\n]+[。！？；]?/gu, '')
+    .replace(/【(?:最终场景图片提示词|镜头参数摘要)】/gu, '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line && !/^(?:人物差异化锚点|人物设定图必须|场景必须绝对|提示词必须|名称至少|道具设定必须|项目统一画风|统一画风|资产类型|创作内容)/u.test(line))
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+
+  const layoutRule = input.type === AssetType.character
+    ? CHARACTER_PROMPT_RULES
+    : input.type === AssetType.location
+      ? LOCATION_PROMPT_RULES
+      : PROP_PROMPT_RULES
+  const maxLength = input.type === AssetType.location ? 820 : input.type === AssetType.character ? 720 : 560
+  const styleLock = buildConciseImageStyle(input.visualStyle, input.customStylePrompt)
+  const characterIdentityAnchor = input.type === AssetType.character
+    ? buildCharacterIdentityAnchor(name)
+    : ''
+  const quality = '构图准确，主体清晰，透视自然，高光与暗部保留细节。'
+  const fixedLength = styleLock.length + layoutRule.length + characterIdentityAnchor.length
+    + quality.length + name.length + 20
+  const facts = compactAssetPromptFacts(prompt, Math.max(120, maxLength - fixedLength), input.type)
+  const finalPrompt = [
+    styleLock,
+    `资产名称：${name}。`,
+    layoutRule,
+    characterIdentityAnchor,
+    facts,
+    quality,
+  ].filter(Boolean).join('\n')
+
+  return { name, prompt: finalPrompt.slice(0, maxLength) }
 }

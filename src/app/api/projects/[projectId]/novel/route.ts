@@ -3,7 +3,7 @@ import { prisma } from '@/lib/db'
 import { requireUser } from '@/lib/auth'
 import { routeHandler } from '@/lib/http'
 import { requireWritableProject } from '@/lib/permissions'
-import { getPreproductionData, saveNovelSchema } from '@/lib/preproduction'
+import { saveNovelSchema } from '@/lib/preproduction'
 
 export async function PUT(
   request: Request,
@@ -17,8 +17,8 @@ export async function PUT(
     const existing = await prisma.novelSource.findUnique({ where: { projectId } })
     const changed = !existing || existing.title !== body.title || existing.content !== body.content
 
-    await prisma.$transaction(async (tx) => {
-      await tx.novelSource.upsert({
+    const novel = await prisma.$transaction(async (tx) => {
+      const saved = await tx.novelSource.upsert({
         where: { projectId },
         create: { projectId, title: body.title, content: body.content },
         update: { title: body.title, content: body.content },
@@ -26,8 +26,18 @@ export async function PUT(
       if (changed) {
         await tx.scriptEpisode.updateMany({ where: { projectId }, data: { locked: false } })
       }
+      return saved
     })
 
-    return NextResponse.json(await getPreproductionData(projectId))
+    return NextResponse.json({
+      novel: {
+        id: novel.id,
+        projectId: novel.projectId,
+        title: novel.title,
+        content: novel.content,
+        updatedAt: novel.updatedAt.toISOString(),
+      },
+      changed,
+    })
   })
 }

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   buildImagesGenerationRequestBody,
+  buildResponsesImageInput,
   extractImageOutputs,
   extractImageOutputFromSSEText,
   generateImageViaOpenAICompat,
@@ -31,6 +32,19 @@ describe('image failure recovery', () => {
 })
 
 describe('buildImagesGenerationRequestBody', () => {
+  it('builds multimodal Responses input for connected canvas references', () => {
+    expect(buildResponsesImageInput({
+      prompt: 'Keep the same character and change the costume.',
+      referenceImages: [{ dataUrl: 'data:image/png;base64,AAAA' }],
+    })).toEqual([{
+      role: 'user',
+      content: [
+        expect.objectContaining({ type: 'input_text' }),
+        { type: 'input_image', image_url: 'data:image/png;base64,AAAA' },
+      ],
+    }])
+  })
+
   it('uses low-latency image options', () => {
     expect(buildImagesGenerationRequestBody({
       model: 'gpt-image-2',

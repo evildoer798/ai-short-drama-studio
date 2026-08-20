@@ -132,18 +132,13 @@ export function buildDefaultPrompt(input: {
   name: string
   description: string
 }) {
-  const typeLabel = {
-    [AssetType.character]: 'character design',
-    [AssetType.location]: 'location design',
-    [AssetType.prop]: 'prop design',
+  const directive = {
+    [AssetType.character]: '白色背景人物设定板，正面、侧面、背面全身三视图，面部与服装细节清晰。',
+    [AssetType.location]: '电影级场景设定图，前中后景、材质、光源、色调、焦段、光圈和景深清晰。',
+    [AssetType.prop]: '干净背景道具设定板，完整轮廓、尺寸、材质、正侧背视图和关键局部清晰。',
   }[input.type]
 
-  return [
-    `Create a polished ${typeLabel} for an AI short drama.`,
-    `Name: ${input.name}.`,
-    `Description: ${input.description}.`,
-    'Cinematic composition, clear visual identity, production-ready concept art.',
-  ].join(' ')
+  return `资产名称：${input.name}。${input.description}。${directive}构图准确，主体清晰，真实材质与自然光影。`
 }
 
 export function assetImageUrl(mediaId: string) {

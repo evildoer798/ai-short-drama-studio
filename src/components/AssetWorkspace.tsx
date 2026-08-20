@@ -1,11 +1,13 @@
 'use client'
 
-import { DragEvent, FormEvent, SyntheticEvent, useEffect, useMemo, useRef, useState } from 'react'
+import { DragEvent, FormEvent, SyntheticEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import {
   ArrowRight,
   BookOpenText,
   Box,
   Boxes,
+  Camera,
   Check,
   ChevronRight,
   CircleAlert,
@@ -14,6 +16,7 @@ import {
   Film,
   GripVertical,
   House,
+  History,
   ImageIcon,
   Layers3,
   ListVideo,
@@ -23,6 +26,7 @@ import {
   PackageOpen,
   Plus,
   RefreshCw,
+  RotateCcw,
   Save,
   Search,
   Settings2,
@@ -35,19 +39,41 @@ import {
   WandSparkles,
   X,
 } from 'lucide-react'
+import { readableVideoTaskError } from '@/lib/video-prompt-safety'
+import {
+  previousStoryboardInSequence,
+  shouldUsePreviousTailFrame,
+} from '@/lib/storyboard-continuity'
+import { captureVideoTailFrame } from '@/lib/video-tail-frame'
 import { splitAssetHighlights } from '@/lib/asset-highlights'
+import {
+  activeStoryboardAssetMention,
+  insertStoryboardAssetMention,
+  removeStoryboardAssetMention,
+  replaceActiveStoryboardAssetMention,
+  type ActiveStoryboardAssetMention,
+} from '@/lib/storyboard-asset-mentions'
 import { readableTextTaskError } from '@/lib/text-task-error'
 import {
   estimateVideoGenerationSeconds,
   fitVideoGroupDurations,
   normalizeVideoDuration,
+  videoDurationOptions,
 } from '@/lib/video-batch'
+import { DEFAULT_VIDEO_MODEL_ID, DEFAULT_VIDEO_RESOLUTION } from '@/lib/video-defaults'
 import { PreproductionWorkspace, type PreproductionSummary } from './PreproductionWorkspace'
+import { CharacterPerformanceProfilesPanel, ShotPerformancePanel } from './ActingDirectorPanels'
+import { VideoModelSelectOptions } from './VideoModelSelectOptions'
+import {
+  planVideoReferences,
+  REFERENCE_MONTAGE_IMAGES_PER_VIDEO,
+} from '@/lib/video-reference-plan'
 
 type AssetType = 'character' | 'location' | 'prop'
-type VisualStyle = 'photorealistic' | 'anime_2d' | 'anime_3d' | 'chibi'
+type VisualStyle = 'photorealistic' | 'overseas_live_action' | 'anime_2d' | 'anime_3d' | 'chibi'
 type TaskStatus = 'queued' | 'processing' | 'completed' | 'failed'
 type WorkspaceView = 'script' | 'assetPlan' | 'shotPlan' | 'assets' | 'storyboards' | 'videos'
+type VideoGenerationPhase = 'saving' | 'capturing_tail' | 'submitting' | 'queued'
 
 type StyleOption = {
   id: VisualStyle
@@ -110,13 +136,13 @@ type TaskRecord = {
   createdAt?: string
 }
 
-type VideoResolution = '480p' | '720p'
+type VideoResolution = '480p' | '720p' | '1080p'
 type StoryboardAspectRatio = '16:9' | '9:16' | '1:1' | '21:9' | '3:4' | '4:3'
 
 type VideoModelOption = {
   id: string
   label: string
-  family: 'Grok' | 'Seedance'
+  family: 'Grok' | 'Seedance' | 'Sora' | 'HappyHouse'
   description: string
   priceLabel: string
   priceMode: 'flat' | 'per_second'
@@ -127,11 +153,13 @@ type VideoModelOption = {
   maximumDuration: number
   supportedDurations: number[] | null
   maximumReferenceImages: number
+  maximumReferenceVideos?: number
   maximumPromptCharacters: number
   supportsAudio: boolean
   resolutions: VideoResolution[]
   defaultResolution: VideoResolution
   aspectRatios: StoryboardAspectRatio[]
+  supportsHumanFaceReferences: boolean
   available: boolean | null
 }
 
@@ -152,6 +180,7 @@ type StoryboardAssetReference = {
   type: AssetType
   referenceOrder: number
   matchReason: string
+  isManual?: boolean
   highlightTerms: string[]
   hasSelectedImage: boolean
   imageUrl: string | null
@@ -160,6 +189,8 @@ type StoryboardAssetReference = {
 type StoryboardVideo = {
   id: string
   mediaId: string
+  tailFrameMediaId: string | null
+  tailFrameUrl: string | null
   name: string
   url: string
   downloadUrl: string
@@ -167,10 +198,18 @@ type StoryboardVideo = {
   model: string
   duration: number
   sourceStoryboardIds: string[]
+  sourceStoryboardNumbers?: number[]
   aspectRatio: string
   resolution: VideoResolution
   isSelected: boolean
   createdAt: string
+}
+
+type VideoLibraryEntry = {
+  project: { id: string; name: string }
+  storyboard: Pick<StoryboardRecord,
+    'id' | 'projectId' | 'episodeSceneNumber' | 'episode' | 'title' | 'sceneNumber'>
+  video: StoryboardVideo
 }
 
 type StoryboardRecord = {
@@ -185,6 +224,8 @@ type StoryboardRecord = {
   notes: string | null
   imagePrompt: string | null
   videoPrompt: string | null
+  continuityIn: unknown | null
+  continuityOut: unknown | null
   duration: number
   aspectRatio: StoryboardAspectRatio
   generateAudio: boolean
@@ -195,11 +236,23 @@ type StoryboardRecord = {
   latestTask: TaskRecord | null
 }
 
+type StoryboardRevisionRecord = {
+  id: string
+  source: string
+  reason: string | null
+  contentHash: string
+  createdAt: string
+  title: string
+  duration: number
+  promptPreview: string
+}
+
 type WorkspaceData = {
   projects: ProjectOption[]
   activeProjectId: string | null
   assets: AssetRecord[]
   storyboards: StoryboardRecord[]
+  videoLibrary: VideoLibraryEntry[]
   styleOptions: StyleOption[]
 }
 
@@ -277,6 +330,10 @@ function imageFor(asset: AssetRecord) {
   return asset.selectedImageUrl || asset.images[0]?.url || null
 }
 
+function assetImageFor(asset: AssetRecord) {
+  return asset.images.find((image) => image.id === asset.selectedImageId) || asset.images[0] || null
+}
+
 function videoPriceEstimate(model: VideoModelOption, duration: number) {
   const amount = videoPriceAmount(model, duration)
   return `本次预计 ¥${amount.toFixed(2)}${model.startingAt ? ' 起' : ''}`
@@ -284,6 +341,38 @@ function videoPriceEstimate(model: VideoModelOption, duration: number) {
 
 function videoPriceAmount(model: VideoModelOption, duration: number) {
   return model.priceMode === 'per_second' ? model.unitPrice * duration : model.unitPrice
+}
+
+function usesLiveActionFaces(visualStyle: VisualStyle) {
+  return visualStyle === 'photorealistic' || visualStyle === 'overseas_live_action'
+}
+
+function prioritizeVideoReferenceAssets(
+  candidates: StoryboardAssetReference[],
+  limit: number,
+  omitLocations = false,
+) {
+  const maximum = Math.max(0, Math.floor(limit))
+  if (maximum === 0) return []
+  const ordered = [...candidates].sort((left, right) => left.referenceOrder - right.referenceOrder)
+  const characters = ordered.filter((asset) => asset.type === 'character')
+  const locations = omitLocations ? [] : ordered.filter((asset) => asset.type === 'location')
+  const props = ordered.filter((asset) => asset.type === 'prop')
+  if (maximum === 1) return (characters.length > 0 ? characters : props.length > 0 ? props : locations).slice(0, 1)
+  if (characters.length >= maximum) return characters.slice(0, maximum)
+
+  const remainingAfterCharacters = maximum - characters.length
+  const selectedProps = props.slice(0, remainingAfterCharacters)
+  const selected = [
+    ...characters,
+    ...selectedProps,
+    ...locations.slice(0, remainingAfterCharacters - selectedProps.length),
+  ]
+  if (selected.length < maximum) {
+    const selectedIds = new Set(selected.map((asset) => asset.id))
+    selected.push(...ordered.filter((asset) => !selectedIds.has(asset.id)).slice(0, maximum - selected.length))
+  }
+  return selected.slice(0, maximum)
 }
 
 function sourceStoryboardIdsForTask(task: TaskRecord) {
@@ -309,20 +398,6 @@ function formatModelRefreshTime(value: string | null) {
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return '尚未同步'
   return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-}
-
-function videoTaskErrorMessage(value: string | null | undefined) {
-  const error = value?.trim() || ''
-  if (/invalid_prompt[\s\S]*maximum length of 4096|Prompt exceeds the maximum length of 4096/iu.test(error)) {
-    return '视频提示词超过当前模型的 4096 字符限制。系统已更新自动压缩规则，请重新点击生成。失败请求没有进入生成阶段。'
-  }
-  if (/model grok-video not found/iu.test(error)) {
-    return '当前线路暂未提供所选 Grok 模型，请刷新模型列表后重新选择可用模型。'
-  }
-  if (/seconds must be one of:\s*6,\s*10,\s*15/iu.test(error)) {
-    return 'Grok 仅支持 6、10 或 15 秒。系统现已自动调整时长，请重新点击生成；本次失败未进入视频生成阶段。'
-  }
-  return error || '视频生成失败'
 }
 
 function directVideoUrl(source: string) {
@@ -419,38 +494,210 @@ function BufferedVideo({
 function HighlightedStoryboardPrompt({
   value,
   assets,
+  availableAssets,
   onChange,
+  onSelectAsset,
 }: {
   value: string
   assets: StoryboardAssetReference[]
+  availableAssets: AssetRecord[]
   onChange: (value: string) => void
+  onSelectAsset: (assetId: string, videoPrompt: string) => void
 }) {
   const mirrorRef = useRef<HTMLDivElement>(null)
-  const segments = useMemo(() => splitAssetHighlights(value, assets), [assets, value])
+  const markerRef = useRef<HTMLSpanElement>(null)
+  const inputRef = useRef<HTMLTextAreaElement>(null)
+  const [mention, setMention] = useState<ActiveStoryboardAssetMention | null>(null)
+  const [activeIndex, setActiveIndex] = useState(0)
+  const [menuPosition, setMenuPosition] = useState<{ left: number; top: number; width: number } | null>(null)
+  const linkedAssetIds = useMemo(() => new Set(assets.map((asset) => asset.id)), [assets])
+  const candidates = useMemo(() => {
+    const query = mention?.query.toLocaleLowerCase() || ''
+    const typeOrder: Record<AssetType, number> = { character: 0, location: 1, prop: 2 }
+    return availableAssets
+      .filter((asset) => asset.type === 'character' || asset.type === 'location' || asset.type === 'prop')
+      .filter((asset) => !query || [asset.name, asset.description, ...asset.tags]
+        .some((text) => text.toLocaleLowerCase().includes(query)))
+      .sort((left, right) => {
+        const leftLinked = linkedAssetIds.has(left.id) ? 0 : 1
+        const rightLinked = linkedAssetIds.has(right.id) ? 0 : 1
+        if (leftLinked !== rightLinked) return leftLinked - rightLinked
+        const leftStarts = query && left.name.toLocaleLowerCase().startsWith(query) ? 0 : 1
+        const rightStarts = query && right.name.toLocaleLowerCase().startsWith(query) ? 0 : 1
+        if (leftStarts !== rightStarts) return leftStarts - rightStarts
+        return typeOrder[left.type] - typeOrder[right.type] || left.name.localeCompare(right.name, 'zh-CN')
+      })
+      .slice(0, 8)
+  }, [availableAssets, linkedAssetIds, mention?.query])
+
+  function updateMention(input: HTMLTextAreaElement) {
+    const next = input.selectionStart === input.selectionEnd
+      ? activeStoryboardAssetMention(input.value, input.selectionStart)
+      : null
+    setMention(next)
+    setActiveIndex(0)
+  }
+
+  function renderSegments(text: string, keyPrefix: string) {
+    return splitAssetHighlights(text, assets).map((segment, index) => segment.assetId ? (
+      <mark
+        data-asset-type={segment.assetType}
+        key={`${keyPrefix}-${segment.assetId}-${index}`}
+      >{segment.text}</mark>
+    ) : <span key={`${keyPrefix}-text-${index}`}>{segment.text}</span>)
+  }
+
+  function updateMenuPosition() {
+    if (!mention || !markerRef.current) {
+      setMenuPosition(null)
+      return
+    }
+    const marker = markerRef.current.getBoundingClientRect()
+    const width = Math.min(360, Math.max(280, window.innerWidth - 24))
+    const estimatedHeight = Math.min(330, 76 + Math.max(1, candidates.length) * 58)
+    const opensBelow = window.innerHeight - marker.bottom >= estimatedHeight + 12
+    setMenuPosition({
+      left: Math.max(12, Math.min(marker.left, window.innerWidth - width - 12)),
+      top: opensBelow ? marker.bottom + 6 : Math.max(12, marker.top - estimatedHeight - 6),
+      width,
+    })
+  }
+
+  useLayoutEffect(() => {
+    updateMenuPosition()
+  }, [mention?.start, mention?.end, mention?.query, candidates.length, value])
+
+  useEffect(() => {
+    if (!mention) return
+    const reposition = () => updateMenuPosition()
+    window.addEventListener('resize', reposition)
+    window.addEventListener('scroll', reposition, true)
+    return () => {
+      window.removeEventListener('resize', reposition)
+      window.removeEventListener('scroll', reposition, true)
+    }
+  }, [mention, candidates.length])
+
+  function selectAsset(asset: AssetRecord) {
+    if (!mention) return
+    const result = replaceActiveStoryboardAssetMention({
+      prompt: value,
+      mention,
+      assetName: asset.name,
+    })
+    onChange(result.prompt)
+    setMention(null)
+    setMenuPosition(null)
+    onSelectAsset(asset.id, result.prompt)
+    window.requestAnimationFrame(() => {
+      inputRef.current?.focus()
+      inputRef.current?.setSelectionRange(result.cursor, result.cursor)
+    })
+  }
+
+  const menu = mention && menuPosition && typeof document !== 'undefined'
+    ? createPortal((
+      <div
+        id="asset-mention-options"
+        className="assetMentionPopover"
+        role="listbox"
+        aria-label="可引用的项目资产"
+        style={menuPosition}
+      >
+        <div className="assetMentionPopoverHeader">
+          <span><strong>@ 引用项目资产</strong><small>{mention.query ? `搜索“${mention.query}”` : '输入名称继续筛选'}</small></span>
+          <span>{candidates.length} 项</span>
+        </div>
+        {candidates.length > 0 ? (
+          <div className="assetMentionOptions">
+            {candidates.map((asset, index) => {
+              const preview = imageFor(asset)
+              const linked = linkedAssetIds.has(asset.id)
+              return (
+                <button
+                  id={`asset-mention-option-${asset.id}`}
+                  className={index === activeIndex ? 'active' : ''}
+                  type="button"
+                  role="option"
+                  aria-selected={index === activeIndex}
+                  key={asset.id}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onMouseEnter={() => setActiveIndex(index)}
+                  onClick={() => selectAsset(asset)}
+                >
+                  <span className="assetMentionThumbnail">
+                    {preview ? <img src={preview} alt="" /> : <TypeIcon type={asset.type} size={19} />}
+                  </span>
+                  <span className="assetMentionOptionCopy">
+                    <strong>@{asset.name}</strong>
+                    <small>{typeLabels[asset.type]} · {linked ? '已加入本镜，可再次引用' : '选择后加入本镜参考'}</small>
+                  </span>
+                  <span className={linked ? 'assetMentionStatus linked' : 'assetMentionStatus'}>{linked ? '已选' : '引用'}</span>
+                </button>
+              )
+            })}
+          </div>
+        ) : <div className="assetMentionEmpty">没有匹配的角色、场景或道具资产</div>}
+        <div className="assetMentionPopoverFooter"><span>↑↓ 选择</span><span>Enter 确认</span><span>Esc 关闭</span></div>
+      </div>
+    ), document.body)
+    : null
+
+  const mirrorPrefix = mention ? value.slice(0, mention.end) : value
+  const mirrorSuffix = mention ? value.slice(mention.end) : ''
 
   return (
     <div className="highlightedTextarea">
       <div className="highlightedTextareaMirror" ref={mirrorRef} aria-hidden="true">
-        {segments.map((segment, index) => segment.assetId ? (
-          <mark
-            data-asset-type={segment.assetType}
-            key={`${segment.assetId}-${index}`}
-          >{segment.text}</mark>
-        ) : <span key={`text-${index}`}>{segment.text}</span>)}
+        {renderSegments(mirrorPrefix, 'prefix')}
+        {mention ? <span className="assetMentionCaretMarker" ref={markerRef} /> : null}
+        {mirrorSuffix ? renderSegments(mirrorSuffix, 'suffix') : null}
         {value.endsWith('\n') ? '\u200b' : null}
       </div>
       <textarea
+        ref={inputRef}
         data-assistant-target="storyboard-prompt"
         value={value}
-        onChange={(event) => onChange(event.target.value)}
+        aria-autocomplete="list"
+        aria-controls={mention ? 'asset-mention-options' : undefined}
+        aria-expanded={Boolean(mention)}
+        aria-activedescendant={mention && candidates[activeIndex] ? `asset-mention-option-${candidates[activeIndex].id}` : undefined}
+        onChange={(event) => {
+          onChange(event.target.value)
+          updateMention(event.currentTarget)
+        }}
+        onFocus={(event) => updateMention(event.currentTarget)}
+        onSelect={(event) => updateMention(event.currentTarget)}
+        onBlur={() => setMention(null)}
+        onKeyDown={(event) => {
+          if (!mention || event.nativeEvent.isComposing) return
+          if (event.key === 'Escape') {
+            event.preventDefault()
+            setMention(null)
+            return
+          }
+          if (candidates.length === 0) return
+          if (event.key === 'ArrowDown') {
+            event.preventDefault()
+            setActiveIndex((index) => (index + 1) % candidates.length)
+          } else if (event.key === 'ArrowUp') {
+            event.preventDefault()
+            setActiveIndex((index) => (index - 1 + candidates.length) % candidates.length)
+          } else if (event.key === 'Enter' || event.key === 'Tab') {
+            event.preventDefault()
+            selectAsset(candidates[activeIndex])
+          }
+        }}
         onScroll={(event) => {
           if (!mirrorRef.current) return
           mirrorRef.current.scrollTop = event.currentTarget.scrollTop
           mirrorRef.current.scrollLeft = event.currentTarget.scrollLeft
+          updateMenuPosition()
         }}
-        placeholder="输入景别、机位、动作、对白，并直接使用资产名称"
+        placeholder="输入景别、机位、动作、对白；输入 @ 可引用带缩略图的项目资产"
         rows={15}
       />
+      {menu}
     </div>
   )
 }
@@ -462,6 +709,7 @@ function buildJenniferGuidance(input: {
   selectedAsset: AssetRecord | null
   assetTask?: TaskRecord
   storyboards: StoryboardRecord[]
+  videoLibraryCount: number
   selectedStoryboard: StoryboardRecord | null
   storyboardTask?: TaskRecord | null
   creatingStoryboard: boolean
@@ -709,7 +957,7 @@ function buildJenniferGuidance(input: {
   }
 
   if (input.view === 'videos') {
-    const videoCount = input.storyboards.reduce((total, storyboard) => total + storyboard.videos.length, 0)
+    const videoCount = input.videoLibraryCount
     return videoCount > 0 ? {
       key: `video-library-${videoCount}`,
       title: `视频库中共有 ${videoCount} 条视频`,
@@ -719,7 +967,7 @@ function buildJenniferGuidance(input: {
       key: 'video-library-empty',
       title: '先生成第一条分镜视频',
       detail: '视频生成完成后会自动进入这里，不需要额外合成或导入。',
-      warnings: ['视频库只展示当前项目的内容。', styleWarning],
+      warnings: ['视频库会汇总当前账号有权限访问的全部项目。', styleWarning],
       action: { id: 'open_storyboards', label: '进入分镜视频' },
     }
   }
@@ -729,7 +977,7 @@ function buildJenniferGuidance(input: {
       key: 'write-storyboard',
       title: '写下这一镜的画面与动作',
       detail: '输入景别、机位、动作、对白，并直接写出角色、场景和道具的资产名称。',
-      warnings: ['保存分镜后才会刷新资产识别结果。', '使用别名时，请写入资产名称括号，例如“陈蕊（Jessica）”。'],
+      warnings: ['创建分镜时只做一次初始识别；之后请通过 @资产自由增删。', '使用别名时，请写入资产名称括号，例如“陈蕊（Jessica）”。'],
       action: { id: 'focus_storyboard_prompt', label: '填写分镜提示词' },
     }
   }
@@ -910,6 +1158,7 @@ export function AssetWorkspace({
   const [activeProjectId, setActiveProjectId] = useState(initialData.activeProjectId)
   const [assets, setAssets] = useState(initialData.assets)
   const [storyboards, setStoryboards] = useState(initialData.storyboards)
+  const [videoLibrary, setVideoLibrary] = useState(initialData.videoLibrary)
   const [filterType, setFilterType] = useState<AssetType | 'all'>('all')
   const [query, setQuery] = useState('')
   const [selectedAssetId, setSelectedAssetId] = useState(initialData.assets[0]?.id || '')
@@ -932,7 +1181,7 @@ export function AssetWorkspace({
   const [toast, setToast] = useState<Toast | null>(null)
   const [assistantOpen, setAssistantOpen] = useState(true)
   const [videoModels, setVideoModels] = useState<VideoModelOption[]>([])
-  const [defaultVideoModel, setDefaultVideoModel] = useState('seedance-2.0-mini')
+  const [defaultVideoModel, setDefaultVideoModel] = useState(DEFAULT_VIDEO_MODEL_ID)
   const [videoPriceNotice, setVideoPriceNotice] = useState('实际扣费以模型广场为准。')
   const [videoModelsRefreshedAt, setVideoModelsRefreshedAt] = useState<string | null>(null)
   const [videoModelsRefreshing, setVideoModelsRefreshing] = useState(false)
@@ -955,6 +1204,20 @@ export function AssetWorkspace({
   useEffect(() => {
     setCustomStyleDraft(activeProject?.customStylePrompt || '')
   }, [activeProjectId, activeProject?.customStylePrompt])
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    if (params.get('view') !== 'storyboards') return
+    const storyboardId = params.get('storyboard') || ''
+    if (storyboardId && storyboards.some((storyboard) => storyboard.id === storyboardId)) {
+      setSelectedStoryboardId(storyboardId)
+      setCreatingStoryboard(false)
+    }
+    setView('storyboards')
+    window.history.replaceState({}, '', window.location.pathname)
+    // Initial navigation from the cross-project video library only.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   useEffect(() => {
     const stored = window.localStorage.getItem('jennifer-assistant-open')
@@ -1016,6 +1279,7 @@ export function AssetWorkspace({
       setActiveProjectId(data.activeProjectId)
       setAssets(data.assets)
       setStoryboards(data.storyboards)
+      setVideoLibrary(data.videoLibrary)
       setTasks((current) => {
         const nextTasks = { ...current }
         data.storyboards.forEach((storyboard) => {
@@ -1218,7 +1482,7 @@ export function AssetWorkspace({
       await refresh()
       setSelectedStoryboardId(payload.storyboard.id)
       setCreatingStoryboard(false)
-      showMessage('分镜已创建，资产匹配完成')
+      showMessage('分镜已创建并完成初始资产识别；之后可自由增删')
       return payload.storyboard
     } catch (error) {
       showMessage(error instanceof Error ? error.message : '创建分镜失败', 'error')
@@ -1231,15 +1495,64 @@ export function AssetWorkspace({
       const payload = await requestJson<{ storyboard: StoryboardRecord }>(`/api/storyboards/${storyboard.id}`, {
         method: 'PATCH',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(patch),
+        body: JSON.stringify({ ...patch, baseUpdatedAt: storyboard.updatedAt }),
       })
       setStoryboards((current) => current.map((item) => (
         item.id === storyboard.id ? payload.storyboard : item
       )))
-      showMessage('分镜已保存，资产匹配已更新')
+      showMessage('分镜已保存；本镜已选资产保持不变')
       return payload.storyboard
     } catch (error) {
       showMessage(error instanceof Error ? error.message : '保存分镜失败', 'error')
+      return null
+    }
+  }
+
+  async function updateStoryboardAssetLink(
+    storyboardId: string,
+    assetId: string,
+    action: 'add' | 'remove',
+    videoPrompt: string,
+  ) {
+    try {
+      const payload = await requestJson<{ storyboard: StoryboardRecord }>(
+        `/api/storyboards/${storyboardId}/assets${action === 'remove' ? `?assetId=${encodeURIComponent(assetId)}` : ''}`,
+        {
+          method: action === 'remove' ? 'DELETE' : 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ assetId, videoPrompt }),
+        },
+      )
+      setStoryboards((current) => current.map((item) => (
+        item.id === storyboardId ? payload.storyboard : item
+      )))
+      showMessage(action === 'add'
+        ? '已添加 @资产，并加入本镜视频参考'
+        : '已移除 @资产；生成时不会自动加回')
+      return payload.storyboard
+    } catch (error) {
+      showMessage(error instanceof Error ? error.message : '更新本镜资产失败', 'error')
+      return null
+    }
+  }
+
+  async function restoreStoryboardRevision(storyboard: StoryboardRecord, revisionId: string) {
+    try {
+      const payload = await requestJson<{ storyboard: StoryboardRecord }>(
+        `/api/storyboards/${storyboard.id}/revisions`,
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ revisionId }),
+        },
+      )
+      setStoryboards((current) => current.map((item) => (
+        item.id === storyboard.id ? payload.storyboard : item
+      )))
+      showMessage('已恢复分镜历史版本，恢复前的稿件也已留存')
+      return payload.storyboard
+    } catch (error) {
+      showMessage(error instanceof Error ? error.message : '恢复分镜版本失败', 'error')
       return null
     }
   }
@@ -1262,6 +1575,8 @@ export function AssetWorkspace({
     resolution: VideoResolution
     generateAudio: boolean
     model: string
+    continuityFrameMediaId?: string
+    continuitySourceVideoId?: string
   }, quiet = false): Promise<TaskRecord | null> {
     try {
       const payload = await requestJson<{ task: TaskRecord; reused?: boolean }>(
@@ -1302,6 +1617,29 @@ export function AssetWorkspace({
     }
   }
 
+  async function cancelVideoTask(task: TaskRecord): Promise<TaskRecord | null> {
+    try {
+      const payload = await requestJson<{
+        task: TaskRecord
+        cancelled: boolean
+        providerMayContinue?: boolean
+      }>(`/api/tasks/${task.id}/cancel`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ reason: '用户在分镜视频页取消生成。' }),
+      })
+      setTasks((current) => ({ ...current, [payload.task.id]: payload.task }))
+      await refresh()
+      showMessage(payload.providerMayContinue
+        ? '已停止等待并忽略该任务的生成结果'
+        : '视频生成已取消')
+      return payload.task
+    } catch (error) {
+      showMessage(error instanceof Error ? error.message : '取消视频生成失败', 'error')
+      return null
+    }
+  }
+
   async function selectVideo(storyboard: StoryboardRecord, video: StoryboardVideo) {
     try {
       await requestJson(`/api/storyboards/${storyboard.id}/select-video`, {
@@ -1332,6 +1670,11 @@ export function AssetWorkspace({
           item.id === payload.video.id ? { ...item, name: payload.video.name } : item
         )),
       })))
+      setVideoLibrary((current) => current.map((entry) => (
+        entry.video.id === payload.video.id
+          ? { ...entry, video: { ...entry.video, name: payload.video.name } }
+          : entry
+      )))
       showMessage('视频名称已保存')
       return payload.video.name
     } catch (error) {
@@ -1366,6 +1709,7 @@ export function AssetWorkspace({
     selectedAsset,
     assetTask: selectedAssetTask,
     storyboards,
+    videoLibraryCount: videoLibrary.length,
     selectedStoryboard,
     storyboardTask: selectedStoryboardTask,
     creatingStoryboard,
@@ -1660,6 +2004,7 @@ export function AssetWorkspace({
             showMessage(task ? '资产已创建，生图任务已提交' : '资产已创建')
           }}
           onError={(message) => showMessage(message, 'error')}
+          onNotice={showMessage}
           onSave={saveAsset}
           onDelete={deleteAsset}
           onGenerate={generateImages}
@@ -1669,6 +2014,8 @@ export function AssetWorkspace({
         />
       ) : view === 'storyboards' ? (
         <StoryboardWorkspace
+          visualStyle={activeProject?.visualStyle || 'photorealistic'}
+          projectAssets={assets}
           storyboards={storyboards}
           selectedStoryboard={selectedStoryboard}
           selectedTask={selectedStoryboardTask}
@@ -1687,17 +2034,25 @@ export function AssetWorkspace({
           }}
           onCreate={createStoryboard}
           onSave={saveStoryboard}
+          onUpdateAssetLink={updateStoryboardAssetLink}
+          onRestoreRevision={restoreStoryboardRevision}
           onDelete={deleteStoryboard}
           onGenerate={generateVideo}
           onGenerateGroup={generateVideoGroup}
+          onCancelTask={cancelVideoTask}
           onSelectVideo={selectVideo}
           onNotice={showMessage}
         />
       ) : view === 'videos' ? (
         <VideoLibrary
-          storyboards={storyboards}
+          entries={videoLibrary}
+          activeProjectId={activeProjectId}
           onRename={renameVideo}
-          onOpenStoryboard={(storyboardId) => {
+          onOpenStoryboard={(projectId, storyboardId) => {
+            if (projectId && projectId !== activeProjectId) {
+              window.location.assign(`/projects/${projectId}?view=storyboards&storyboard=${storyboardId}`)
+              return
+            }
             setSelectedStoryboardId(storyboardId)
             setCreatingStoryboard(!storyboardId)
             setView('storyboards')
@@ -1720,27 +2075,28 @@ function formatSeconds(value: number) {
 }
 
 function VideoLibrary({
-  storyboards,
+  entries,
+  activeProjectId,
   onRename,
   onOpenStoryboard,
 }: {
-  storyboards: StoryboardRecord[]
+  entries: VideoLibraryEntry[]
+  activeProjectId: string | null
   onRename: (video: StoryboardVideo, name: string) => Promise<string | null>
-  onOpenStoryboard: (storyboardId: string) => void
+  onOpenStoryboard: (projectId: string, storyboardId: string) => void
 }) {
   const [query, setQuery] = useState('')
   const storyboardById = useMemo(
-    () => new Map(storyboards.map((storyboard) => [storyboard.id, storyboard])),
-    [storyboards],
+    () => new Map(entries.map((entry) => [entry.storyboard.id, entry.storyboard])),
+    [entries],
   )
-  const allEntries = useMemo(() => storyboards.flatMap((storyboard) => (
-    storyboard.videos.map((video) => ({ storyboard, video }))
-  )), [storyboards])
+  const allEntries = entries
   const normalizedQuery = query.trim().toLocaleLowerCase()
-  const filteredEntries = normalizedQuery ? allEntries.filter(({ storyboard, video }) => (
+  const filteredEntries = normalizedQuery ? allEntries.filter(({ project, storyboard, video }) => (
     [
       video.name,
       video.model,
+      project.name,
       storyboard.title,
       storyboard.episode?.title,
       storyboard.episode?.episodeNumber ? `第${storyboard.episode.episodeNumber}集` : '',
@@ -1749,15 +2105,19 @@ function VideoLibrary({
   const groups = useMemo(() => {
     const grouped = new Map<string, {
       key: string
+      projectId: string
+      projectName: string
       episodeNumber: number | null
       title: string
-      entries: Array<{ storyboard: StoryboardRecord; video: StoryboardVideo }>
+      entries: VideoLibraryEntry[]
     }>()
     for (const entry of filteredEntries) {
       const episode = entry.storyboard.episode
-      const key = episode?.id || 'unassigned'
+      const key = `${entry.project.id}:${episode?.id || 'unassigned'}`
       const existing = grouped.get(key) || {
         key,
+        projectId: entry.project.id,
+        projectName: entry.project.name,
         episodeNumber: episode?.episodeNumber || null,
         title: episode?.title || '未分集视频',
         entries: [],
@@ -1767,7 +2127,9 @@ function VideoLibrary({
     }
     return [...grouped.values()]
       .sort((left, right) => (
-        (left.episodeNumber ?? Number.MAX_SAFE_INTEGER) - (right.episodeNumber ?? Number.MAX_SAFE_INTEGER)
+        Number(right.projectId === activeProjectId) - Number(left.projectId === activeProjectId)
+        || left.projectName.localeCompare(right.projectName, 'zh-CN')
+        || (left.episodeNumber ?? Number.MAX_SAFE_INTEGER) - (right.episodeNumber ?? Number.MAX_SAFE_INTEGER)
       ))
       .map((group) => ({
         ...group,
@@ -1777,15 +2139,16 @@ function VideoLibrary({
           || right.video.createdAt.localeCompare(left.video.createdAt)
         )),
       }))
-  }, [filteredEntries])
+  }, [activeProjectId, filteredEntries])
   const totalDuration = allEntries.reduce((total, entry) => total + entry.video.duration, 0)
+  const projectCount = new Set(allEntries.map((entry) => entry.project.id)).size
 
   return (
     <section className="videoLibraryWorkspace" tabIndex={-1}>
       <header className="videoLibraryHeader">
         <div>
           <span><ListVideo size={19} /><strong>视频库</strong></span>
-          <small>{allEntries.length} 条视频 · 总时长 {formatSeconds(totalDuration)}</small>
+          <small>{allEntries.length} 条视频 · {projectCount} 个项目 · 总时长 {formatSeconds(totalDuration)}</small>
         </div>
         <label className="videoLibrarySearch">
           <Search size={16} aria-hidden="true" />
@@ -1806,9 +2169,9 @@ function VideoLibrary({
       {allEntries.length === 0 ? (
         <div className="videoLibraryEmpty">
           <Film size={32} />
-          <strong>当前项目还没有生成视频</strong>
-          <span>完成任意分镜视频任务后，视频会自动保存在这里。</span>
-          <button className="primaryButton compact" type="button" onClick={() => onOpenStoryboard('')}>
+          <strong>当前账号还没有生成视频</strong>
+          <span>完成任意项目的分镜视频任务后，视频都会自动保存在这里。</span>
+          <button className="primaryButton compact" type="button" onClick={() => onOpenStoryboard(activeProjectId || '', '')}>
             <Film size={16} />进入分镜视频
           </button>
         </div>
@@ -1825,17 +2188,18 @@ function VideoLibrary({
               <summary>
                 <ChevronRight size={17} />
                 <span>
-                  <strong>{group.episodeNumber ? `第 ${group.episodeNumber} 集` : '未分集'}</strong>
-                  <small>{group.title}</small>
+                  <strong>{group.projectName}</strong>
+                  <small>{group.episodeNumber ? `第 ${group.episodeNumber} 集 · ${group.title}` : '未分集视频'}</small>
                 </span>
                 <b>{group.entries.length} 条</b>
               </summary>
               <div className="videoLibraryList">
-                {group.entries.map(({ storyboard, video }) => (
+                {group.entries.map(({ project, storyboard, video }) => (
                   <VideoLibraryItem
                     key={video.id}
                     storyboard={storyboard}
                     video={video}
+                    projectId={project.id}
                     storyboardById={storyboardById}
                     onRename={onRename}
                     onOpenStoryboard={onOpenStoryboard}
@@ -1853,15 +2217,17 @@ function VideoLibrary({
 function VideoLibraryItem({
   storyboard,
   video,
+  projectId,
   storyboardById,
   onRename,
   onOpenStoryboard,
 }: {
-  storyboard: StoryboardRecord
+  storyboard: VideoLibraryEntry['storyboard']
   video: StoryboardVideo
-  storyboardById: Map<string, StoryboardRecord>
+  projectId: string
+  storyboardById: Map<string, VideoLibraryEntry['storyboard']>
   onRename: (video: StoryboardVideo, name: string) => Promise<string | null>
-  onOpenStoryboard: (storyboardId: string) => void
+  onOpenStoryboard: (projectId: string, storyboardId: string) => void
 }) {
   const [draft, setDraft] = useState(video.name)
   const [saving, setSaving] = useState(false)
@@ -1875,8 +2241,10 @@ function VideoLibraryItem({
     const source = storyboardById.get(id)
     return source ? [source] : []
   })
-  const sourceNumbers = (sourceStoryboards.length ? sourceStoryboards : [storyboard])
-    .map((source) => source.episodeSceneNumber || source.sceneNumber)
+  const sourceNumbers = (video.sourceStoryboardNumbers?.length
+    ? video.sourceStoryboardNumbers
+    : (sourceStoryboards.length ? sourceStoryboards : [storyboard])
+      .map((source) => source.episodeSceneNumber || source.sceneNumber))
     .join('、')
   const createdAt = new Date(video.createdAt)
   const createdLabel = Number.isNaN(createdAt.getTime())
@@ -1960,7 +2328,7 @@ function VideoLibraryItem({
         </div>
 
         <div className="videoLibraryActions">
-          <button className="quietButton compact" type="button" onClick={() => onOpenStoryboard(storyboard.id)}>
+          <button className="quietButton compact" type="button" onClick={() => onOpenStoryboard(projectId, storyboard.id)}>
             <Film size={15} />查看分镜
           </button>
           <a className="primaryButton compact" href={video.downloadUrl} download={downloadName}>
@@ -1987,6 +2355,7 @@ function AssetLibrary({
   onRefresh,
   onCreated,
   onError,
+  onNotice,
   onSave,
   onDelete,
   onGenerate,
@@ -2008,18 +2377,22 @@ function AssetLibrary({
   onRefresh: () => void
   onCreated: (asset: AssetRecord, task: TaskRecord | null) => Promise<void>
   onError: (message: string) => void
+  onNotice: (message: string, tone?: Toast['tone']) => void
   onSave: (asset: AssetRecord, patch: Partial<AssetRecord> & { tags?: string[] }) => Promise<void>
   onDelete: (asset: AssetRecord) => Promise<void>
   onGenerate: (asset: AssetRecord, prompt?: string) => Promise<void>
   onUploadImage: (asset: AssetRecord, file: File) => Promise<boolean>
   onGenerateAll: () => Promise<void>
   onSelectImage: (asset: AssetRecord, image: AssetImage) => Promise<void>
-}) {
+  }) {
   const [form, setForm] = useState({
     type: 'character' as AssetType,
     prompt: '',
   })
   const [submitting, setSubmitting] = useState(false)
+  const generatingAssetCount = assets.filter((asset) => (
+    asset.latestTask?.status === 'queued' || asset.latestTask?.status === 'processing'
+  )).length
 
   async function createAsset(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -2074,7 +2447,7 @@ function AssetLibrary({
               data-assistant-target="asset-prompt"
               value={form.prompt}
               onChange={(event) => setForm((current) => ({ ...current, prompt: event.target.value }))}
-              rows={16}
+              rows={10}
               placeholder={assetPromptPlaceholders[form.type]}
               required
             />
@@ -2087,63 +2460,90 @@ function AssetLibrary({
       </aside>
 
       <section className="assetBrowser">
-        <div className="browserToolbar">
-          <div className="searchBox">
-            <Search size={16} />
-            <input
-              value={query}
-              onChange={(event) => onQuery(event.target.value)}
-              placeholder="搜索资产"
-            />
+        <div className="assetBrowserChrome">
+          <div className="assetBrowserHeading">
+            <span>
+              <span className="assetBrowserHeadingIcon"><Layers3 size={16} /></span>
+              <span>
+                <strong>项目资产</strong>
+                <small>当前显示 {assets.length} 项，选择卡片后在右侧编辑</small>
+              </span>
+            </span>
+            <span className={`assetBrowserStatus ${generatingAssetCount > 0 ? 'busy' : ''}`} role="status">
+              {generatingAssetCount > 0 ? <Loader2 className="spin" size={14} /> : <Check size={14} />}
+              {generatingAssetCount > 0 ? `${generatingAssetCount} 项生成中` : '资产已同步'}
+            </span>
           </div>
-          <div className="filterTabs">
-            {(['all', ...typeOptions] as Array<AssetType | 'all'>).map((type) => (
-              <button
-                key={type}
-                className={filterType === type ? 'active' : ''}
-                type="button"
-                onClick={() => onFilterType(type)}
-              >
-                {typeLabels[type]}
-              </button>
-            ))}
+          <div className="browserToolbar">
+            <div className="searchBox">
+              <Search size={16} />
+              <input
+                value={query}
+                onChange={(event) => onQuery(event.target.value)}
+                placeholder="搜索资产"
+              />
+            </div>
+            <div className="filterTabs">
+              {(['all', ...typeOptions] as Array<AssetType | 'all'>).map((type) => (
+                <button
+                  key={type}
+                  className={filterType === type ? 'active' : ''}
+                  type="button"
+                  onClick={() => onFilterType(type)}
+                >
+                  {typeLabels[type]}
+                </button>
+              ))}
+            </div>
+            <button
+              className="quietButton batchAssetButton"
+              type="button"
+              disabled={batchSubmitting || !activeProjectId}
+              onClick={() => void onGenerateAll()}
+            >
+              {batchSubmitting ? <Loader2 className="spin" size={16} /> : <Sparkles size={16} />}
+              {batchSubmitting ? '正在统一入队' : '一键生成全部资产'}
+            </button>
+            <button className="iconButton" onClick={onRefresh} title="刷新" type="button">
+              {loading ? <Loader2 className="spin" size={17} /> : <RefreshCw size={17} />}
+            </button>
           </div>
-          <button
-            className="quietButton batchAssetButton"
-            type="button"
-            disabled={batchSubmitting || !activeProjectId}
-            onClick={() => void onGenerateAll()}
-          >
-            {batchSubmitting ? <Loader2 className="spin" size={16} /> : <Sparkles size={16} />}
-            {batchSubmitting ? '正在统一入队' : '一键生成全部资产'}
-          </button>
-          <button className="iconButton" onClick={onRefresh} title="刷新" type="button">
-            {loading ? <Loader2 className="spin" size={17} /> : <RefreshCw size={17} />}
-          </button>
         </div>
 
         {assets.length > 0 ? (
           <div className="assetGrid">
             {assets.map((asset) => {
               const image = imageFor(asset)
+              const downloadableImage = assetImageFor(asset)
               const generating = asset.latestTask?.status === 'queued' || asset.latestTask?.status === 'processing'
               return (
-                <button
-                  key={asset.id}
-                  className={`assetTile ${selectedAsset?.id === asset.id ? 'selected' : ''}`}
-                  onClick={() => onSelect(asset.id)}
-                  type="button"
-                >
-                  <span className="assetThumb">
-                    {image ? <img src={image} alt={asset.name} /> : <ImageIcon size={30} />}
-                    {generating ? <span className="assetGenerating"><Loader2 className="spin" size={14} />生成中</span> : null}
-                  </span>
-                  <span className="assetTileBody">
-                    <span className={`assetKind ${asset.type}`}><TypeIcon type={asset.type} size={13} />{typeLabels[asset.type]}</span>
-                    <strong title={asset.name}>{asset.name}</strong>
-                    <small>{asset.tags.slice(0, 2).join(' · ') || '未添加标签'}</small>
-                  </span>
-                </button>
+                <div className="assetTileShell" key={asset.id}>
+                  <button
+                    className={`assetTile ${selectedAsset?.id === asset.id ? 'selected' : ''}`}
+                    onClick={() => onSelect(asset.id)}
+                    type="button"
+                  >
+                    <span className="assetThumb">
+                      {image ? <img src={image} alt={asset.name} loading="lazy" decoding="async" /> : <ImageIcon size={30} />}
+                      {generating ? <span className="assetGenerating"><Loader2 className="spin" size={14} />生成中</span> : null}
+                    </span>
+                    <span className="assetTileBody">
+                      <span className={`assetKind ${asset.type}`}><TypeIcon type={asset.type} size={13} />{typeLabels[asset.type]}</span>
+                      <strong title={asset.name}>{asset.name}</strong>
+                      <small>{asset.tags.slice(0, 2).join(' · ') || '未添加标签'}</small>
+                    </span>
+                  </button>
+                  {downloadableImage ? (
+                    <a
+                      aria-label={`下载${asset.name}图片`}
+                      className="assetTileDownload"
+                      href={`/api/media/${encodeURIComponent(downloadableImage.mediaId)}?download=1`}
+                      title="下载图片"
+                    >
+                      <Download size={16} />
+                    </a>
+                  ) : null}
+                </div>
               )
             })}
           </div>
@@ -2160,6 +2560,7 @@ function AssetLibrary({
           <AssetDetail
             asset={selectedAsset}
             selectedTask={selectedTask}
+            onNotice={onNotice}
             onSave={onSave}
             onDelete={onDelete}
             onGenerate={onGenerate}
@@ -2177,6 +2578,7 @@ function AssetLibrary({
 function AssetDetail({
   asset,
   selectedTask,
+  onNotice,
   onSave,
   onDelete,
   onGenerate,
@@ -2185,6 +2587,7 @@ function AssetDetail({
 }: {
   asset: AssetRecord
   selectedTask?: TaskRecord
+  onNotice: (message: string, tone?: Toast['tone']) => void
   onSave: (asset: AssetRecord, patch: Partial<AssetRecord> & { tags?: string[] }) => Promise<void>
   onDelete: (asset: AssetRecord) => Promise<void>
   onGenerate: (asset: AssetRecord, prompt?: string) => Promise<void>
@@ -2201,9 +2604,11 @@ function AssetDetail({
   })
   const [saving, setSaving] = useState(false)
   const [uploading, setUploading] = useState(false)
+  const [submittingGeneration, setSubmittingGeneration] = useState(false)
   const uploadInputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
+    setSubmittingGeneration(false)
     setDraft({
       name: asset.name,
       type: asset.type,
@@ -2216,7 +2621,9 @@ function AssetDetail({
 
   const generating = selectedTask?.status === 'queued' || selectedTask?.status === 'processing'
   const retrying = generating && Boolean(selectedTask?.error)
+  const generationBusy = submittingGeneration || generating
   const mainImage = imageFor(asset)
+  const mainAssetImage = assetImageFor(asset)
 
   async function save() {
     setSaving(true)
@@ -2241,11 +2648,31 @@ function AssetDetail({
     input.value = ''
   }
 
+  async function generateImage() {
+    if (generationBusy) return
+    setSubmittingGeneration(true)
+    try {
+      await onGenerate(asset, draft.prompt)
+    } finally {
+      setSubmittingGeneration(false)
+    }
+  }
+
   return (
     <div className="detailStack">
       <div className="detailHeader">
         <span className={`assetKind ${asset.type}`}><TypeIcon type={asset.type} size={13} />{typeLabels[asset.type]}</span>
         <div className="detailActions">
+          {mainAssetImage ? (
+            <a
+              aria-label={`下载${asset.name}图片`}
+              className="iconButton"
+              href={`/api/media/${encodeURIComponent(mainAssetImage.mediaId)}?download=1`}
+              title="下载当前图片"
+            >
+              <Download size={17} />
+            </a>
+          ) : null}
           <button className="iconButton danger" onClick={() => void onDelete(asset)} title="删除资产" type="button">
             <Trash2 size={17} />
           </button>
@@ -2256,7 +2683,15 @@ function AssetDetail({
       </div>
 
       <div className="assetHeroPreview">
-        {mainImage ? <img src={mainImage} alt={asset.name} /> : <ImageIcon size={38} />}
+        {mainImage ? (
+          <img src={mainImage} alt={asset.name} decoding="async" fetchPriority="high" />
+        ) : (
+          <span className="assetHeroEmpty">
+            <ImageIcon size={38} />
+            <strong>{generationBusy ? '图片生成中' : '尚未生成'}</strong>
+            <small>{generationBusy ? '完成后会自动显示在这里' : '生成或上传一张资产图片'}</small>
+          </span>
+        )}
         {asset.selectedImageId ? <span className="selectedMark"><Check size={14} />主图</span> : null}
       </div>
 
@@ -2285,6 +2720,14 @@ function AssetDetail({
         <textarea value={draft.prompt} onChange={(event) => setDraft((current) => ({ ...current, prompt: event.target.value }))} rows={6} />
       </label>
 
+      {asset.type === 'character' ? (
+        <CharacterPerformanceProfilesPanel
+          assetId={asset.id}
+          characterName={asset.name}
+          onNotice={onNotice}
+        />
+      ) : null}
+
       <div className="assetImageActions">
         <input
           ref={uploadInputRef}
@@ -2306,12 +2749,18 @@ function AssetDetail({
         <button
           className="primaryButton"
           data-assistant-target="generate-image"
-          disabled={generating}
-          onClick={() => void onGenerate(asset, draft.prompt)}
+          disabled={generationBusy}
+          onClick={() => void generateImage()}
           type="button"
         >
-          {generating ? <Loader2 className="spin" size={17} /> : <Sparkles size={17} />}
-          {retrying ? '排队重试中' : generating ? '生成中' : '生成新图片'}
+          {generationBusy ? <Loader2 className="spin" size={17} /> : <Sparkles size={17} />}
+          {submittingGeneration
+            ? '正在提交'
+            : retrying
+              ? '自动重试中'
+              : generating
+                ? '生成中'
+                : selectedTask?.status === 'failed' ? '重新生成' : '生成新图片'}
         </button>
       </div>
 
@@ -2324,16 +2773,25 @@ function AssetDetail({
         <div className="sectionLabel"><strong>图片版本</strong><span>{asset.images.length}</span></div>
         <div className="imageStrip">
           {asset.images.map((image) => (
-            <button
-              key={image.id}
-              className={`variantButton ${image.isSelected ? 'chosen' : ''}`}
-              onClick={() => void onSelectImage(asset, image)}
-              title="设为主图"
-              type="button"
-            >
-              <img src={image.url} alt={`${asset.name} 版本 ${image.variant}`} />
-              {image.isSelected ? <span><Check size={14} /></span> : null}
-            </button>
+            <div className="variantItem" key={image.id}>
+              <button
+                className={`variantButton ${image.isSelected ? 'chosen' : ''}`}
+                onClick={() => void onSelectImage(asset, image)}
+                title="设为主图"
+                type="button"
+              >
+                <img src={image.url} alt={`${asset.name} 版本 ${image.variant}`} loading="lazy" decoding="async" />
+                {image.isSelected ? <span><Check size={14} /></span> : null}
+              </button>
+              <a
+                aria-label={`下载${asset.name}版本${image.variant}`}
+                className="variantDownloadButton"
+                href={`/api/media/${encodeURIComponent(image.mediaId)}?download=1`}
+                title="下载这个版本"
+              >
+                <Download size={14} />
+              </a>
+            </div>
           ))}
         </div>
       </div>
@@ -2342,6 +2800,8 @@ function AssetDetail({
 }
 
 function StoryboardWorkspace({
+  visualStyle,
+  projectAssets,
   storyboards,
   selectedStoryboard,
   selectedTask,
@@ -2357,12 +2817,17 @@ function StoryboardWorkspace({
   onSelect,
   onCreate,
   onSave,
+  onUpdateAssetLink,
+  onRestoreRevision,
   onDelete,
   onGenerate,
   onGenerateGroup,
+  onCancelTask,
   onSelectVideo,
   onNotice,
 }: {
+  visualStyle: VisualStyle
+  projectAssets: AssetRecord[]
   storyboards: StoryboardRecord[]
   selectedStoryboard: StoryboardRecord | null
   selectedTask?: TaskRecord | null
@@ -2385,6 +2850,8 @@ function StoryboardWorkspace({
     generateAudio: boolean
   }) => Promise<StoryboardRecord | null>
   onSave: (storyboard: StoryboardRecord, patch: Partial<StoryboardRecord>) => Promise<StoryboardRecord | null>
+  onUpdateAssetLink: (storyboardId: string, assetId: string, action: 'add' | 'remove', videoPrompt: string) => Promise<StoryboardRecord | null>
+  onRestoreRevision: (storyboard: StoryboardRecord, revisionId: string) => Promise<StoryboardRecord | null>
   onDelete: (storyboard: StoryboardRecord) => Promise<void>
   onGenerate: (storyboard: StoryboardRecord, settings: {
     duration: number
@@ -2392,6 +2859,8 @@ function StoryboardWorkspace({
     resolution: VideoResolution
     generateAudio: boolean
     model: string
+    continuityFrameMediaId?: string
+    continuitySourceVideoId?: string
   }, quiet?: boolean) => Promise<TaskRecord | null>
   onGenerateGroup: (storyboardIds: string[], settings: {
     duration: number
@@ -2399,6 +2868,7 @@ function StoryboardWorkspace({
     generateAudio?: boolean
     model: string
   }, quiet?: boolean) => Promise<TaskRecord | null>
+  onCancelTask: (task: TaskRecord) => Promise<TaskRecord | null>
   onSelectVideo: (storyboard: StoryboardRecord, video: StoryboardVideo) => Promise<void>
   onNotice: (text: string, tone?: Toast['tone']) => void
 }) {
@@ -2434,11 +2904,20 @@ function StoryboardWorkspace({
   const [batchIds, setBatchIds] = useState<string[]>([])
   const [batchModel, setBatchModel] = useState(defaultVideoModel)
   const [batchDuration, setBatchDuration] = useState(15)
-  const [batchResolution, setBatchResolution] = useState<VideoResolution>('720p')
+  const [batchResolution, setBatchResolution] = useState<VideoResolution>(DEFAULT_VIDEO_RESOLUTION)
   const [batchSubmitting, setBatchSubmitting] = useState(false)
   const [draggingStoryboardId, setDraggingStoryboardId] = useState<string | null>(null)
   const [dropActive, setDropActive] = useState(false)
   const selectedBatchModel = videoModels.find((model) => model.id === batchModel) || null
+  const batchRequiresHumanFaceReferences = usesLiveActionFaces(visualStyle) && storyboards.some((storyboard) => (
+    batchIds.includes(storyboard.id)
+    && storyboard.assets.some((asset) => asset.type === 'character' && asset.hasSelectedImage)
+  ))
+  const batchUsesTextOnlyCharacters = Boolean(
+    selectedBatchModel
+    && batchRequiresHumanFaceReferences
+    && !selectedBatchModel.supportsHumanFaceReferences,
+  )
 
   useEffect(() => {
     if (!selectedEpisodeKey) return
@@ -2483,12 +2962,10 @@ function StoryboardWorkspace({
     index > 0 && number !== storyboardNumbers[index - 1] + 1
   ))
   const mixedAspectRatios = new Set(batchStoryboards.map((storyboard) => storyboard.aspectRatio)).size > 1
-  const batchReferenceCount = new Set(batchStoryboards.flatMap((storyboard) => storyboard.assets
-    .filter((asset) => asset.hasSelectedImage && asset.type !== 'prop')
-    .map((asset) => asset.id))).size
   const unsupportedRatioCount = selectedBatchModel
     ? batchStoryboards.filter((storyboard) => !selectedBatchModel.aspectRatios.includes(storyboard.aspectRatio)).length
     : 0
+  const sourceBatchDuration = batchStoryboards.reduce((total, storyboard) => total + storyboard.duration, 0)
   const fittedBatch = fitVideoGroupDurations(
     batchStoryboards.map((storyboard) => storyboard.duration),
     selectedBatchModel?.maximumDuration || 15,
@@ -2497,12 +2974,18 @@ function StoryboardWorkspace({
     batchDuration,
   )
   const effectiveBatchDuration = batchStoryboards.length > 0 ? fittedBatch.duration : batchDuration
+  const batchDurationSteps = videoDurationOptions(
+    selectedBatchModel?.minimumDuration || 4,
+    selectedBatchModel?.maximumDuration || 15,
+    selectedBatchModel?.supportedDurations || null,
+  )
+  const batchDurationStepIndex = Math.max(0, batchDurationSteps.indexOf(batchDuration))
   const batchValidationError = batchStoryboards.length > 1 && batchStoryboards.some((storyboard) => !storyboard.episodeId)
     ? '组合视频只能使用同一集内已归档的分镜'
-    : nonContiguous ? '请拖入同一集内连续相邻的分镜'
+    : nonContiguous ? '请选择同一集内连续相邻的分镜'
       : mixedAspectRatios ? '同一条组合视频中的分镜必须使用相同画幅'
-        : batchReferenceCount > (selectedBatchModel?.maximumReferenceImages || 4)
-          ? `当前模型最多接收 ${selectedBatchModel?.maximumReferenceImages || 4} 张人物或场景参考图，请减少组合分镜或更换模型`
+        : sourceBatchDuration > (selectedBatchModel?.maximumDuration || 15)
+          ? `所选分镜原始时长共 ${sourceBatchDuration} 秒，超过当前模型的 ${(selectedBatchModel?.maximumDuration || 15)} 秒上限`
           : ''
   const batchPrice = selectedBatchModel
     ? videoPriceAmount(selectedBatchModel, effectiveBatchDuration)
@@ -2510,6 +2993,7 @@ function StoryboardWorkspace({
   const batchTime = selectedBatchModel
     ? estimateVideoGenerationSeconds(selectedBatchModel.family, effectiveBatchDuration)
     : { minimum: 0, maximum: 0 }
+
   const generatedVideoStoryboardIds = new Set(storyboards.flatMap((storyboard) => (
     storyboard.videos.flatMap((video) => video.sourceStoryboardIds?.length
       ? video.sourceStoryboardIds
@@ -2518,7 +3002,34 @@ function StoryboardWorkspace({
   const batchActionError = unsupportedRatioCount > 0
     ? `当前模型不支持其中 ${unsupportedRatioCount} 个分镜的画幅`
     : batchValidationError
-
+  const previousStoryboard = selectedStoryboard
+    ? previousStoryboardInSequence(storyboards, selectedStoryboard)
+    : previousStoryboardInSequence([
+        ...storyboards,
+        {
+          id: '__new_storyboard__',
+          projectId: storyboards[0]?.projectId || '',
+          episodeId: null,
+          episodeSceneNumber: null,
+          generatedByAI: false,
+          episode: null,
+          title: '',
+          sceneNumber: storyboards.length + 1,
+          notes: null,
+          imagePrompt: null,
+          videoPrompt: null,
+          continuityIn: null,
+          continuityOut: null,
+          duration: 15,
+          aspectRatio: '16:9',
+          generateAudio: true,
+          selectedVideoId: null,
+          updatedAt: '',
+          assets: [],
+          videos: [],
+          latestTask: null,
+        } satisfies StoryboardRecord,
+      ], { id: '__new_storyboard__' })
   function toggleEpisode(episodeKey: string) {
     setOpenEpisodeKeys((current) => current.includes(episodeKey)
       ? current.filter((key) => key !== episodeKey)
@@ -2576,7 +3087,7 @@ function StoryboardWorkspace({
     setBatchSubmitting(false)
     if (task) {
       setBatchIds([])
-      onNotice(`已提交 1 条组合视频，共包含 ${batchStoryboards.length} 个分镜`)
+      onNotice(`已提交 1 条 ${effectiveBatchDuration} 秒组合视频，共包含 ${batchStoryboards.length} 个分镜`)
     } else {
       onNotice('所选视频任务未能加入队列，请检查资产主图和提示词', 'error')
     }
@@ -2587,8 +3098,8 @@ function StoryboardWorkspace({
       <div className="batchVideoBar" aria-label="分镜组合视频生成">
         <div className="batchComposer">
           <div className="batchVideoSummary">
-            <span><ListVideo size={17} /><strong>分镜组合区</strong></span>
-            <small>{batchEpisode?.label || '从下方拖入分镜'} · {batchStoryboards.length}/4 镜</small>
+            <span><ListVideo size={17} /><strong>15 秒分镜组合区</strong></span>
+            <small>{batchEpisode?.label || '从下方拖入分镜'} · {batchStoryboards.length}/4 镜 · 场景可以不同</small>
           </div>
           <div
             className={`storyboardDropzone ${dropActive ? 'dragOver' : ''} ${batchStoryboards.length >= 4 ? 'full' : ''}`}
@@ -2607,7 +3118,7 @@ function StoryboardWorkspace({
             {batchStoryboards.length === 0 ? (
               <div className="dropzoneEmpty">
                 <GripVertical size={22} />
-                <span><strong>把分镜拖到这里</strong><small>同一集内最多 4 个连续分镜</small></span>
+                <span><strong>把相邻短分镜拖到这里</strong><small>同一集最多 4 镜，总时长不超过 15 秒，可跨场景</small></span>
               </div>
             ) : (
               <div className="batchStoryboardTokens">
@@ -2615,7 +3126,7 @@ function StoryboardWorkspace({
                   <div className="batchStoryboardToken" key={storyboard.id}>
                     <GripVertical size={15} />
                     <span>
-                      <strong>分镜 {String(storyboard.episodeSceneNumber || storyboard.sceneNumber).padStart(2, '0')}</strong>
+                      <strong>分镜 {String(storyboard.episodeSceneNumber || storyboard.sceneNumber).padStart(2, '0')} · {storyboard.duration}s</strong>
                       <small title={storyboard.title}>{storyboard.title}</small>
                     </span>
                     <button
@@ -2628,7 +3139,7 @@ function StoryboardWorkspace({
                 ))}
               </div>
             )}
-            <span className="batchSlotCount">{batchStoryboards.length}/4</span>
+            <span className="batchSlotCount">{sourceBatchDuration || 0}/15s</span>
           </div>
         </div>
 
@@ -2638,11 +3149,7 @@ function StoryboardWorkspace({
               视频模型
               <select value={batchModel} onChange={(event) => setBatchModel(event.target.value)}>
                 {videoModels.length === 0 ? <option value={batchModel}>正在读取模型…</option> : null}
-                {videoModels.map((model) => (
-                  <option key={model.id} value={model.id} disabled={model.available === false}>
-                    {model.label} · {model.priceLabel}{model.available === false ? '（不可用）' : ''}
-                  </option>
-                ))}
+                <VideoModelSelectOptions models={videoModels} />
               </select>
             </label>
             <button
@@ -2658,30 +3165,41 @@ function StoryboardWorkspace({
             <small title={videoPriceNotice}>
               {selectedBatchModel?.priceSource === 'live' ? '实时价' : '参考价'} · {formatModelRefreshTime(videoModelsRefreshedAt)}
             </small>
+            {batchUsesTextOnlyCharacters ? <small className="batchVideoError">保留音频，不上传人物脸图；人物将按文字设定生成。</small> : null}
           </div>
 
-          <div className="batchDurationControl">
+          <div className="batchDurationControl durationControl">
             <span>成片时长 <strong>{effectiveBatchDuration}s</strong></span>
-            {selectedBatchModel?.supportedDurations?.length ? (
-              <div className="ratioControl" aria-label="组合视频时长">
-                {selectedBatchModel.supportedDurations.map((duration) => (
-                  <button
-                    key={duration}
-                    type="button"
-                    className={batchDuration === duration ? 'active' : ''}
-                    onClick={() => setBatchDuration(duration)}
-                  >{duration}s</button>
-                ))}
-              </div>
-            ) : (
+            <div className="durationSlider">
               <input
                 type="range"
-                min={selectedBatchModel?.minimumDuration || 4}
-                max={selectedBatchModel?.maximumDuration || 15}
-                value={batchDuration}
-                onChange={(event) => setBatchDuration(Number(event.target.value))}
+                min={0}
+                max={Math.max(0, batchDurationSteps.length - 1)}
+                step={1}
+                value={batchDurationStepIndex}
+                aria-label="组合视频时长"
+                aria-valuetext={`${effectiveBatchDuration} 秒`}
+                onChange={(event) => {
+                  const duration = batchDurationSteps[Number(event.target.value)] || batchDurationSteps[0]
+                  setBatchDuration(duration)
+                }}
               />
-            )}
+              <div
+                className="durationScale"
+                style={{ gridTemplateColumns: `repeat(${batchDurationSteps.length}, minmax(0, 1fr))` }}
+                aria-hidden="true"
+              >
+                {batchDurationSteps.map((duration) => (
+                  <span className={duration === effectiveBatchDuration ? 'active' : ''} key={duration}>
+                    {duration === batchDuration
+                      || duration === batchDurationSteps[0]
+                      || duration === batchDurationSteps[batchDurationSteps.length - 1]
+                      ? `${duration}s`
+                      : ''}
+                  </span>
+                ))}
+              </div>
+            </div>
           </div>
 
           <label className="batchResolutionControl">
@@ -2691,7 +3209,7 @@ function StoryboardWorkspace({
               onChange={(event) => setBatchResolution(event.target.value as VideoResolution)}
             >
               {(selectedBatchModel?.resolutions || [batchResolution]).map((resolution) => (
-                <option key={resolution} value={resolution}>{resolution === '720p' ? 'HD 720p' : '标准 480p'}</option>
+                <option key={resolution} value={resolution}>{resolution === '1080p' ? 'Full HD 1080p' : resolution === '720p' ? 'HD 720p' : '标准 480p'}</option>
               ))}
             </select>
           </label>
@@ -2751,10 +3269,10 @@ function StoryboardWorkspace({
                 {open ? (
                   <div className="episodeStoryboardList" id={contentId}>
                     <div className="batchSelectionRow">
-                      <span><GripVertical size={14} />拖动分镜到上方组合区，也可以勾选加入</span>
+                      <span><GripVertical size={14} />拖动或勾选相邻分镜，可跨场景组合</span>
                       {selectedCount > 0 ? (
                         <button className="quietButton compact" type="button" onClick={() => setBatchIds([])}>清空组合</button>
-                      ) : <span>最多 4 镜</span>}
+                      ) : <span>最多 4 镜 / 15 秒</span>}
                     </div>
                     <div className="sceneList">
                       {group.storyboards.map((storyboard) => {
@@ -2763,8 +3281,8 @@ function StoryboardWorkspace({
                         const status = active || task?.status === 'queued' || task?.status === 'processing'
                           ? '生成中'
                           : task?.status === 'failed'
-                            ? '失败'
-                            : generatedVideoStoryboardIds.has(storyboard.id) ? '已出片' : '草稿'
+                              ? /VIDEO_TASK_CANCELLED/iu.test(task.error || '') ? '已取消' : '失败'
+                              : generatedVideoStoryboardIds.has(storyboard.id) ? '已出片' : '草稿'
                         const hasPrompt = Boolean(storyboard.videoPrompt?.trim())
                         const hasReference = storyboard.assets.some((asset) => asset.hasSelectedImage)
                         const selectable = hasPrompt && hasReference && !active
@@ -2790,7 +3308,7 @@ function StoryboardWorkspace({
                             <span className={`sceneDragHandle ${selectable ? '' : 'disabled'}`} title={unavailableReason || '拖到上方组合区'}>
                               <GripVertical size={15} />
                             </span>
-                            <label className="sceneBatchCheck" title={unavailableReason || '加入组合视频队列'}>
+                            <label className="sceneBatchCheck" title={unavailableReason || '加入组合视频'}>
                               <input
                                 type="checkbox"
                                 checked={batchIds.includes(storyboard.id)}
@@ -2823,6 +3341,9 @@ function StoryboardWorkspace({
       <StoryboardEditor
         key={creating ? 'new' : selectedStoryboard?.id || 'empty'}
         storyboard={creating ? null : selectedStoryboard}
+        projectAssets={projectAssets}
+        previousStoryboard={previousStoryboard}
+        visualStyle={visualStyle}
         selectedTask={creating ? null : selectedTask}
         videoModels={videoModels}
         defaultVideoModel={defaultVideoModel}
@@ -2831,9 +3352,13 @@ function StoryboardWorkspace({
         onCancelCreate={() => onCreating(false)}
         onCreate={onCreate}
         onSave={onSave}
+        onUpdateAssetLink={onUpdateAssetLink}
+        onRestoreRevision={onRestoreRevision}
         onDelete={onDelete}
         onGenerate={onGenerate}
+        onCancelTask={onCancelTask}
         onSelectVideo={onSelectVideo}
+        onNotice={onNotice}
       />
     </section>
   )
@@ -2841,6 +3366,9 @@ function StoryboardWorkspace({
 
 function StoryboardEditor({
   storyboard,
+  projectAssets,
+  previousStoryboard,
+  visualStyle,
   selectedTask,
   videoModels,
   defaultVideoModel,
@@ -2849,11 +3377,18 @@ function StoryboardEditor({
   onCancelCreate,
   onCreate,
   onSave,
+  onUpdateAssetLink,
+  onRestoreRevision,
   onDelete,
   onGenerate,
+  onCancelTask,
   onSelectVideo,
+  onNotice,
 }: {
   storyboard: StoryboardRecord | null
+  projectAssets: AssetRecord[]
+  previousStoryboard: StoryboardRecord | null
+  visualStyle: VisualStyle
   selectedTask?: TaskRecord | null
   videoModels: VideoModelOption[]
   defaultVideoModel: string
@@ -2869,6 +3404,8 @@ function StoryboardEditor({
     generateAudio: boolean
   }) => Promise<StoryboardRecord | null>
   onSave: (storyboard: StoryboardRecord, patch: Partial<StoryboardRecord>) => Promise<StoryboardRecord | null>
+  onUpdateAssetLink: (storyboardId: string, assetId: string, action: 'add' | 'remove', videoPrompt: string) => Promise<StoryboardRecord | null>
+  onRestoreRevision: (storyboard: StoryboardRecord, revisionId: string) => Promise<StoryboardRecord | null>
   onDelete: (storyboard: StoryboardRecord) => Promise<void>
   onGenerate: (storyboard: StoryboardRecord, settings: {
     duration: number
@@ -2876,8 +3413,12 @@ function StoryboardEditor({
     resolution: VideoResolution
     generateAudio: boolean
     model: string
+    continuityFrameMediaId?: string
+    continuitySourceVideoId?: string
   }, quiet?: boolean) => Promise<TaskRecord | null>
+  onCancelTask: (task: TaskRecord) => Promise<TaskRecord | null>
   onSelectVideo: (storyboard: StoryboardRecord, video: StoryboardVideo) => Promise<void>
+  onNotice: (text: string, tone?: Toast['tone']) => void
 }) {
   const [draft, setDraft] = useState({
     title: storyboard?.title || `分镜 ${nextSceneNumber}`,
@@ -2885,22 +3426,151 @@ function StoryboardEditor({
     notes: storyboard?.notes || '',
     duration: storyboard?.duration || 15,
     aspectRatio: storyboard?.aspectRatio || '16:9' as StoryboardAspectRatio,
-    resolution: '720p' as VideoResolution,
+    resolution: DEFAULT_VIDEO_RESOLUTION as VideoResolution,
     generateAudio: storyboard?.generateAudio ?? true,
-    model: selectedTask?.model || defaultVideoModel,
+    model: selectedTask && (selectedTask.status === 'queued' || selectedTask.status === 'processing')
+      ? selectedTask.model || defaultVideoModel
+      : defaultVideoModel,
   })
   const [saving, setSaving] = useState(false)
+  const [revisionOpen, setRevisionOpen] = useState(false)
+  const [revisionLoading, setRevisionLoading] = useState(false)
+  const [revisions, setRevisions] = useState<StoryboardRevisionRecord[]>([])
+  const [assetPickerOpen, setAssetPickerOpen] = useState(false)
+  const [assetPickerQuery, setAssetPickerQuery] = useState('')
+  const [assetLinkBusyId, setAssetLinkBusyId] = useState<string | null>(null)
+  const [generationPhase, setGenerationPhase] = useState<VideoGenerationPhase | null>(null)
+  const [cancellingGeneration, setCancellingGeneration] = useState(false)
+  const generationLockRef = useRef(false)
+  const previousSelectedVideo = previousStoryboard?.videos.find((video) => (
+    video.id === previousStoryboard.selectedVideoId
+  )) || null
+  const spatialContinuity = Boolean(
+    storyboard
+    && previousStoryboard
+    && previousSelectedVideo
+    && shouldUsePreviousTailFrame(previousStoryboard, storyboard),
+  )
+  const [inheritPrevious, setInheritPrevious] = useState(spatialContinuity)
+  const [continuityFrame, setContinuityFrame] = useState(() => previousSelectedVideo?.tailFrameMediaId
+    ? {
+        mediaId: previousSelectedVideo.tailFrameMediaId,
+        url: previousSelectedVideo.tailFrameUrl,
+      }
+    : null)
+  const [capturingTail, setCapturingTail] = useState(false)
   const generating = selectedTask?.status === 'queued' || selectedTask?.status === 'processing'
+  const generationBusy = generationPhase !== null || generating
   const selectedVideo = storyboard?.videos.find((video) => video.id === storyboard.selectedVideoId)
     || storyboard?.videos[0]
     || null
   const selectedModel = videoModels.find((model) => model.id === draft.model) || null
+  const requiresHumanFaceReferences = usesLiveActionFaces(visualStyle) && Boolean(
+    storyboard?.assets.some((asset) => asset.type === 'character' && asset.hasSelectedImage),
+  )
+  const usesTextOnlyCharacters = Boolean(
+    selectedModel
+    && requiresHumanFaceReferences
+    && !selectedModel.supportsHumanFaceReferences,
+  )
+  const maximumReferenceImages = selectedModel?.maximumReferenceImages || 4
+  const maximumReferenceVideos = selectedModel?.maximumReferenceVideos || 0
+  const availableAssetReferences = storyboard?.assets.filter((asset) => (
+    asset.hasSelectedImage && (asset.type === 'character' || asset.type === 'location' || asset.type === 'prop')
+  )) || []
+  const selectedCharacterReferences = availableAssetReferences.filter((asset) => asset.type === 'character')
+  const totalReferenceCapacity = maximumReferenceImages
+    + maximumReferenceVideos * REFERENCE_MONTAGE_IMAGES_PER_VIDEO
+  const referenceLimitBlocked = selectedCharacterReferences.length > totalReferenceCapacity
+  const continuityBlockedByReferenceLimit = selectedCharacterReferences.length >= totalReferenceCapacity
+  const continuityDisabled = !previousSelectedVideo
+    || usesTextOnlyCharacters
+    || continuityBlockedByReferenceLimit
+  const crossEpisodeSource = Boolean(
+    storyboard?.episode
+    && previousStoryboard?.episode
+    && storyboard.episode.episodeNumber !== previousStoryboard.episode.episodeNumber,
+  )
+  const continuityEnabled = inheritPrevious && !continuityDisabled
+  const assetReferenceSlots = Math.max(0, maximumReferenceImages - (continuityEnabled ? 1 : 0))
+  const assetReferenceCapacity = assetReferenceSlots
+    + maximumReferenceVideos * REFERENCE_MONTAGE_IMAGES_PER_VIDEO
+  const eligibleAssetReferences = availableAssetReferences.filter((asset) => (
+    (!continuityEnabled || asset.type !== 'location')
+  ))
+  const plannedAssetReferences = prioritizeVideoReferenceAssets(
+    eligibleAssetReferences,
+    assetReferenceCapacity,
+    continuityEnabled,
+  )
+  const videoReferencePlan = planVideoReferences(
+    plannedAssetReferences.map((asset) => asset.id),
+    assetReferenceSlots,
+    maximumReferenceVideos,
+  )
+  const plannedAssetsById = new Map(plannedAssetReferences.map((asset) => [asset.id, asset]))
+  const submittedAssetReferences = videoReferencePlan.imageMediaIds
+    .map((assetId) => plannedAssetsById.get(assetId)!)
+    .filter(Boolean)
+  const videoReferenceAssetGroups = videoReferencePlan.videoGroups.map((group) => (
+    group.map((assetId) => plannedAssetsById.get(assetId)!).filter(Boolean)
+  ))
+  const videoReferenceGroupByAssetId = new Map(videoReferenceAssetGroups.flatMap((group, groupIndex) => (
+    group.map((asset) => [asset.id, groupIndex + 1] as const)
+  )))
+  const submittedAssetReferenceOrder = new Map(
+    submittedAssetReferences.map((asset, index) => [asset.id, index + 1]),
+  )
+  const submittedImageReferenceCount = submittedAssetReferences.length
+    + (continuityEnabled ? 1 : 0)
+  const linkedAssetIds = new Set(storyboard?.assets.map((asset) => asset.id) || [])
+  const normalizedAssetPickerQuery = assetPickerQuery.trim().toLocaleLowerCase()
+  const pickerAssets = projectAssets
+    .filter((asset) => asset.type === 'character' || asset.type === 'location' || asset.type === 'prop')
+    .filter((asset) => !linkedAssetIds.has(asset.id))
+    .filter((asset) => !normalizedAssetPickerQuery || [
+      asset.name,
+      asset.description,
+      ...asset.tags,
+    ].some((value) => value.toLocaleLowerCase().includes(normalizedAssetPickerQuery)))
+  const usesTextSceneReference = !continuityEnabled
+    && availableAssetReferences.some((asset) => asset.type === 'location')
+    && !plannedAssetReferences.some((asset) => asset.type === 'location')
+  const previousStoryboardLabel = previousStoryboard
+    ? `${previousStoryboard.episode ? `第 ${previousStoryboard.episode.episodeNumber} 集 · ` : ''}分镜 ${String(
+        previousStoryboard.episodeSceneNumber || previousStoryboard.sceneNumber,
+      ).padStart(2, '0')}`
+    : '无上一镜'
   const availableResolutions = selectedModel?.resolutions || [draft.resolution]
   const availableAspectRatios = selectedModel?.aspectRatios || [draft.aspectRatio]
+  const durationSteps = videoDurationOptions(
+    selectedModel?.minimumDuration || 4,
+    selectedModel?.maximumDuration || 15,
+    selectedModel?.supportedDurations || null,
+  )
+  const durationStepIndex = Math.max(0, durationSteps.indexOf(draft.duration))
   const promptDirty = Boolean(storyboard) && draft.videoPrompt !== (storyboard?.videoPrompt || '')
   const generationTime = selectedModel
     ? estimateVideoGenerationSeconds(selectedModel.family, draft.duration)
     : null
+  const generationStatusTitle = generationPhase === 'saving'
+    ? '正在保存分镜'
+    : generationPhase === 'capturing_tail'
+      ? '正在截取上一镜尾帧'
+      : generationPhase === 'submitting'
+        ? '正在提交视频任务'
+        : generationPhase === 'queued' || selectedTask?.status === 'queued'
+          ? '已加入生成队列'
+          : selectedTask?.status === 'processing'
+            ? `正在生成视频 ${selectedTask.progress || 0}%`
+            : ''
+  const generationStatusDetail = generationPhase === 'saving'
+    ? '点击已接收，正在保存最新分镜设置，请勿重复点击。'
+    : generationPhase === 'capturing_tail'
+      ? '正在截取并上传上一镜尾帧，完成后会自动提交视频任务。'
+      : generationPhase === 'submitting'
+        ? '正在创建后台任务，请勿重复点击。'
+        : '任务已进入后台，离开页面不会中断。'
 
   useEffect(() => {
     const usableModel = selectedModel && selectedModel.available !== false
@@ -2921,7 +3591,10 @@ function StoryboardEditor({
         usableModel.maximumDuration,
         usableModel.supportedDurations,
       )
-      const generateAudio = usableModel.supportsAudio && current.generateAudio
+      const currentModel = videoModels.find((model) => model.id === current.model)
+      const generateAudio = usableModel.supportsAudio && (
+        currentModel == null || currentModel.supportsAudio === false || current.generateAudio
+      )
       if (usableModel.id === current.model
         && resolution === current.resolution
         && aspectRatio === current.aspectRatio
@@ -2933,33 +3606,174 @@ function StoryboardEditor({
     })
   }, [defaultVideoModel, selectedModel, videoModels])
 
+  useEffect(() => {
+    if (generationPhase && generating) setGenerationPhase(null)
+  }, [generationPhase, generating])
+
   async function save() {
     setSaving(true)
-    const input = {
-      title: draft.title,
-      videoPrompt: draft.videoPrompt,
-      notes: draft.notes || null,
-      duration: draft.duration,
-      aspectRatio: draft.aspectRatio,
-      generateAudio: draft.generateAudio,
+    try {
+      const input = {
+        title: draft.title,
+        videoPrompt: draft.videoPrompt,
+        notes: draft.notes || null,
+        duration: draft.duration,
+        aspectRatio: draft.aspectRatio,
+        generateAudio: draft.generateAudio,
+      }
+      return storyboard
+        ? await onSave(storyboard, input)
+        : await onCreate(input)
+    } finally {
+      setSaving(false)
     }
-    const result = storyboard
-      ? await onSave(storyboard, input)
-      : await onCreate(input)
-    setSaving(false)
-    return result
+  }
+
+  async function loadRevisions() {
+    if (!storyboard) return
+    const nextOpen = !revisionOpen
+    setRevisionOpen(nextOpen)
+    if (!nextOpen) return
+    setRevisionLoading(true)
+    try {
+      const payload = await requestJson<{ revisions: StoryboardRevisionRecord[] }>(
+        `/api/storyboards/${storyboard.id}/revisions`,
+      )
+      setRevisions(payload.revisions)
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : '读取分镜版本失败', 'error')
+    } finally {
+      setRevisionLoading(false)
+    }
+  }
+
+  async function restoreRevision(revision: StoryboardRevisionRecord) {
+    if (!storyboard || !window.confirm(`恢复到 ${new Date(revision.createdAt).toLocaleString('zh-CN')} 的版本？当前稿会先自动留存。`)) return
+    setRevisionLoading(true)
+    try {
+      const restored = await onRestoreRevision(storyboard, revision.id)
+      if (!restored) return
+      setDraft((current) => ({
+        ...current,
+        title: restored.title,
+        videoPrompt: restored.videoPrompt || '',
+        notes: restored.notes || '',
+        duration: restored.duration,
+        aspectRatio: restored.aspectRatio,
+        generateAudio: restored.generateAudio,
+      }))
+      setRevisionOpen(false)
+    } finally {
+      setRevisionLoading(false)
+    }
+  }
+
+  async function updateAssetLink(
+    assetId: string,
+    action: 'add' | 'remove',
+    promptOverride?: string,
+  ) {
+    if (!storyboard || assetLinkBusyId) return
+    const asset = projectAssets.find((candidate) => candidate.id === assetId)
+    if (!asset || (asset.type !== 'character' && asset.type !== 'location' && asset.type !== 'prop')) return
+    const previousPrompt = draft.videoPrompt
+    const nextPrompt = promptOverride ?? (action === 'add'
+      ? insertStoryboardAssetMention(previousPrompt, asset)
+      : removeStoryboardAssetMention(previousPrompt, asset.name))
+    setDraft((current) => ({ ...current, videoPrompt: nextPrompt }))
+    setAssetLinkBusyId(assetId)
+    try {
+      const updated = await onUpdateAssetLink(storyboard.id, assetId, action, nextPrompt)
+      if (updated) {
+        setDraft((current) => ({ ...current, videoPrompt: updated.videoPrompt || nextPrompt }))
+      } else {
+        setDraft((current) => ({ ...current, videoPrompt: previousPrompt }))
+      }
+      if (updated && action === 'add' && pickerAssets.length <= 1) {
+        setAssetPickerOpen(false)
+        setAssetPickerQuery('')
+      }
+      if (updated && action === 'remove' && generating) {
+        onNotice('已从后续生成参考中移除；当前正在生成的任务仍使用提交时的资产')
+      }
+    } finally {
+      setAssetLinkBusyId(null)
+    }
   }
 
   async function generate() {
-    const saved = await save()
-    if (!saved) return
-    await onGenerate(saved, {
-      duration: draft.duration,
-      aspectRatio: draft.aspectRatio,
-      resolution: draft.resolution,
-      generateAudio: draft.generateAudio,
-      model: draft.model,
-    })
+    if (generationLockRef.current || generating) return
+    generationLockRef.current = true
+    setGenerationPhase('saving')
+    try {
+      const saved = await save()
+      if (!saved) {
+        setGenerationPhase(null)
+        return
+      }
+      let continuityFrameMediaId: string | undefined
+      let continuitySourceVideoId: string | undefined
+      if (continuityEnabled && previousSelectedVideo) {
+        setGenerationPhase('capturing_tail')
+        try {
+          const frame = await ensureContinuityFrame()
+          continuityFrameMediaId = frame.mediaId
+          continuitySourceVideoId = previousSelectedVideo.id
+        } catch (error) {
+          onNotice(
+            `${error instanceof Error ? error.message : '尾帧截取失败'}，已按文字连续性继续生成`,
+            'error',
+          )
+        }
+      }
+      setGenerationPhase('submitting')
+      const task = await onGenerate(saved, {
+        duration: draft.duration,
+        aspectRatio: draft.aspectRatio,
+        resolution: draft.resolution,
+        generateAudio: draft.generateAudio,
+        model: draft.model,
+        continuityFrameMediaId,
+        continuitySourceVideoId,
+      })
+      setGenerationPhase(task ? 'queued' : null)
+    } catch (error) {
+      setGenerationPhase(null)
+      onNotice(error instanceof Error ? error.message : '视频任务提交失败', 'error')
+    } finally {
+      generationLockRef.current = false
+    }
+  }
+
+  async function cancelGeneration() {
+    if (!selectedTask || !generating || cancellingGeneration) return
+    if (!window.confirm('取消这个视频生成任务？已经提交到上游的任务可能仍会产生费用，但结果将不再保存。')) return
+    setCancellingGeneration(true)
+    try {
+      await onCancelTask(selectedTask)
+      setGenerationPhase(null)
+    } finally {
+      setCancellingGeneration(false)
+    }
+  }
+
+  async function ensureContinuityFrame(force = false) {
+    if (!previousSelectedVideo) throw new Error('上一镜没有已选中的视频')
+    if (continuityFrame && !force) return continuityFrame
+    setCapturingTail(true)
+    try {
+      const captured = await captureVideoTailFrame(previousSelectedVideo.url)
+      const form = new FormData()
+      form.set('file', new File([captured.blob], '上一镜尾帧.png', { type: 'image/png' }))
+      const payload = await requestJson<{ tailFrame: { mediaId: string, url: string } }>(
+        `/api/storyboard-videos/${previousSelectedVideo.id}/tail-frame`,
+        { method: 'POST', body: form },
+      )
+      setContinuityFrame(payload.tailFrame)
+      return payload.tailFrame
+    } finally {
+      setCapturingTail(false)
+    }
   }
 
   if (!storyboard && nextSceneNumber === 1 && !draft.videoPrompt && !draft.title) {
@@ -2982,8 +3796,31 @@ function StoryboardEditor({
             <button className="iconButton" type="button" title="保存分镜" onClick={() => void save()} disabled={saving}>
               {saving ? <Loader2 className="spin" size={17} /> : <Save size={17} />}
             </button>
+            {storyboard ? (
+              <button className="iconButton" type="button" title="查看版本记录" onClick={() => void loadRevisions()} disabled={revisionLoading}>
+                {revisionLoading ? <Loader2 className="spin" size={17} /> : <History size={17} />}
+              </button>
+            ) : null}
           </div>
         </div>
+
+        {revisionOpen ? (
+          <div className="storyboardRevisionPanel">
+            <div className="sectionLabel"><strong>版本记录</strong><span>{revisions.length}</span></div>
+            {revisions.length > 0 ? revisions.map((revision) => (
+              <div className="storyboardRevisionItem" key={revision.id}>
+                <span>
+                  <strong>{new Date(revision.createdAt).toLocaleString('zh-CN')}</strong>
+                  <small>{revision.reason || revision.source} · {revision.duration}s</small>
+                  <small>{revision.promptPreview || '无视频提示词'}</small>
+                </span>
+                <button className="iconButton" type="button" title="恢复这个版本" onClick={() => void restoreRevision(revision)}>
+                  <RotateCcw size={16} />
+                </button>
+              </div>
+            )) : <small>尚无历史版本；下次修改前会自动留存。</small>}
+          </div>
+        ) : null}
 
         <label>
           标题
@@ -2997,31 +3834,215 @@ function StoryboardEditor({
           <HighlightedStoryboardPrompt
             value={draft.videoPrompt}
             assets={storyboard?.assets || []}
+            availableAssets={projectAssets}
             onChange={(videoPrompt) => setDraft((current) => ({ ...current, videoPrompt }))}
+            onSelectAsset={(assetId, videoPrompt) => void updateAssetLink(assetId, 'add', videoPrompt)}
           />
           <small className="promptUsageHint">单个生成会先自动保存；批量生成使用最近保存的版本。当前 {draft.videoPrompt.length} 字。</small>
         </label>
 
+        {storyboard ? (
+          <ShotPerformancePanel
+            storyboardId={storyboard.id}
+            duration={draft.duration}
+            assets={storyboard.assets}
+            onNotice={onNotice}
+          />
+        ) : null}
+
         <div className="referenceSection">
-          <div className="sectionLabel">
-            <strong>已识别人物与场景</strong>
-            <span>{storyboard?.assets.length || 0}/{selectedModel?.maximumReferenceImages || 4} 参考图</span>
+          <div className="sectionLabel referenceSectionHeader">
+            <span className="referenceSectionTitle">
+              <strong>本次视频参考图</strong>
+              <small>原图 {submittedImageReferenceCount}/{maximumReferenceImages} 张{maximumReferenceVideos > 0
+                ? ` · 参考视频 ${videoReferenceAssetGroups.length}/${maximumReferenceVideos} 段`
+                : ''}</small>
+            </span>
+            {storyboard ? (
+              <button
+                className={`quietButton compact referenceAssetAddButton ${assetPickerOpen ? 'active' : ''}`}
+                type="button"
+                aria-expanded={assetPickerOpen}
+                onClick={() => setAssetPickerOpen((open) => !open)}
+              >
+                <Plus size={14} />添加项目资产
+              </button>
+            ) : null}
           </div>
+          {storyboard && assetPickerOpen ? (
+            <section className="storyboardAssetPicker" aria-label="添加项目资产到当前分镜">
+              <header>
+                <span>
+                  <strong>从项目资产库添加</strong>
+                  <small>点击资产会在提示词中写入 @资产；初始识别完成后，列表只按你的增删决定。</small>
+                </span>
+                <button
+                  className="iconButton small"
+                  type="button"
+                  title="关闭资产选择"
+                  aria-label="关闭资产选择"
+                  onClick={() => setAssetPickerOpen(false)}
+                ><X size={15} /></button>
+              </header>
+              <label className="storyboardAssetSearch">
+                <Search size={15} />
+                <input
+                  value={assetPickerQuery}
+                  onChange={(event) => setAssetPickerQuery(event.target.value)}
+                  placeholder="搜索角色、场景或道具"
+                  aria-label="搜索项目资产"
+                />
+              </label>
+              {pickerAssets.length > 0 ? (
+                <div className="storyboardAssetPickerList">
+                  {pickerAssets.slice(0, 24).map((asset) => {
+                    const preview = imageFor(asset)
+                    return (
+                      <button
+                        key={asset.id}
+                        type="button"
+                        disabled={assetLinkBusyId !== null}
+                        onClick={() => void updateAssetLink(asset.id, 'add')}
+                      >
+                        <span className="storyboardAssetPickerThumb">
+                          {preview ? <img src={preview} alt="" /> : <TypeIcon type={asset.type} size={18} />}
+                        </span>
+                        <span>
+                          <strong>{asset.name}</strong>
+                          <small>{typeLabels[asset.type]} · {asset.selectedImageId ? '已有主图' : '缺少主图，添加后需先生图'}</small>
+                        </span>
+                        {assetLinkBusyId === asset.id ? <Loader2 className="spin" size={15} /> : <Plus size={15} />}
+                      </button>
+                    )
+                  })}
+                </div>
+              ) : (
+                <div className="storyboardAssetPickerEmpty">
+                  {assetPickerQuery ? '没有匹配的未添加资产' : '项目中的角色、场景和道具已经全部加入本镜'}
+                </div>
+              )}
+            </section>
+          ) : null}
           {storyboard?.assets.length ? (
             <div className="referenceStrip">
-              {storyboard.assets.map((asset, index) => (
-                <div className={`referenceItem ${asset.hasSelectedImage ? '' : 'missing'}`} key={asset.id} title={asset.matchReason}>
-                  <span className="referenceImage">
-                    {asset.imageUrl ? <img src={asset.imageUrl} alt={asset.name} /> : <ImageIcon size={24} />}
-                    <b>@{index + 1}</b>
-                  </span>
-                  <span><strong>{asset.name}</strong><small>{asset.hasSelectedImage ? typeLabels[asset.type] : '缺少主图'}</small></span>
-                </div>
-              ))}
+              {storyboard.assets.map((asset) => {
+                const referenceOrder = submittedAssetReferenceOrder.get(asset.id)
+                const videoReferenceGroup = videoReferenceGroupByAssetId.get(asset.id)
+                const replacedByTailFrame = continuityEnabled && asset.type === 'location'
+                const sceneUsesText = usesTextSceneReference
+                  && asset.type === 'location'
+                  && asset.hasSelectedImage
+                  && !referenceOrder
+                return (
+                  <div
+                    className={`referenceItem removable ${asset.isManual ? 'manual' : ''} ${asset.hasSelectedImage ? referenceOrder || videoReferenceGroup ? '' : 'omitted' : 'missing'}`}
+                    key={asset.id}
+                    title={replacedByTailFrame
+                      ? '启用上一镜尾帧后不再提交场景资产图'
+                      : sceneUsesText
+                          ? '镜内人物已占满参考图名额，场景按【场景】文字描述生成'
+                          : videoReferenceGroup
+                            ? `超出原图上限，已自动加入参考视频 ${videoReferenceGroup}`
+                          : asset.matchReason}
+                  >
+                    <span className="referenceImage">
+                      {asset.imageUrl ? <img src={asset.imageUrl} alt={asset.name} /> : <ImageIcon size={24} />}
+                      {referenceOrder ? <b>@{referenceOrder}</b> : null}
+                      {!referenceOrder && videoReferenceGroup ? <b className="videoReferenceBadge">V{videoReferenceGroup}</b> : null}
+                    </span>
+                    <span>
+                      <strong>{asset.name}</strong>
+                      <small>{!asset.hasSelectedImage
+                        ? '缺少主图'
+                        : replacedByTailFrame
+                           ? '由上一镜尾帧替代'
+                          : sceneUsesText
+                              ? '场景由文字控制（人物优先）'
+                              : referenceOrder
+                                ? `${typeLabels[asset.type]} · ${asset.isManual ? '@手动添加' : '初始识别'}`
+                                : videoReferenceGroup
+                                  ? `参考视频 ${videoReferenceGroup} · ${typeLabels[asset.type]}`
+                                  : '未提交（超出总上限）'}</small>
+                    </span>
+                    <button
+                      className="referenceRemoveAsset"
+                      type="button"
+                      title={`从本镜视频参考中移除${asset.name}`}
+                      aria-label={`从本镜视频参考中移除${asset.name}`}
+                      disabled={assetLinkBusyId !== null}
+                      onClick={() => void updateAssetLink(asset.id, 'remove')}
+                    >
+                      {assetLinkBusyId === asset.id ? <Loader2 className="spin" size={13} /> : <X size={13} />}
+                    </button>
+                  </div>
+                )
+              })}
             </div>
           ) : (
-            <div className="referenceEmpty">尚未匹配剧本中的人物或场景</div>
+            <div className="referenceEmpty">本镜暂无参考资产；点击“添加项目资产”写入 @资产</div>
           )}
+          {referenceLimitBlocked ? (
+            <div className="referenceStrategyNote errorText" role="alert">
+              <CircleAlert size={14} />
+              <span>你为本镜选择了 {selectedCharacterReferences.length} 个人物资产，超过当前模型可接收的 {totalReferenceCapacity} 项资产总上限。请移除多余资产或拆分分镜。</span>
+            </div>
+          ) : videoReferenceAssetGroups.length > 0 ? (
+            <div className="referenceStrategyNote referenceVideoPackingNote" role="status">
+              <Film size={14} />
+              <span>前 {submittedAssetReferences.length} 张保留为原图；每张溢出图片已分别生成 1 段无声静态参考视频，共 {videoReferenceAssetGroups.length} 段，仅用于锁定人物、服装、场景和道具，不作为动作时序。</span>
+            </div>
+          ) : usesTextSceneReference ? (
+            <div className="referenceStrategyNote">
+              <CircleAlert size={14} />
+              <span>{selectedCharacterReferences.length} 个已选人物资产优先使用全部参考图名额；场景将严格按【场景】文字描述生成，不上传场景资产图。</span>
+            </div>
+          ) : null}
+          <div className="continuityReference">
+            <Toggle
+              checked={inheritPrevious && !continuityDisabled}
+              onChange={setInheritPrevious}
+              label="承接上一镜"
+              icon={<Camera size={15} />}
+              disabled={continuityDisabled}
+            />
+            <div className={`continuityPreview ${inheritPrevious && !continuityDisabled ? 'active' : ''}`}>
+              <span className="continuityThumbnail">
+                {continuityFrame?.url
+                  ? <img src={continuityFrame.url} alt="上一镜尾帧" />
+                  : <Camera size={22} />}
+                {continuityEnabled ? <b>@{submittedAssetReferences.length + 1}</b> : null}
+              </span>
+              <span>
+                <strong>{previousStoryboardLabel} 尾帧</strong>
+                <small>{continuityFrame
+                  ? spatialContinuity ? '已锁定站位、朝向与接触状态' : '已准备人物外观与情绪承接'
+                  : !previousStoryboard
+                    ? '这是项目第一条分镜，没有可承接的视频'
+                    : !previousSelectedVideo
+                      ? '上一镜尚未选中视频版本'
+                        : usesTextOnlyCharacters
+                          ? '当前模型不支持真人尾帧参考'
+                          : continuityBlockedByReferenceLimit
+                            ? `${selectedCharacterReferences.length} 个已选人物资产已占满参考图名额，不能再加入尾帧`
+                          : spatialContinuity
+                          ? '生成前自动截取，不替换人物资产'
+                          : crossEpisodeSource
+                            ? '跨集承接：开启后自动截取上一集最后一镜'
+                            : '转场承接：仅继承同名人物外观、道具与情绪'}</small>
+              </span>
+              <button
+                className="iconButton small"
+                type="button"
+                title={continuityFrame ? '重新截取上一镜尾帧' : '立即截取上一镜尾帧'}
+                disabled={!inheritPrevious || continuityDisabled || capturingTail || generationBusy}
+                onClick={() => void ensureContinuityFrame(true).catch((error) => (
+                  onNotice(error instanceof Error ? error.message : '尾帧截取失败', 'error')
+                ))}
+              >
+                {capturingTail ? <Loader2 className="spin" size={15} /> : <Camera size={15} />}
+              </button>
+            </div>
+          </div>
         </div>
 
         <div className="generationSettings">
@@ -3030,14 +4051,20 @@ function StoryboardEditor({
               视频模型
               <select
                 value={draft.model}
-                onChange={(event) => setDraft((current) => ({ ...current, model: event.target.value }))}
+                onChange={(event) => {
+                  const next = videoModels.find((model) => model.id === event.target.value)
+                  if (!next) return
+                  setDraft((current) => ({
+                    ...current,
+                    model: next.id,
+                    generateAudio: next.supportsAudio && (
+                      selectedModel == null || selectedModel.supportsAudio === false || current.generateAudio
+                    ),
+                  }))
+                }}
               >
                 {videoModels.length === 0 ? <option value={draft.model}>正在读取模型价格…</option> : null}
-                {videoModels.map((model) => (
-                  <option key={model.id} value={model.id} disabled={model.available === false}>
-                    {model.label} · {model.priceLabel}{model.available === false ? '（当前不可用）' : ''}
-                  </option>
-                ))}
+                <VideoModelSelectOptions models={videoModels} unavailableLabel="当前不可用" />
               </select>
             </label>
             <div className="modelPriceSummary">
@@ -3047,6 +4074,9 @@ function StoryboardEditor({
                   <small>{selectedModel.description} 预计耗时 {generationTime
                     ? formatMinuteRange(generationTime.minimum, generationTime.maximum)
                     : '等待模型信息'}。{videoPriceNotice}</small>
+                  {usesTextOnlyCharacters ? (
+                    <small className="errorText">保留原生音频，但不会上传人物或人脸图片；人物将按提示词中的外形、服装和声音文字设定生成。</small>
+                  ) : null}
                 </>
               ) : (
                 <small>{videoPriceNotice}</small>
@@ -3054,27 +4084,31 @@ function StoryboardEditor({
             </div>
           </div>
           <div className="durationControl">
-            <span>时长 <strong>{draft.duration}s</strong></span>
-            {selectedModel?.supportedDurations?.length ? (
-              <div className="ratioControl durationOptions" aria-label="视频时长">
-                {selectedModel.supportedDurations.map((duration) => (
-                  <button
-                    key={duration}
-                    type="button"
-                    className={draft.duration === duration ? 'active' : ''}
-                    onClick={() => setDraft((current) => ({ ...current, duration }))}
-                  >{duration}s</button>
-                ))}
-              </div>
-            ) : (
+            <span>时长 <strong aria-live="polite">{draft.duration}s</strong></span>
+            <div className="durationSlider">
               <input
                 type="range"
-                min={selectedModel?.minimumDuration || 4}
-                max={selectedModel?.maximumDuration || 15}
-                value={draft.duration}
-                onChange={(event) => setDraft((current) => ({ ...current, duration: Number(event.target.value) }))}
+                min={0}
+                max={Math.max(0, durationSteps.length - 1)}
+                step={1}
+                value={durationStepIndex}
+                aria-label="视频时长"
+                aria-valuetext={`${draft.duration} 秒`}
+                onChange={(event) => {
+                  const duration = durationSteps[Number(event.target.value)] || durationSteps[0]
+                  setDraft((current) => ({ ...current, duration }))
+                }}
               />
-            )}
+              <div
+                className="durationScale"
+                style={{ gridTemplateColumns: `repeat(${durationSteps.length}, minmax(0, 1fr))` }}
+                aria-hidden="true"
+              >
+                {durationSteps.map((duration) => (
+                  <span className={duration === draft.duration ? 'active' : ''} key={duration}>{duration}s</span>
+                ))}
+              </div>
+            </div>
           </div>
           <div className="settingControl">
             <span>清晰度</span>
@@ -3085,7 +4119,7 @@ function StoryboardEditor({
                   type="button"
                   className={draft.resolution === resolution ? 'active' : ''}
                   onClick={() => setDraft((current) => ({ ...current, resolution }))}
-                >{resolution === '720p' ? 'HD 720p' : '标准 480p'}</button>
+                >{resolution === '1080p' ? 'Full HD 1080p' : resolution === '720p' ? 'HD 720p' : '标准 480p'}</button>
               ))}
             </div>
           </div>
@@ -3121,12 +4155,16 @@ function StoryboardEditor({
           ) : (
             <div className="videoPlaceholder"><Clapperboard size={36} /><span>暂无视频</span></div>
           )}
-          {generating ? (
+          {generationBusy ? (
             <div className="renderOverlay">
               <Loader2 className="spin" size={25} />
-              <strong>{selectedTask?.status === 'queued' ? '等待生成' : '正在生成'}</strong>
-              <div className="progressTrack"><span style={{ width: `${selectedTask?.progress || 4}%` }} /></div>
-              <small>{selectedTask?.progress || 0}%</small>
+              <strong>{generationStatusTitle}</strong>
+              {generating ? (
+                <>
+                  <div className="progressTrack"><span style={{ width: `${selectedTask?.progress || 4}%` }} /></div>
+                  <small>{selectedTask?.progress || 0}%</small>
+                </>
+              ) : <small>点击已接收，请勿重复点击</small>}
             </div>
           ) : null}
         </div>
@@ -3136,15 +4174,40 @@ function StoryboardEditor({
           data-assistant-target="generate-video"
           type="button"
           onClick={() => void generate()}
-          disabled={saving || generating || !draft.videoPrompt.trim() || !draft.model || selectedModel?.available === false}
+          disabled={saving || generationBusy || referenceLimitBlocked || !draft.videoPrompt.trim() || !draft.model || selectedModel?.available === false}
         >
-          {generating ? <Loader2 className="spin" size={17} /> : <Clapperboard size={17} />}
-          {generating
-            ? `${selectedModel?.family || '视频'} 生成中`
+          {generationBusy ? <Loader2 className="spin" size={17} /> : <Clapperboard size={17} />}
+          {generationBusy
+            ? generationStatusTitle
             : `使用 ${selectedModel?.label || '所选模型'} 生成 ${draft.duration}s · ${draft.resolution}`}
         </button>
 
-        {selectedTask?.status === 'failed' ? <p className="errorText">{videoTaskErrorMessage(selectedTask.error)}</p> : null}
+        {generationBusy ? (
+          <div className="videoGenerationStatus" role="status" aria-live="polite">
+            <span><Loader2 className="spin" size={16} /></span>
+            <div>
+              <strong>{generationStatusTitle}</strong>
+              <small>{generationStatusDetail}</small>
+            </div>
+            {generating && selectedTask ? (
+              <button
+                className="cancelGenerationButton"
+                type="button"
+                onClick={() => void cancelGeneration()}
+                disabled={cancellingGeneration}
+              >
+                {cancellingGeneration ? <Loader2 className="spin" size={14} /> : <X size={14} />}
+                {cancellingGeneration ? '正在取消' : '取消生成'}
+              </button>
+            ) : null}
+          </div>
+        ) : null}
+
+        {selectedTask?.status === 'failed' ? (
+          <p className="errorText videoTaskError" role="alert">
+            {readableVideoTaskError(selectedTask.error)}
+          </p>
+        ) : null}
 
         <div className="videoVersions">
           <div className="sectionLabel"><strong>视频版本</strong><span>{storyboard?.videos.length || 0}</span></div>

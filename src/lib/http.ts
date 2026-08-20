@@ -27,7 +27,10 @@ export function jsonError(error: unknown) {
     )
   }
 
-  const message = error instanceof Error ? error.message : 'Unexpected error'
+  console.error('Unhandled route error', error)
+  const message = process.env.NODE_ENV === 'production'
+    ? '服务器处理请求失败，请稍后重试'
+    : error instanceof Error ? error.message : 'Unexpected error'
   return NextResponse.json(
     { error: { code: 'INTERNAL_ERROR', message } },
     { status: 500 },

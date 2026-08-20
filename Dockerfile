@@ -1,5 +1,10 @@
 FROM node:24-alpine AS base
 
+ENV PRISMA_ENGINES_MIRROR=https://npmmirror.com/mirrors/prisma
+ENV NPM_CONFIG_FETCH_RETRIES=5
+ENV NPM_CONFIG_FETCH_RETRY_MINTIMEOUT=20000
+ENV NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT=120000
+
 FROM base AS dependencies
 
 WORKDIR /app
@@ -10,9 +15,12 @@ FROM dependencies AS builder
 
 WORKDIR /app
 ENV NEXT_TELEMETRY_DISABLED=1
-ENV NODE_OPTIONS=--max-old-space-size=512
+ENV NODE_OPTIONS=--max-old-space-size=1024
 COPY . .
-RUN npx prisma generate && npm run build
+RUN npm run build
+
+FROM builder AS runtime-dependencies
+RUN npm prune --omit=dev
 
 FROM base AS runtime
 
@@ -20,7 +28,9 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 
-COPY --from=builder /app/node_modules ./node_modules
+RUN apk add --no-cache ffmpeg
+
+COPY --from=runtime-dependencies /app/node_modules ./node_modules
 COPY --from=builder /app/.next ./.next
 COPY --from=builder /app/public ./public
 COPY --from=builder /app/prisma ./prisma

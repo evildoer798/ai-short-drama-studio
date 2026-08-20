@@ -21,7 +21,7 @@ export function storyboardPromptSection(prompt: string | null | undefined, label
 export function storyboardTimeLocation(storyboard: StoryboardSceneSource) {
   const notesLine = storyboard.notes?.split(/\r?\n/, 1)[0]?.trim() || ''
   const promptLocation = storyboardPromptSection(storyboard.videoPrompt, '时间地点')
-  return (notesLine.includes('｜') ? notesLine : promptLocation).replace(/^时间地点[:：]\s*/u, '').trim()
+  return (notesLine || promptLocation).replace(/^时间地点[:：]\s*/u, '').trim()
 }
 
 export function storyboardLocationName(storyboard: StoryboardSceneSource) {
@@ -30,6 +30,7 @@ export function storyboardLocationName(storyboard: StoryboardSceneSource) {
 
 export function storyboardLocationNames(storyboard: StoryboardSceneSource) {
   const timeLocation = storyboardTimeLocation(storyboard)
+  if (timeLocation && !timeLocation.includes('｜')) return [timeLocation]
   return [...new Set(timeLocation
     .split(/[；;\n]+/u)
     .map((segment) => segment.split('｜').map((part) => part.trim()))

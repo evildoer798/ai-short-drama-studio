@@ -33,4 +33,23 @@ describe('text task error messages', () => {
     expect(message).toContain('备用线路')
     expect(message).not.toContain('沧元审核')
   })
+
+  it('turns legacy forty-shot checkpoint validation dumps into a concise recovery action', () => {
+    const message = readableTextTaskError(
+      '已保存 0/1 集。[{"code":"too_big","maximum":40,"path":["episodeReviews",0,"currentShots"]}]',
+    )
+    expect(message).toContain('旧版检查点容量')
+    expect(message).toContain('请重新生成')
+    expect(message).not.toContain('too_big')
+  })
+
+  it('turns missing asset type validation into a resumable checkpoint message', () => {
+    const message = readableTextTaskError(
+      `[{"expected":"'character' | 'location' | 'prop'","received":"undefined","code":"invalid_type","path":["assets",0,"type"],"message":"Required"}]`,
+    )
+
+    expect(message).toContain('资产条目缺少类别字段')
+    expect(message).toContain('检查点仍然保留')
+    expect(message).not.toContain('invalid_type')
+  })
 })

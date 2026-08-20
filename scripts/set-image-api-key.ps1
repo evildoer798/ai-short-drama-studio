@@ -1,6 +1,6 @@
 param(
-  [string]$BaseUrl = "https://ai.cangyuansuanli.cn",
-  [string]$Model = "gpt-image-2"
+  [string]$BaseUrl = "http://direct-api.cangyuansuanli.cn",
+  [string]$Model = "gpt-image-2-1k"
 )
 
 $ErrorActionPreference = "Stop"

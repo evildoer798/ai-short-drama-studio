@@ -3,6 +3,7 @@ export type SequentialVideoBatchItem = {
   episodeSceneNumber: number | null
   sceneNumber: number
   duration: number
+  sceneKey?: string | null
 }
 
 export type StoryboardVideoGroupSize = 1 | 2 | 3 | 4
@@ -27,8 +28,46 @@ export function normalizeVideoDuration(
   return options.find((duration) => duration >= requested) || options.at(-1)!
 }
 
+export function videoDurationOptions(
+  minimumDuration = 4,
+  maximumDuration = 15,
+  supportedDurations: number[] | null = null,
+) {
+  const minimum = Math.max(1, Math.round(minimumDuration))
+  const maximum = Math.max(minimum, Math.round(maximumDuration))
+  const supported = [...new Set(supportedDurations || [])]
+    .map((duration) => Math.round(duration))
+    .filter((duration) => duration >= minimum && duration <= maximum)
+    .sort((left, right) => left - right)
+  if (supported.length > 0) return supported
+  return Array.from({ length: maximum - minimum + 1 }, (_value, index) => minimum + index)
+}
+
 function storyboardOrder(item: SequentialVideoBatchItem) {
   return item.episodeSceneNumber || item.sceneNumber
+}
+
+function normalizeSceneIdentity(value: string) {
+  return value
+    .toLocaleLowerCase()
+    .replace(/^(?:时间地点|场景)[:：]\s*/u, '')
+    .replace(/[\s\p{P}\p{S}]+/gu, '')
+}
+
+export function storyboardSceneIdentity(input: {
+  notes?: string | null
+  locationNames?: string[]
+}) {
+  const noteLine = input.notes?.split(/\r?\n/u).map((line) => line.trim()).find(Boolean) || ''
+  const locationName = input.locationNames?.map((name) => name.trim()).find(Boolean) || ''
+  const noteParts = noteLine.split('｜').map((part) => part.trim()).filter(Boolean)
+  const noteLocation = noteParts.length > 1 ? noteParts.slice(1).join('｜') : noteLine
+  const label = noteLocation || locationName || '未识别场景'
+  const keySource = noteLine || locationName
+  return {
+    key: keySource ? normalizeSceneIdentity(keySource) : '',
+    label,
+  }
 }
 
 export function orderSingleEpisodeVideoBatch<T extends SequentialVideoBatchItem>(items: T[]) {
@@ -54,10 +93,12 @@ export function groupSingleEpisodeVideoBatch<T extends SequentialVideoBatchItem>
 
   const groups: T[][] = []
   let current: T[] = []
+  let currentDuration = 0
 
   const flush = () => {
     if (current.length > 0) groups.push(current)
     current = []
+    currentDuration = 0
   }
 
   for (const item of ordered) {
@@ -67,8 +108,10 @@ export function groupSingleEpisodeVideoBatch<T extends SequentialVideoBatchItem>
     const previous = current.at(-1)
     const contiguous = !previous || storyboardOrder(item) === storyboardOrder(previous) + 1
     const fitsCount = current.length < groupSize
-    if (!contiguous || !fitsCount) flush()
+    const fitsDuration = currentDuration + item.duration <= maximumDuration
+    if (!contiguous || !fitsCount || !fitsDuration) flush()
     current.push(item)
+    currentDuration += item.duration
   }
   flush()
   return groups
@@ -87,31 +130,26 @@ export function fitVideoGroupDurations(
     return { duration: 0, sourceDuration: 0, timelineDurations: [] as number[] }
   }
 
+  if (sourceDuration > maximumDuration) {
+    return { duration: sourceDuration, sourceDuration, timelineDurations: sourceDurations }
+  }
+
+  const requested = Math.max(sourceDuration, requestedDuration ?? sourceDuration)
   const duration = normalizeVideoDuration(
-    requestedDuration ?? sourceDuration,
+    requested,
     minimumDuration,
     maximumDuration,
     supportedDurations,
   )
-  if (Math.abs(sourceDuration - duration) < 0.001) {
-    return { duration, sourceDuration, timelineDurations: sourceDurations }
-  }
-
-  let allocated = 0
-  const timelineDurations = sourceDurations.map((source, index) => {
-    if (index === sourceDurations.length - 1) {
-      return Number(Math.max(0.1, duration - allocated).toFixed(2))
-    }
-    const fitted = Number((duration * source / sourceDuration).toFixed(2))
-    allocated += fitted
-    return fitted
-  })
-  return { duration, sourceDuration, timelineDurations }
+  return { duration, sourceDuration, timelineDurations: sourceDurations }
 }
 
-export function estimateVideoGenerationSeconds(family: 'Grok' | 'Seedance', duration: number) {
+export function estimateVideoGenerationSeconds(
+  family: 'Grok' | 'Seedance' | 'Sora' | 'HappyHouse',
+  duration: number,
+) {
   const durationFactor = Math.max(0.5, duration / 15)
-  const base = family === 'Seedance'
+  const base = family === 'Seedance' || family === 'HappyHouse'
     ? { minimum: 4 * 60, maximum: 8 * 60 }
     : { minimum: 60, maximum: 3 * 60 }
   return {
@@ -121,7 +159,7 @@ export function estimateVideoGenerationSeconds(family: 'Grok' | 'Seedance', dura
 }
 
 export function estimateSequentialVideoBatchSeconds(
-  family: 'Grok' | 'Seedance',
+  family: 'Grok' | 'Seedance' | 'Sora' | 'HappyHouse',
   items: Array<{ duration: number }>,
 ) {
   return items.reduce((total, item) => {

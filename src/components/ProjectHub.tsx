@@ -17,7 +17,10 @@ import {
   Pencil,
   Plus,
   Search,
+  CircleDollarSign,
+  ShieldCheck,
   UsersRound,
+  Workflow,
   X,
 } from 'lucide-react'
 import type { ProjectHubData } from '@/lib/projects'
@@ -26,6 +29,7 @@ type User = {
   id: string
   email: string
   name: string
+  role: 'user' | 'admin'
 }
 
 type ProjectForm = {
@@ -142,6 +146,20 @@ export function ProjectHub({ user, initialData }: { user: User, initialData: Pro
           </span>
         </div>
         <div className="projectHubUser">
+          <Link className="quietButton projectCanvasLink" href="/director">
+            <Clapperboard size={16} />导演工作台
+          </Link>
+          <Link className="quietButton projectCanvasLink" href="/canvas">
+            <Workflow size={16} />画布
+          </Link>
+          <Link className="quietButton projectCanvasLink" href="/billing">
+            <CircleDollarSign size={16} />我的费用
+          </Link>
+          {user.role === 'admin' ? (
+            <Link className="quietButton projectCanvasLink" href="/admin/billing">
+              <ShieldCheck size={16} />费用后台
+            </Link>
+          ) : null}
           <span><strong>{user.name}</strong><small>{user.email}</small></span>
           <button className="iconButton" type="button" onClick={() => void logout()} title="退出登录" aria-label="退出登录">
             <LogOut size={17} />

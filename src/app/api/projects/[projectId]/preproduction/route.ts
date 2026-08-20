@@ -12,6 +12,10 @@ export async function GET(
     const user = await requireUser()
     const { projectId } = await context.params
     await requireProjectAccess(projectId, user.id)
-    return NextResponse.json(await getPreproductionData(projectId))
+    return NextResponse.json(await getPreproductionData(projectId), {
+      headers: {
+        'Cache-Control': 'private, max-age=15, stale-while-revalidate=60',
+      },
+    })
   })
 }

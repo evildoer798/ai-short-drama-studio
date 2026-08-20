@@ -9,7 +9,9 @@ import {
 describe('storage helpers', () => {
   it('uses the public OSS endpoint for browser media delivery', () => {
     expect(publicStorageEndpoint('https://s3.oss-cn-hangzhou-internal.aliyuncs.com'))
-      .toBe('https://s3.oss-cn-hangzhou.aliyuncs.com')
+      .toBe('https://oss-cn-hangzhou.aliyuncs.com')
+    expect(publicStorageEndpoint('https://s3.oss-cn-hangzhou.aliyuncs.com'))
+      .toBe('https://oss-cn-hangzhou.aliyuncs.com')
     expect(publicStorageEndpoint('https://s3.example.com')).toBe('https://s3.example.com')
   })
 
@@ -17,6 +19,13 @@ describe('storage helpers', () => {
     expect(extensionForMime('image/jpeg')).toBe('jpg')
     expect(extensionForMime('image/webp')).toBe('webp')
     expect(extensionForMime('image/png')).toBe('png')
+  })
+
+  it('maps reference-audio mime types to playable extensions', () => {
+    expect(extensionForMime('audio/mpeg')).toBe('mp3')
+    expect(extensionForMime('audio/wav')).toBe('wav')
+    expect(extensionForMime('audio/aac')).toBe('aac')
+    expect(extensionForMime('audio/ogg')).toBe('ogg')
   })
 
   it('builds project-scoped storage keys', () => {

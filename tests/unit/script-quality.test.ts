@@ -6,6 +6,8 @@ import {
   firstEpisodeColdOpenIssue,
   isSuspiciousTextReuse,
   removeRepeatedOpeningFromLaterEpisode,
+  scriptQualityAuditScore,
+  scriptQualityAuditWarnings,
   textReuseMetrics,
 } from '../../src/lib/script-quality'
 
@@ -91,5 +93,23 @@ describe('script quality audit', () => {
     expect(trimmed).toContain('陈蕊抓起桌上的啤酒')
     expect(trimmed).toContain('花衬衫男生递来违禁品')
     expect(trimmed).not.toContain('银发男生起哄')
+  })
+
+  it('scores repair candidates and summarizes residual findings without blocking output', () => {
+    const lengthOnly = {
+      duplicatePairs: [],
+      missingHooks: [],
+      lengthIssues: [{ episodeNumber: 5, characterCount: 500, minimum: 700, maximum: 3000 }],
+      firstEpisodeColdOpenIssue: null,
+    }
+    const missingHook = {
+      duplicatePairs: [],
+      missingHooks: [{ episodeNumber: 5, reason: '缺少结尾钩子' }],
+      lengthIssues: [],
+      firstEpisodeColdOpenIssue: null,
+    }
+
+    expect(scriptQualityAuditScore(lengthOnly)).toBeLessThan(scriptQualityAuditScore(missingHook))
+    expect(scriptQualityAuditWarnings(lengthOnly)).toEqual(['篇幅待确认：第 5 集'])
   })
 })

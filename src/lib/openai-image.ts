@@ -43,7 +43,7 @@ const IMAGE_TASK_POLL_INTERVAL_MS = 3000
 const IMAGE_TASK_POLL_TIMEOUT_MS = 30 * 60_000
 const DEFAULT_IMAGE_RETRY_DELAYS_MS = [15_000, 30_000, 60_000, 90_000, 180_000, 300_000, 300_000]
 
-type ImageGenerationInput = {
+export type ImageGenerationInput = {
   prompt: string
   model: string
   baseUrl: string
@@ -61,6 +61,7 @@ type ImageGenerationInput = {
   resumeProviderTask?: ImageProviderTask
   onRetry?: (info: ImageRetryInfo) => void | Promise<void>
   onProviderTaskUpdate?: (info: ImageProviderTaskUpdate) => void | Promise<void>
+  referenceImages?: Array<{ dataUrl: string }>
 }
 
 class ImageApiHttpError extends Error {
@@ -526,6 +527,9 @@ export function readableImageGenerationError(error: unknown) {
   if (status !== null && status >= 500) return '生图服务暂时不可用，系统已自动重试。请稍后再试。'
 
   const message = error instanceof Error ? error.message : String(error)
+  if (/IMAGE_MODEL_UNAVAILABLE/iu.test(message)) {
+    return '当前生图模型名称已失效或没有权限，系统未找到可用的主通道或备用通道。'
+  }
   if (isImageContentPolicyError(error)) {
     return '生图请求被内容规则拒绝，请调整提示词后重试。'
   }
@@ -565,6 +569,7 @@ async function parseJsonResponse(response: Response) {
 }
 
 export async function generateImageViaOpenAICompat(input: ImageGenerationInput) {
+  if (input.referenceImages?.length) return generateImageViaResponses(input)
   const mode = normalizeImageApiMode(input.mode)
   if (mode === 'responses') return generateImageViaResponses(input)
 
@@ -864,17 +869,22 @@ async function generateImageViaImagesEndpointOnce(input: ImageGenerationInput) {
   return outputs[0]
 }
 
-async function generateImageViaResponses(input: {
-  prompt: string
-  model: string
-  baseUrl: string
-  apiKey: string
-  quality?: string
-  size?: string
-  outputFormat?: string
-  outputCompression?: number
-  partialImages?: number
-}) {
+export function buildResponsesImageInput(input: Pick<ImageGenerationInput, 'prompt' | 'referenceImages'>) {
+  const prompt = `${RESPONSES_IMAGE_PROMPT_PREFIX}\n\nUser prompt:\n${input.prompt}`
+  if (!input.referenceImages?.length) return prompt
+  return [{
+    role: 'user',
+    content: [
+      { type: 'input_text', text: prompt },
+      ...input.referenceImages.map((reference) => ({
+        type: 'input_image',
+        image_url: reference.dataUrl,
+      })),
+    ],
+  }]
+}
+
+async function generateImageViaResponses(input: ImageGenerationInput) {
   const imageTool: Record<string, unknown> = {
     type: 'image_generation',
     partial_images: Math.min(3, Math.max(1, Math.round(input.partialImages || 3))),
@@ -892,7 +902,7 @@ async function generateImageViaResponses(input: {
     },
     body: JSON.stringify({
       model: input.model,
-      input: `${RESPONSES_IMAGE_PROMPT_PREFIX}\n\nUser prompt:\n${input.prompt}`,
+      input: buildResponsesImageInput(input),
       tools: [imageTool],
       tool_choice: { type: 'image_generation' },
       store: false,

@@ -60,9 +60,10 @@ describe('asset validation', () => {
       description: '荒废多年，霓虹灯半亮',
     })
 
-    expect(prompt).toContain('location design')
+    expect(prompt).toContain('电影级场景设定图')
     expect(prompt).toContain('旧剧院')
     expect(prompt).toContain('荒废多年')
+    expect(prompt).not.toMatch(/不要|禁止|杜绝/)
   })
 
   it('derives character and location names from prompt labels', () => {

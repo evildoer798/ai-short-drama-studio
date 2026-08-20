@@ -3,6 +3,7 @@ import 'server-only'
 import { cookies } from 'next/headers'
 import { createHmac, timingSafeEqual } from 'node:crypto'
 import { compare, hash } from 'bcryptjs'
+import { AccountRole } from '@prisma/client'
 import { prisma } from './db'
 import { env } from './env'
 import { HttpError } from './http'
@@ -96,6 +97,7 @@ export async function getCurrentUser() {
       username: true,
       name: true,
       mustChangePassword: true,
+      role: true,
     },
   })
 }
@@ -105,6 +107,14 @@ export async function requireUser() {
   if (!user) throw new HttpError(401, 'UNAUTHENTICATED', 'Please sign in')
   if (user.mustChangePassword) {
     throw new HttpError(403, 'PASSWORD_CHANGE_REQUIRED', '首次登录需要先修改密码')
+  }
+  return user
+}
+
+export async function requireAdmin() {
+  const user = await requireUser()
+  if (user.role !== AccountRole.admin) {
+    throw new HttpError(403, 'ADMIN_REQUIRED', '仅管理员可以访问费用后台')
   }
   return user
 }

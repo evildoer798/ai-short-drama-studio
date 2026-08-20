@@ -16,6 +16,7 @@ enum AssetType {
 enum MediaKind {
   image
   video
+  audio
 }
 
 enum ProjectRole {
@@ -24,11 +25,29 @@ enum ProjectRole {
   member
 }
 
+enum AccountRole {
+  user
+  admin
+}
+
 enum TaskStatus {
   queued
   processing
   completed
   failed
+}
+
+enum BillingTaskType {
+  image
+  video
+  audio
+  text
+}
+
+enum BillingStatus {
+  pending
+  settled
+  void
 }
 
 enum GenerationTaskType {
@@ -43,25 +62,118 @@ enum GenerationTaskType {
 
 enum VisualStyle {
   photorealistic
+  overseas_live_action
   anime_2d
   anime_3d
   chibi
 }
 
+enum CanvasNodeType {
+  image
+  video
+  audio
+}
+
+enum DirectorStage {
+  acting
+  lira
+  cinedance
+  review
+  completed
+}
+
+enum DirectorProductionStatus {
+  active
+  completed
+  archived
+}
+
+enum DirectorStageStatus {
+  draft
+  generating
+  ready
+  confirmed
+  failed
+}
+
+enum DirectorVideoDecision {
+  undecided
+  selected
+  rejected
+}
+
+enum DirectorFrameType {
+  first
+  end
+}
+
 model User {
-  id                 String            @id @default(cuid())
-  email              String            @unique
-  username           String?           @unique
-  name               String
-  passwordHash       String
-  mustChangePassword Boolean           @default(false)
-  createdAt          DateTime          @default(now())
-  updatedAt          DateTime          @updatedAt
-  assets             Asset[]           @relation("AssetCreator")
-  memberships        ProjectMember[]
-  taskRuns           GenerationTask[]
-  workspaces         WorkspaceMember[]
-  scriptComments     ScriptComment[]
+  id                      String                   @id @default(cuid())
+  email                   String                   @unique
+  username                String?                  @unique
+  name                    String
+  passwordHash            String
+  mustChangePassword      Boolean                  @default(false)
+  role                    AccountRole              @default(user)
+  createdAt               DateTime                 @default(now())
+  updatedAt               DateTime                 @updatedAt
+  assets                  Asset[]                  @relation("AssetCreator")
+  memberships             ProjectMember[]
+  taskRuns                GenerationTask[]
+  workspaces              WorkspaceMember[]
+  scriptComments          ScriptComment[]
+  canvases                CreativeCanvas[]
+  canvasImageTasks        CanvasImageTask[]
+  canvasVideoTasks        CanvasVideoTask[]
+  canvasAudioTasks        CanvasAudioTask[]
+  directorProductions     DirectorProduction[]     @relation("DirectorProductionCreator")
+  directorConfirmations   DirectorStageVersion[]   @relation("DirectorStageConfirmer")
+  directorVideoTasks      DirectorVideoTask[]
+  directorImageTasks      DirectorImageTask[]
+  directorStateImageTasks DirectorStateImageTask[]
+  billingEntries          UsageLedger[]
+}
+
+model PricingCatalogSnapshot {
+  provider        String   @id
+  pricingVersion  String
+  catalog         Json
+  fetchedAt       DateTime
+  lastAttemptedAt DateTime
+  lastError       String?  @db.Text
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+model UsageLedger {
+  id               String          @id @default(cuid())
+  idempotencyKey   String          @unique
+  userId           String
+  taskType         BillingTaskType
+  sourceType       String
+  sourceTaskId     String
+  model            String
+  quantity         Decimal         @db.Decimal(20, 6)
+  unit             String
+  unitPrice        Decimal?        @db.Decimal(24, 12)
+  amount           Decimal?        @db.Decimal(24, 12)
+  currency         String          @default("CNY")
+  status           BillingStatus   @default(pending)
+  pricingVersion   String?
+  pricingSource    String          @default("https://ai.cangyuansuanli.cn/api/pricing")
+  priceSnapshot    Json?
+  billingError     String?         @db.Text
+  occurredAt       DateTime        @default(now())
+  settledAt        DateTime?
+  voidedAt         DateTime?
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+  user             User            @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([userId, occurredAt])
+  @@index([status, occurredAt])
+  @@index([sourceType, sourceTaskId])
+  @@index([model, occurredAt])
 }
 
 model Workspace {
@@ -87,23 +199,24 @@ model WorkspaceMember {
 }
 
 model Project {
-  id                String           @id @default(cuid())
-  workspaceId       String
-  name              String
-  visualStyle       VisualStyle      @default(photorealistic)
-  customStylePrompt String?          @db.Text
-  selectedRenderId  String?          @unique
-  createdAt         DateTime         @default(now())
-  updatedAt         DateTime         @updatedAt
-  workspace         Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-  members           ProjectMember[]
-  assets            Asset[]
-  storyboards       Storyboard[]
-  tasks             GenerationTask[]
-  renders           ProjectRender[]  @relation("ProjectRenders")
-  selectedRender    ProjectRender?   @relation("SelectedProjectRender", fields: [selectedRenderId], references: [id], onDelete: SetNull)
-  novelSource       NovelSource?
-  scriptEpisodes    ScriptEpisode[]
+  id                  String               @id @default(cuid())
+  workspaceId         String
+  name                String
+  visualStyle         VisualStyle          @default(photorealistic)
+  customStylePrompt   String?              @db.Text
+  selectedRenderId    String?              @unique
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
+  workspace           Workspace            @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  members             ProjectMember[]
+  assets              Asset[]
+  storyboards         Storyboard[]
+  tasks               GenerationTask[]
+  renders             ProjectRender[]      @relation("ProjectRenders")
+  selectedRender      ProjectRender?       @relation("SelectedProjectRender", fields: [selectedRenderId], references: [id], onDelete: SetNull)
+  novelSource         NovelSource?
+  scriptEpisodes      ScriptEpisode[]
+  directorProductions DirectorProduction[]
 
   @@index([workspaceId])
 }
@@ -119,19 +232,20 @@ model NovelSource {
 }
 
 model ScriptEpisode {
-  id                 String          @id @default(cuid())
-  projectId          String
-  episodeNumber      Int
-  title              String
-  logline            String?         @db.Text
-  content            String          @db.Text
-  locked             Boolean         @default(false)
-  sourceChunkIndexes Int[]           @default([])
-  createdAt          DateTime        @default(now())
-  updatedAt          DateTime        @updatedAt
-  project            Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  comments           ScriptComment[]
-  storyboards        Storyboard[]
+  id                  String               @id @default(cuid())
+  projectId           String
+  episodeNumber       Int
+  title               String
+  logline             String?              @db.Text
+  content             String               @db.Text
+  locked              Boolean              @default(false)
+  sourceChunkIndexes  Int[]                @default([])
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
+  project             Project              @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  comments            ScriptComment[]
+  storyboards         Storyboard[]
+  directorProductions DirectorProduction[]
 
   @@unique([projectId, episodeNumber])
   @@index([projectId, locked])
@@ -169,24 +283,27 @@ model ProjectMember {
 }
 
 model Asset {
-  id              String            @id @default(cuid())
-  projectId       String
-  type            AssetType
-  name            String
-  description     String            @db.Text
-  tags            String[]          @default([])
-  prompt          String?           @db.Text
-  videoPrompt     String?           @db.Text
-  selectedImageId String?           @unique
-  createdById     String
-  createdAt       DateTime          @default(now())
-  updatedAt       DateTime          @updatedAt
-  createdBy       User              @relation("AssetCreator", fields: [createdById], references: [id], onDelete: Restrict)
-  project         Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  selectedImage   AssetImage?       @relation("SelectedAssetImage", fields: [selectedImageId], references: [id], onDelete: SetNull)
-  images          AssetImage[]      @relation("AssetImages")
-  tasks           GenerationTask[]
-  storyboardLinks StoryboardAsset[]
+  id               String                  @id @default(cuid())
+  projectId        String
+  type             AssetType
+  name             String
+  description      String                  @db.Text
+  tags             String[]                @default([])
+  prompt           String?                 @db.Text
+  videoPrompt      String?                 @db.Text
+  selectedImageId  String?                 @unique
+  createdById      String
+  createdAt        DateTime                @default(now())
+  updatedAt        DateTime                @updatedAt
+  createdBy        User                    @relation("AssetCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  project          Project                 @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  selectedImage    AssetImage?             @relation("SelectedAssetImage", fields: [selectedImageId], references: [id], onDelete: SetNull)
+  images           AssetImage[]            @relation("AssetImages")
+  tasks            GenerationTask[]
+  storyboardLinks  StoryboardAsset[]
+  actingProfile    CharacterActingProfile?
+  voiceProfile     VoiceProfile?
+  shotPerformances ShotPerformance[]
 
   @@index([projectId, type])
   @@index([createdById])
@@ -209,17 +326,432 @@ model AssetImage {
 }
 
 model MediaObject {
-  id               String            @id @default(cuid())
-  kind             MediaKind
-  storageKey       String            @unique
-  mimeType         String
-  sizeBytes        BigInt
-  width            Int?
-  height           Int?
-  createdAt        DateTime          @default(now())
-  images           AssetImage[]
-  storyboardVideos StoryboardVideo[]
-  projectRenders   ProjectRender[]
+  id                         String                      @id @default(cuid())
+  kind                       MediaKind
+  storageKey                 String                      @unique
+  mimeType                   String
+  sizeBytes                  BigInt
+  width                      Int?
+  height                     Int?
+  createdAt                  DateTime                    @default(now())
+  images                     AssetImage[]
+  storyboardVideos           StoryboardVideo[]           @relation("StoryboardVideoMedia")
+  storyboardVideoTailFrames  StoryboardVideo[]           @relation("StoryboardVideoTailFrame")
+  projectRenders             ProjectRender[]
+  canvasNodes                CanvasNode[]
+  canvasImageTasks           CanvasImageTask[]
+  canvasAudioTasks           CanvasAudioTask[]
+  directorVideoVersions      DirectorVideoVersion[]
+  directorImageVersions      DirectorImageVersion[]
+  directorStateImageVersions DirectorStateImageVersion[]
+}
+
+model CreativeCanvas {
+  id           String            @id @default(cuid())
+  userId       String
+  name         String
+  viewportX    Float             @default(0)
+  viewportY    Float             @default(0)
+  viewportZoom Float             @default(1)
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+  user         User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  nodes        CanvasNode[]
+  edges        CanvasEdge[]
+  imageTasks   CanvasImageTask[]
+  videoTasks   CanvasVideoTask[]
+  audioTasks   CanvasAudioTask[]
+
+  @@index([userId, updatedAt])
+}
+
+model CanvasNode {
+  id            String            @id @default(cuid())
+  canvasId      String
+  type          CanvasNodeType
+  title         String
+  positionX     Float
+  positionY     Float
+  width         Float             @default(320)
+  height        Float             @default(240)
+  prompt        String?           @db.Text
+  mediaId       String?
+  model         String?
+  duration      Int               @default(15)
+  aspectRatio   String            @default("16:9")
+  resolution    String            @default("720p")
+  generateAudio Boolean           @default(true)
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+  canvas        CreativeCanvas    @relation(fields: [canvasId], references: [id], onDelete: Cascade)
+  media         MediaObject?      @relation(fields: [mediaId], references: [id], onDelete: SetNull)
+  outgoingEdges CanvasEdge[]      @relation("CanvasEdgeSource")
+  incomingEdges CanvasEdge[]      @relation("CanvasEdgeTarget")
+  imageTasks    CanvasImageTask[]
+  videoTasks    CanvasVideoTask[]
+  audioTasks    CanvasAudioTask[]
+
+  @@index([canvasId, type])
+  @@index([mediaId])
+}
+
+model CanvasEdge {
+  id             String         @id @default(cuid())
+  canvasId       String
+  sourceNodeId   String
+  targetNodeId   String
+  referenceOrder Int
+  createdAt      DateTime       @default(now())
+  canvas         CreativeCanvas @relation(fields: [canvasId], references: [id], onDelete: Cascade)
+  sourceNode     CanvasNode     @relation("CanvasEdgeSource", fields: [sourceNodeId], references: [id], onDelete: Cascade)
+  targetNode     CanvasNode     @relation("CanvasEdgeTarget", fields: [targetNodeId], references: [id], onDelete: Cascade)
+
+  @@unique([sourceNodeId, targetNodeId])
+  @@index([canvasId, targetNodeId, referenceOrder])
+}
+
+model CanvasVideoTask {
+  id               String         @id @default(cuid())
+  canvasId         String
+  nodeId           String
+  createdById      String
+  status           TaskStatus     @default(queued)
+  provider         String         @default("openai-compatible-video")
+  model            String
+  prompt           String         @db.Text
+  duration         Int
+  aspectRatio      String
+  resolution       String
+  generateAudio    Boolean        @default(true)
+  referenceNodeIds String[]       @default([])
+  providerJobId    String?
+  progress         Int            @default(0)
+  error            String?        @db.Text
+  payload          Json?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+  startedAt        DateTime?
+  completedAt      DateTime?
+  canvas           CreativeCanvas @relation(fields: [canvasId], references: [id], onDelete: Cascade)
+  node             CanvasNode     @relation(fields: [nodeId], references: [id], onDelete: Cascade)
+  createdBy        User           @relation(fields: [createdById], references: [id], onDelete: Cascade)
+
+  @@index([canvasId, status])
+  @@index([nodeId, createdAt])
+  @@index([createdById])
+}
+
+model CanvasImageTask {
+  id               String         @id @default(cuid())
+  canvasId         String
+  nodeId           String
+  createdById      String
+  mediaId          String?        @unique
+  status           TaskStatus     @default(queued)
+  provider         String         @default("openai-compatible-image")
+  model            String
+  prompt           String         @db.Text
+  aspectRatio      String
+  resolution       String
+  count            Int            @default(1)
+  referenceNodeIds String[]       @default([])
+  progress         Int            @default(0)
+  error            String?        @db.Text
+  payload          Json?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+  startedAt        DateTime?
+  completedAt      DateTime?
+  canvas           CreativeCanvas @relation(fields: [canvasId], references: [id], onDelete: Cascade)
+  node             CanvasNode     @relation(fields: [nodeId], references: [id], onDelete: Cascade)
+  createdBy        User           @relation(fields: [createdById], references: [id], onDelete: Cascade)
+  media            MediaObject?   @relation(fields: [mediaId], references: [id], onDelete: SetNull)
+
+  @@index([canvasId, status])
+  @@index([nodeId, createdAt])
+  @@index([createdById])
+}
+
+model CanvasAudioTask {
+  id            String         @id @default(cuid())
+  canvasId      String
+  nodeId        String
+  createdById   String
+  mediaId       String?        @unique
+  status        TaskStatus     @default(queued)
+  provider      String         @default("cangyuan-audio")
+  model         String         @default("gemini-music")
+  prompt        String         @db.Text
+  providerJobId String?
+  progress      Int            @default(0)
+  error         String?        @db.Text
+  payload       Json?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  startedAt     DateTime?
+  completedAt   DateTime?
+  canvas        CreativeCanvas @relation(fields: [canvasId], references: [id], onDelete: Cascade)
+  node          CanvasNode     @relation(fields: [nodeId], references: [id], onDelete: Cascade)
+  createdBy     User           @relation(fields: [createdById], references: [id], onDelete: Cascade)
+  media         MediaObject?   @relation(fields: [mediaId], references: [id], onDelete: SetNull)
+
+  @@index([canvasId, status])
+  @@index([nodeId, createdAt])
+  @@index([createdById])
+}
+
+model DirectorProduction {
+  id                   String                        @id @default(cuid())
+  projectId            String
+  sourceEpisodeId      String?
+  createdById          String
+  name                 String
+  currentStage         DirectorStage                 @default(acting)
+  status               DirectorProductionStatus      @default(active)
+  sourceSnapshot       Json
+  settings             Json?
+  createdAt            DateTime                      @default(now())
+  updatedAt            DateTime                      @updatedAt
+  project              Project                       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  sourceEpisode        ScriptEpisode?                @relation(fields: [sourceEpisodeId], references: [id], onDelete: SetNull)
+  createdBy            User                          @relation("DirectorProductionCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  stageVersions        DirectorStageVersion[]
+  shots                DirectorShot[]
+  keyframes            DirectorKeyframe[]
+  characterStateAssets DirectorCharacterStateAsset[]
+
+  @@index([projectId, updatedAt])
+  @@index([sourceEpisodeId])
+  @@index([createdById])
+}
+
+model DirectorKeyframe {
+  id                     String                 @id @default(cuid())
+  productionId           String
+  shotKey                String
+  title                  String
+  frameType              DirectorFrameType
+  prompt                 String                 @db.Text
+  aspectRatio            String                 @default("16:9")
+  selectedImageVersionId String?                @unique
+  createdAt              DateTime               @default(now())
+  updatedAt              DateTime               @updatedAt
+  production             DirectorProduction     @relation(fields: [productionId], references: [id], onDelete: Cascade)
+  imageTasks             DirectorImageTask[]
+  imageVersions          DirectorImageVersion[] @relation("DirectorKeyframeVersions")
+  selectedImageVersion   DirectorImageVersion?  @relation("DirectorSelectedImage", fields: [selectedImageVersionId], references: [id], onDelete: SetNull)
+
+  @@unique([productionId, shotKey, frameType])
+  @@index([productionId, shotKey])
+}
+
+model DirectorCharacterStateAsset {
+  id                     String                      @id @default(cuid())
+  productionId           String
+  stateId                String
+  assetId                String
+  assetName              String
+  stateName              String
+  prompt                 String                      @db.Text
+  imageModelRoute        String
+  soulIdRequired         Boolean                     @default(false)
+  selectedImageVersionId String?                     @unique
+  createdAt              DateTime                    @default(now())
+  updatedAt              DateTime                    @updatedAt
+  production             DirectorProduction          @relation(fields: [productionId], references: [id], onDelete: Cascade)
+  imageTasks             DirectorStateImageTask[]
+  imageVersions          DirectorStateImageVersion[] @relation("DirectorStateAssetVersions")
+  selectedImageVersion   DirectorStateImageVersion?  @relation("DirectorSelectedStateImage", fields: [selectedImageVersionId], references: [id], onDelete: SetNull)
+
+  @@unique([productionId, stateId])
+  @@index([productionId, assetId])
+}
+
+model DirectorStateImageTask {
+  id                String                      @id @default(cuid())
+  stateAssetId      String
+  createdById       String
+  status            TaskStatus                  @default(queued)
+  model             String
+  prompt            String                      @db.Text
+  referenceMediaIds String[]                    @default([])
+  progress          Int                         @default(0)
+  error             String?                     @db.Text
+  payload           Json?
+  createdAt         DateTime                    @default(now())
+  updatedAt         DateTime                    @updatedAt
+  startedAt         DateTime?
+  completedAt       DateTime?
+  stateAsset        DirectorCharacterStateAsset @relation(fields: [stateAssetId], references: [id], onDelete: Cascade)
+  createdBy         User                        @relation(fields: [createdById], references: [id], onDelete: Cascade)
+  imageVersion      DirectorStateImageVersion?
+
+  @@index([stateAssetId, status])
+  @@index([createdById])
+}
+
+model DirectorStateImageVersion {
+  id           String                       @id @default(cuid())
+  stateAssetId String
+  taskId       String                       @unique
+  mediaId      String
+  version      Int
+  model        String
+  prompt       String                       @db.Text
+  createdAt    DateTime                     @default(now())
+  stateAsset   DirectorCharacterStateAsset  @relation("DirectorStateAssetVersions", fields: [stateAssetId], references: [id], onDelete: Cascade)
+  task         DirectorStateImageTask       @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  media        MediaObject                  @relation(fields: [mediaId], references: [id], onDelete: Restrict)
+  selectedFor  DirectorCharacterStateAsset? @relation("DirectorSelectedStateImage")
+
+  @@unique([stateAssetId, version])
+  @@index([mediaId])
+}
+
+model DirectorImageTask {
+  id                String                @id @default(cuid())
+  keyframeId        String
+  createdById       String
+  status            TaskStatus            @default(queued)
+  model             String
+  prompt            String                @db.Text
+  referenceMediaIds String[]              @default([])
+  progress          Int                   @default(0)
+  error             String?               @db.Text
+  payload           Json?
+  createdAt         DateTime              @default(now())
+  updatedAt         DateTime              @updatedAt
+  startedAt         DateTime?
+  completedAt       DateTime?
+  keyframe          DirectorKeyframe      @relation(fields: [keyframeId], references: [id], onDelete: Cascade)
+  createdBy         User                  @relation(fields: [createdById], references: [id], onDelete: Cascade)
+  imageVersion      DirectorImageVersion?
+
+  @@index([keyframeId, status])
+  @@index([createdById])
+}
+
+model DirectorImageVersion {
+  id          String            @id @default(cuid())
+  keyframeId  String
+  taskId      String            @unique
+  mediaId     String
+  version     Int
+  model       String
+  prompt      String            @db.Text
+  createdAt   DateTime          @default(now())
+  keyframe    DirectorKeyframe  @relation("DirectorKeyframeVersions", fields: [keyframeId], references: [id], onDelete: Cascade)
+  task        DirectorImageTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  media       MediaObject       @relation(fields: [mediaId], references: [id], onDelete: Restrict)
+  selectedFor DirectorKeyframe? @relation("DirectorSelectedImage")
+
+  @@unique([keyframeId, version])
+  @@index([mediaId])
+}
+
+model DirectorStageVersion {
+  id             String              @id @default(cuid())
+  productionId   String
+  stage          DirectorStage
+  version        Int
+  status         DirectorStageStatus @default(draft)
+  inputSnapshot  Json
+  output         Json?
+  feedback       String?             @db.Text
+  error          String?             @db.Text
+  skillName      String
+  skillVersion   String
+  promptSnapshot String?             @db.Text
+  confirmedById  String?
+  confirmedAt    DateTime?
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+  production     DirectorProduction  @relation(fields: [productionId], references: [id], onDelete: Cascade)
+  confirmedBy    User?               @relation("DirectorStageConfirmer", fields: [confirmedById], references: [id], onDelete: SetNull)
+
+  @@unique([productionId, stage, version])
+  @@index([productionId, stage, status])
+  @@index([confirmedById])
+}
+
+model DirectorShot {
+  id                     String                 @id @default(cuid())
+  productionId           String
+  order                  Int
+  title                  String
+  scriptExcerpt          String                 @db.Text
+  duration               Int                    @default(8)
+  aspectRatio            String                 @default("16:9")
+  performance            Json
+  visualPlan             Json
+  motionPlan             Json
+  continuityIn           Json
+  continuityOut          Json
+  generationPrompt       String                 @db.Text
+  selectedVideoVersionId String?                @unique
+  createdAt              DateTime               @default(now())
+  updatedAt              DateTime               @updatedAt
+  production             DirectorProduction     @relation(fields: [productionId], references: [id], onDelete: Cascade)
+  videoTasks             DirectorVideoTask[]
+  videoVersions          DirectorVideoVersion[] @relation("DirectorShotVersions")
+  selectedVideoVersion   DirectorVideoVersion?  @relation("DirectorSelectedVideo", fields: [selectedVideoVersionId], references: [id], onDelete: SetNull)
+
+  @@unique([productionId, order])
+  @@index([productionId, updatedAt])
+}
+
+model DirectorVideoTask {
+  id                String                @id @default(cuid())
+  shotId            String
+  createdById       String
+  status            TaskStatus            @default(queued)
+  provider          String                @default("openai-compatible-video")
+  model             String
+  prompt            String                @db.Text
+  duration          Int
+  aspectRatio       String
+  resolution        String
+  generateAudio     Boolean               @default(true)
+  referenceMediaIds String[]              @default([])
+  providerJobId     String?
+  progress          Int                   @default(0)
+  error             String?               @db.Text
+  payload           Json?
+  createdAt         DateTime              @default(now())
+  updatedAt         DateTime              @updatedAt
+  startedAt         DateTime?
+  completedAt       DateTime?
+  shot              DirectorShot          @relation(fields: [shotId], references: [id], onDelete: Cascade)
+  createdBy         User                  @relation(fields: [createdById], references: [id], onDelete: Cascade)
+  videoVersion      DirectorVideoVersion?
+
+  @@index([shotId, status])
+  @@index([createdById])
+}
+
+model DirectorVideoVersion {
+  id          String                @id @default(cuid())
+  shotId      String
+  taskId      String                @unique
+  mediaId     String
+  version     Int
+  name        String
+  model       String
+  prompt      String                @db.Text
+  duration    Int
+  aspectRatio String
+  decision    DirectorVideoDecision @default(undecided)
+  reviewNote  String?               @db.Text
+  createdAt   DateTime              @default(now())
+  updatedAt   DateTime              @updatedAt
+  shot        DirectorShot          @relation("DirectorShotVersions", fields: [shotId], references: [id], onDelete: Cascade)
+  task        DirectorVideoTask     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  media       MediaObject           @relation(fields: [mediaId], references: [id], onDelete: Restrict)
+  selectedFor DirectorShot?         @relation("DirectorSelectedVideo")
+
+  @@unique([shotId, version])
+  @@index([mediaId])
+  @@index([shotId, decision])
 }
 
 model GenerationTask {
@@ -253,32 +785,159 @@ model GenerationTask {
 }
 
 model Storyboard {
-  id              String            @id @default(cuid())
-  projectId       String
-  episodeId       String?
-  title           String
-  sceneNumber     Int               @default(1)
+  id                 String            @id @default(cuid())
+  projectId          String
+  episodeId          String?
+  title              String
+  sceneNumber        Int               @default(1)
   episodeSceneNumber Int?
-  generatedByAI   Boolean           @default(false)
-  notes           String?           @db.Text
-  imagePrompt     String?           @db.Text
-  videoPrompt     String?           @db.Text
-  duration        Int               @default(15)
-  aspectRatio     String            @default("16:9")
-  generateAudio   Boolean           @default(true)
-  selectedVideoId String?           @unique
-  createdAt       DateTime          @default(now())
-  updatedAt       DateTime          @updatedAt
-  project         Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  episode         ScriptEpisode?    @relation(fields: [episodeId], references: [id], onDelete: SetNull)
-  selectedVideo   StoryboardVideo?  @relation("SelectedStoryboardVideo", fields: [selectedVideoId], references: [id], onDelete: SetNull)
-  videos          StoryboardVideo[] @relation("StoryboardVideos")
-  assetLinks      StoryboardAsset[]
-  tasks           GenerationTask[]
+  generatedByAI      Boolean           @default(false)
+  notes              String?           @db.Text
+  imagePrompt        String?           @db.Text
+  directorPrompt     String?           @db.Text
+  videoPrompt        String?           @db.Text
+  duration           Int               @default(15)
+  aspectRatio        String            @default("16:9")
+  generateAudio      Boolean           @default(true)
+  assetSelectionInitialized Boolean    @default(false)
+  continuityIn       Json?
+  continuityOut      Json?
+  selectedVideoId    String?           @unique
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
+  project            Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  episode            ScriptEpisode?    @relation(fields: [episodeId], references: [id], onDelete: SetNull)
+  selectedVideo      StoryboardVideo?  @relation("SelectedStoryboardVideo", fields: [selectedVideoId], references: [id], onDelete: SetNull)
+  videos             StoryboardVideo[] @relation("StoryboardVideos")
+  assetLinks         StoryboardAsset[]
+  tasks              GenerationTask[]
+  performances       ShotPerformance[]
 
   @@unique([projectId, sceneNumber])
   @@index([projectId])
   @@index([episodeId, episodeSceneNumber])
+}
+
+model CharacterActingProfile {
+  id                     String            @id @default(cuid())
+  assetId                String            @unique
+  masterPrompt           String            @db.Text
+  physicality            String            @db.Text
+  psychologicalEngine    String            @db.Text
+  vocalBehavior          String            @db.Text
+  signatureTics          Json?
+  stressTics             Json?
+  concealmentBehavior    String?           @db.Text
+  facialMask             String?           @db.Text
+  maskCrackTrigger       String?           @db.Text
+  pressureTransformation String?           @db.Text
+  gait                   String?           @db.Text
+  eyeLife                String            @db.Text
+  softeningTarget        String?           @db.Text
+  version                Int               @default(1)
+  createdAt              DateTime          @default(now())
+  updatedAt              DateTime          @updatedAt
+  asset                  Asset             @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  shotPerformances       ShotPerformance[]
+
+  @@index([updatedAt])
+}
+
+model VoiceProfile {
+  id               String            @id @default(cuid())
+  assetId          String            @unique
+  prompt           String            @db.Text
+  ageDescriptor    String?
+  originAccent     String?
+  timbreRegister   String?           @db.Text
+  paceDelivery     String?           @db.Text
+  pressureShift    String?           @db.Text
+  locked           Boolean           @default(true)
+  version          Int               @default(1)
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  asset            Asset             @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  shotPerformances ShotPerformance[]
+
+  @@index([updatedAt])
+}
+
+model ShotPerformance {
+  id              String                  @id @default(cuid())
+  storyboardId    String
+  assetId         String
+  actingProfileId String?
+  voiceProfileId  String?
+  objective       String                  @db.Text
+  obstacle        String                  @db.Text
+  stakes          String                  @db.Text
+  subtext         String?                 @db.Text
+  business        String?                 @db.Text
+  statusIn        String?
+  statusOut       String?
+  proximityIn     String?
+  proximityOut    String?
+  sceneAdaptation String?                 @db.Text
+  speaks          Boolean                 @default(false)
+  qualityScore    Int?
+  qualityReport   Json?
+  createdAt       DateTime                @default(now())
+  updatedAt       DateTime                @updatedAt
+  storyboard      Storyboard              @relation(fields: [storyboardId], references: [id], onDelete: Cascade)
+  asset           Asset                   @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  actingProfile   CharacterActingProfile? @relation(fields: [actingProfileId], references: [id], onDelete: SetNull)
+  voiceProfile    VoiceProfile?           @relation(fields: [voiceProfileId], references: [id], onDelete: SetNull)
+  beats           PerformanceBeat[]
+
+  @@unique([storyboardId, assetId])
+  @@index([assetId])
+  @@index([actingProfileId])
+  @@index([voiceProfileId])
+}
+
+model PerformanceBeat {
+  id                String          @id @default(cuid())
+  shotPerformanceId String
+  order             Int
+  startSeconds      Float?
+  endSeconds        Float?
+  tactic            String
+  trigger           String?         @db.Text
+  behavior          String          @db.Text
+  reaction          String?         @db.Text
+  gaze              String?         @db.Text
+  posture           String?         @db.Text
+  tempo             String?         @db.Text
+  voiceDelivery     String?         @db.Text
+  entryState        String?         @db.Text
+  exitState         String?         @db.Text
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+  shotPerformance   ShotPerformance @relation(fields: [shotPerformanceId], references: [id], onDelete: Cascade)
+
+  @@unique([shotPerformanceId, order])
+  @@index([shotPerformanceId, startSeconds])
+}
+
+model StoryboardRevision {
+  id                 String   @id @default(cuid())
+  projectId          String
+  episodeId          String?
+  storyboardId       String
+  episodeSceneNumber Int?
+  sceneNumber        Int
+  source             String
+  reason             String?  @db.Text
+  sourceTaskId       String?
+  createdById        String?
+  snapshot           Json
+  contentHash        String
+  validationReport   Json?
+  createdAt          DateTime @default(now())
+
+  @@index([storyboardId, createdAt])
+  @@index([episodeId, episodeSceneNumber, createdAt])
+  @@index([projectId, createdAt])
 }
 
 model StoryboardAsset {
@@ -298,24 +957,27 @@ model StoryboardAsset {
 }
 
 model StoryboardVideo {
-  id            String      @id @default(cuid())
-  storyboardId  String
-  sourceStoryboardIds String[] @default([])
-  mediaId       String
-  name          String?
-  prompt        String      @db.Text
-  model         String
-  providerJobId String?
-  duration      Int
-  aspectRatio   String
-  isSelected    Boolean     @default(false)
-  createdAt     DateTime    @default(now())
-  storyboard    Storyboard  @relation("StoryboardVideos", fields: [storyboardId], references: [id], onDelete: Cascade)
-  media         MediaObject @relation(fields: [mediaId], references: [id], onDelete: Restrict)
-  selectedFor   Storyboard? @relation("SelectedStoryboardVideo")
+  id                  String       @id @default(cuid())
+  storyboardId        String
+  sourceStoryboardIds String[]     @default([])
+  mediaId             String
+  tailFrameMediaId    String?
+  name                String?
+  prompt              String       @db.Text
+  model               String
+  providerJobId       String?
+  duration            Int
+  aspectRatio         String
+  isSelected          Boolean      @default(false)
+  createdAt           DateTime     @default(now())
+  storyboard          Storyboard   @relation("StoryboardVideos", fields: [storyboardId], references: [id], onDelete: Cascade)
+  media               MediaObject  @relation("StoryboardVideoMedia", fields: [mediaId], references: [id], onDelete: Restrict)
+  tailFrameMedia      MediaObject? @relation("StoryboardVideoTailFrame", fields: [tailFrameMediaId], references: [id], onDelete: SetNull)
+  selectedFor         Storyboard?  @relation("SelectedStoryboardVideo")
 
   @@index([storyboardId])
   @@index([mediaId])
+  @@index([tailFrameMediaId])
 }
 
 model ProjectRender {

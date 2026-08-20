@@ -20,6 +20,7 @@ describe('storyboard and asset scene consistency', () => {
     expect(storyboardLocationNames({
       notes: '凌晨｜老陈中餐门口｜密集秋雨、油腻屋檐、湿砖墙',
     })).toEqual(['老陈中餐门口'])
+    expect(storyboardLocationNames({ notes: '豪宅书房·雨夜' })).toEqual(['豪宅书房·雨夜'])
   })
 
   it('requires exact asset names and reports every missing storyboard scene', () => {

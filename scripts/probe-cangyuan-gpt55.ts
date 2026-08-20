@@ -8,7 +8,7 @@ const apiKey = keySource === 'video'
     : keySource === 'text'
       ? env.textApiKey()
       : env.openAICompatApiKey()
-const response = await fetch('https://ai.cangyuansuanli.cn/v1/chat/completions', {
+const response = await fetch('http://direct-api.cangyuansuanli.cn/v1/chat/completions', {
   method: 'POST',
   headers: {
     authorization: `Bearer ${apiKey}`,

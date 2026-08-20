@@ -1,7 +1,7 @@
 import { AssetType } from '@prisma/client'
 import { prisma } from './db'
 import { assetImageUrl } from './assets'
-import { getProjectStoryboards } from './storyboards'
+import { getAccessibleVideoLibrary, getProjectStoryboards } from './storyboards'
 import { visualStyleOptions } from './visual-styles'
 
 export async function getWorkspaceData(userId: string, input?: {
@@ -32,6 +32,7 @@ export async function getWorkspaceData(userId: string, input?: {
       activeProjectId: null,
       assets: [],
       storyboards: [],
+      videoLibrary: [],
       styleOptions: visualStyleOptions(),
     }
   }
@@ -75,7 +76,10 @@ export async function getWorkspaceData(userId: string, input?: {
     orderBy: { updatedAt: 'desc' },
   })
 
-  const storyboards = await getProjectStoryboards(activeProjectId)
+  const [storyboards, videoLibrary] = await Promise.all([
+    getProjectStoryboards(activeProjectId),
+    getAccessibleVideoLibrary(projects.map((project) => project.id)),
+  ])
 
   return {
     projects: projects.map((project) => ({
@@ -88,6 +92,7 @@ export async function getWorkspaceData(userId: string, input?: {
     activeProjectId,
     styleOptions: visualStyleOptions(),
     storyboards,
+    videoLibrary,
     assets: assets.map((asset) => ({
       id: asset.id,
       projectId: asset.projectId,

@@ -4,6 +4,7 @@ import {
   extractJsonValue,
   extractResponsesSseText,
   extractResponsesText,
+  extractTextUsage,
   generateTextViaOpenAICompat,
   generateTextWithFallback,
   resolveChatCompletionsEndpoint,
@@ -31,6 +32,19 @@ describe('OpenAI-compatible text helpers', () => {
     expect(extractResponsesText({
       output: [{ content: [{ type: 'output_text', text: '第一段' }, { output_text: '第二段' }] }],
     })).toBe('第一段第二段')
+  })
+
+  it('normalizes chat and Responses token usage for billing', () => {
+    expect(extractTextUsage({
+      usage: {
+        prompt_tokens: 1200,
+        completion_tokens: 300,
+        prompt_tokens_details: { cached_tokens: 400 },
+      },
+    })).toEqual({ inputTokens: 1200, outputTokens: 300, cachedInputTokens: 400 })
+    expect(extractTextUsage({
+      usage: { input_tokens: 900, output_tokens: 100 },
+    })).toEqual({ inputTokens: 900, outputTokens: 100 })
   })
 
   it('joins Responses API SSE text deltas', () => {

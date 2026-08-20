@@ -12,6 +12,9 @@ import {
   buildSeriesBibleMergePrompt,
   buildSeriesBiblePrompt,
   buildSingleAssetPrompt,
+  buildStoryboardContinuityRepairPrompt,
+  buildStoryboardFinalRepairPrompt,
+  buildStoryboardFinalReviewPrompt,
   buildStoryboardGenerationPrompt,
   canonicalizeScriptCharacterNames,
   dialogueMissing,
@@ -52,6 +55,24 @@ describe('preproduction prompt rules', () => {
       { speaker: '陈蕊', os: true, text: '真麻烦。' },
     ])
     expect(dialogueMissing('苏文菁：下周见面吃饭', '下周见面吃饭。')).toBe(false)
+    expect(dialogueMissing(
+      '林夏：失恋就失恋，看开点。大学里还有漂亮学姐和诗与远方。',
+      '失恋就失恋了，看开一点，往好的想，大学里还有漂亮的学姐以及诗和远方呢。',
+    )).toBe(false)
+    expect(dialogueMissing('林夏：大学生活会更好。', '大学里还有漂亮的学姐以及诗和远方。')).toBe(true)
+  })
+
+  it('keeps speaker directions out of names and ignores narrative colons', () => {
+    const script = [
+      '陆野（语音通话，哭腔）：夏哥，我失恋了。',
+      '林夏（叹气）：看开一点。',
+      '林夏的手机突然震动，他低头一看，是母亲发来的微信：“儿子，开学快乐。”',
+    ].join('\n')
+
+    expect(extractScriptDialogueLines(script)).toEqual([
+      { speaker: '陆野', os: false, text: '夏哥，我失恋了。' },
+      { speaker: '林夏', os: false, text: '看开一点。' },
+    ])
   })
 
   it('requires on-screen dialogue but leaves narration and OS available for visual replacement', () => {
@@ -65,6 +86,149 @@ describe('preproduction prompt rules', () => {
     expect(extractRequiredStoryboardDialogueLines(script)).toEqual([
       { speaker: '苏文菁', os: false, text: '下周见面吃饭。' },
     ])
+  })
+
+  it('does not count screenplay cast metadata as spoken dialogue', () => {
+    const script = [
+      '场1-1',
+      '出场人物：克莱尔、达米安',
+      '地点：黑松庄园主屋客厅',
+      '克莱尔·摩根：为什么？',
+      '达米安·克劳：你只是个工具。',
+    ].join('\n')
+
+    expect(extractRequiredStoryboardDialogueLines(script)).toEqual([
+      { speaker: '克莱尔·摩根', os: false, text: '为什么？' },
+      { speaker: '达米安·克劳', os: false, text: '你只是个工具。' },
+    ])
+  })
+
+  it('resolves overseas storyboard dialogue to American English instead of exact Chinese speech', () => {
+    const prompt = buildStoryboardGenerationPrompt({
+      episodeNumber: 1,
+      episodeTitle: '坠落的开端',
+      script: '克莱尔·摩根：为什么？',
+      assets: [],
+      visualStyle: VisualStyle.overseas_live_action,
+    })
+
+    expect(prompt).toContain('a 字段只能写自然、简洁的美式英语')
+    expect(prompt).toContain('完整对应源剧本对白的语义、说话人和先后顺序')
+    expect(prompt).toContain('禁止出现中文台词')
+    expect(prompt).not.toContain('CINE-LOCK 导演情绪设计')
+    expect(prompt).toContain('每 3 个连续原子分镜合成为一条 15 秒视频')
+  })
+
+  it('preserves exact Chinese dialogue without an episode duration cap', () => {
+    const prompt = buildStoryboardGenerationPrompt({
+      episodeNumber: 1,
+      episodeTitle: '开学遇到老婆',
+      script: '林夏：失恋就失恋了，看开一点，往好的想。',
+      assets: [],
+      visualStyle: VisualStyle.anime_3d,
+    })
+
+    expect(prompt).toContain('不得删词、改写、合并、串词或换说话人')
+    expect(prompt).not.toContain('整集最长 180 秒')
+    expect(prompt).toContain('每 3 个连续原子分镜合成为一条 15 秒视频')
+    expect(prompt).not.toContain('覆盖约 90 秒剧情')
+  })
+
+  it('does not expose the next segment text to the current storyboard generation call', () => {
+    const prompt = buildStoryboardGenerationPrompt({
+      episodeNumber: 1,
+      episodeTitle: '坠落的开端',
+      script: '克莱尔·摩根仍悬在崖边。',
+      assets: [],
+      visualStyle: VisualStyle.overseas_live_action,
+      segment: {
+        index: 1,
+        total: 2,
+        nextHead: '深海之下，克莱尔手腕封印碎裂。',
+      },
+    })
+
+    expect(prompt).toContain('当前段不得提前生成、概括或复述后段事件')
+    expect(prompt).not.toContain('深海之下，克莱尔手腕封印碎裂')
+  })
+
+  it('builds a mandatory full-episode review against the locked script', () => {
+    const prompt = buildStoryboardFinalReviewPrompt({
+      episodeNumber: 1,
+      script: '克莱尔·摩根：为什么？\n崖边碎石松脱。',
+      currentJson: '{"shots":[]}',
+      targetShotCount: 18,
+      visualStyle: VisualStyle.overseas_live_action,
+      allowedLocationNames: ['月光悬崖'],
+      issues: ['镜头 2 重复坠落'],
+    })
+
+    expect(prompt).toContain('从第一行到最后一行做一次最终审片')
+    expect(prompt).toContain('镜头 2 重复坠落')
+    expect(prompt).toContain('剧情顺序')
+    expect(prompt).toContain('结尾钩子')
+    expect(prompt).toContain('自然、简洁的美式英语')
+    expect(prompt).toContain('月光悬崖')
+    expect(prompt).toContain('本次调用只负责找出仍然存在的问题')
+    expect(prompt).toContain('"severity":"fatal"')
+    expect(prompt).not.toContain('只返回需要执行的小型修复补丁')
+  })
+
+  it('builds a separate repair prompt that must apply the review result', () => {
+    const prompt = buildStoryboardFinalRepairPrompt({
+      episodeNumber: 1,
+      script: '克莱尔·摩根：为什么？\n崖边碎石松脱。',
+      currentJson: '{"shots":[]}',
+      targetShotCount: 18,
+      visualStyle: VisualStyle.overseas_live_action,
+      allowedLocationNames: ['月光悬崖'],
+      repairRound: 2,
+      issues: [{
+        severity: 'fatal',
+        category: 'dialogue',
+        shotNumbers: [2],
+        scriptEvidence: '克莱尔先问为什么',
+        problem: '对白顺序错误',
+        repairInstruction: '把克莱尔的对白移到坠落之前',
+      }],
+    })
+
+    expect(prompt).toContain('第 2 轮整集分镜修复')
+    expect(prompt).toContain('只负责根据这些问题生成可执行的小型补丁')
+    expect(prompt).toContain('把克莱尔的对白移到坠落之前')
+    expect(prompt).toContain('不得返回空补丁')
+    expect(prompt).toContain('passed 固定写 false')
+  })
+
+  it('keeps dialogue repair verbatim and splits overlong speech', () => {
+    const prompt = buildStoryboardContinuityRepairPrompt({
+      episodeNumber: 1,
+      script: '陆野：感觉还是不太靠谱啊，要不你女装给兄弟我看一次吧。',
+      currentJson: '{"shots":[]}',
+      issues: ['对白超过镜头自然时长'],
+      targetShotCount: 12,
+    })
+
+    expect(prompt).toContain('逐字保留说话人和完整原台词')
+    expect(prompt).toContain('放不下时拆成多个 4-6 秒原子镜头')
+    expect(prompt).toContain('禁止删词、改写或加速念词')
+    expect(prompt).toContain('多位现场对白说话人')
+  })
+
+  it('locks an explicit cold-open replay and dialogue continuations during final review', () => {
+    const prompt = buildStoryboardFinalReviewPrompt({
+      episodeNumber: 1,
+      script: '【倒叙冷开场】\n克莱尔坠落。\n【回到主线】\n克莱尔在主线后段再次坠落。',
+      currentJson: '{"shots":[]}',
+      targetShotCount: 18,
+      visualStyle: VisualStyle.overseas_live_action,
+      allowedLocationNames: ['月光悬崖'],
+    })
+
+    expect(prompt).toContain('必须同时保留冷开场预演与主线后段的完整事件')
+    expect(prompt).toContain('不得把两者判为普通重复')
+    expect(prompt).toContain('标题带“对白续镜”的相邻镜头共同承载一条长对白')
+    expect(prompt).toContain('禁止把完整长句复制到每个续镜')
   })
 
   it('locks canonical character names and adjacent episode context into script prompts', () => {
@@ -189,7 +353,7 @@ describe('preproduction prompt rules', () => {
     expect(normalized).not.toContain('苏苏文菁')
   })
 
-  it('enforces anonymous, empty location prompts and distinctive names', () => {
+  it('builds concise positive location prompts and distinctive names', () => {
     const result = enforceAssetPrompt({
       type: AssetType.location,
       name: '客厅',
@@ -198,9 +362,12 @@ describe('preproduction prompt rules', () => {
       visualStyle: VisualStyle.photorealistic,
     })
     expect([...result.name].length).toBeGreaterThanOrEqual(4)
-    expect(result.prompt.startsWith('不能出现其他人, 无人, 纯场景,')).toBe(true)
+    expect(result.prompt).toContain('【真人写实】')
+    expect(result.prompt).toContain('建筑与环境为画面主体')
+    expect(result.prompt).toContain('24mm，f5.6')
     expect(result.prompt).not.toContain('苏文菁')
-    expect(result.prompt).toMatch(/no humans, empty, landscape only/i)
+    expect(result.prompt).not.toMatch(/不能出现其他人|no humans|empty|杜绝/iu)
+    expect(result.prompt.length).toBeLessThanOrEqual(820)
   })
 
   it('preserves an exact storyboard scene name even when it is short', () => {
@@ -215,6 +382,28 @@ describe('preproduction prompt rules', () => {
     expect(result.name).toBe('旧屋')
   })
 
+  it('compacts legacy scene prompts without repeating reverse constraints', () => {
+    const result = enforceAssetPrompt({
+      type: AssetType.location,
+      name: '雨夜翡翠山庄',
+      prompt: [
+        '不能出现其他人, 无人, 纯场景, 【真人写实】电影级超写实。',
+        '场景必须绝对真空与匿名，提示词必须以不能出现其他人开头。',
+        '现代雨夜独栋别墅，前景为湿润石板路，中景为花岗岩外墙和门廊，背景为冷蓝夜空。落地窗透出暖黄灯光，皮质沙发与玻璃茶几材质清晰。',
+        '镜头参数：电影摄影机，35mm，f5.6，深景深，对焦别墅入口，背景保留环境细节，真实镜头焦外。',
+        '杜绝游戏 CG 感、塑料感、过度美化、错误透视、过曝和主体模糊。no humans, empty, landscape only。',
+      ].join('\n'),
+      characterNames: [],
+      visualStyle: VisualStyle.photorealistic,
+    })
+
+    expect(result.prompt.match(/【真人写实】/g)).toHaveLength(1)
+    expect(result.prompt).toContain('前景为湿润石板路')
+    expect(result.prompt).toContain('35mm，f5.6')
+    expect(result.prompt).not.toMatch(/不能出现其他人|无人|no humans|empty|杜绝|禁止/iu)
+    expect(result.prompt.length).toBeLessThanOrEqual(820)
+  })
+
   it('includes the supplied production rules in asset and storyboard prompts', () => {
     const assetPrompt = buildAssetExtractionPrompt({
       script: '第1集\n苏文菁：下周见。',
@@ -227,7 +416,8 @@ describe('preproduction prompt rules', () => {
     })
     expect(assetPrompt).toContain('正面、侧面、背面')
     expect(assetPrompt).toContain('高角度航拍俯瞰')
-    expect(assetPrompt).toContain('不能出现其他人, 无人, 纯场景,')
+    expect(assetPrompt).toContain('建筑与环境为画面主体')
+    expect(assetPrompt).not.toContain('no humans, empty, landscape only')
     expect(assetPrompt).toContain('陈蕊（Jessica）')
     expect(assetPrompt).toContain('原样复用已有名称')
 
@@ -246,44 +436,25 @@ describe('preproduction prompt rules', () => {
       visualStyle: VisualStyle.photorealistic,
     })
     expect(storyboardPrompt).toContain('苏文菁')
-    expect(storyboardPrompt).toContain('一个分镜最多只允许一个人物说话')
-    expect(storyboardPrompt).toContain('人物在场说出的对白必须逐字保留')
-    expect(storyboardPrompt).toContain('非必要旁白/画外音/【OS】必须写成“无对白”')
-    expect(storyboardPrompt).toContain('默认全部省略')
-    expect(storyboardPrompt).toContain('系统会在保存前自动移除')
-    expect(storyboardPrompt).toContain('禁止使用画外音解释角色正在做什么')
-    expect(storyboardPrompt).toContain('每镜承载约 70 个中文字')
-    expect(storyboardPrompt).toContain('c 对应“景别机位运动”')
-    expect(storyboardPrompt).toContain('同职业、同族裔、同款服装或相似道具不代表同一人物')
-    expect(storyboardPrompt).toContain('禁止把甲角色的伤势、经历、车辆或随身物品转移给乙角色')
-    expect(storyboardPrompt).toContain('v 对应“画面内容”')
-    expect(storyboardPrompt).toContain('a 对应“动作对白”')
-    expect(storyboardPrompt).toContain('人物锁定、道具锁定、环境与照明锁定')
-    expect(storyboardPrompt).toContain('下一镜 p 必须逐项复述上一镜 g')
-    expect(storyboardPrompt).toContain('道具只属于谁、戴在哪只手或拿在哪只手')
-    expect(storyboardPrompt).toContain('先……；随后……；然后……；最后……')
-    expect(storyboardPrompt).toContain('起始姿态和重心、哪一侧肢体主动')
-    expect(storyboardPrompt).toContain('人物或物体间接触点')
-    expect(storyboardPrompt).toContain('确保主动肢体、双脚和接触点始终在画内')
-    expect(storyboardPrompt).toContain('每个原子镜头最多一个复杂身体动作')
-    expect(storyboardPrompt).toContain('"m":"重心、主动肢体路径、接触点、遮挡和结束姿态"')
-    expect(storyboardPrompt).toContain('"f":"首帧精确构图"')
-    expect(storyboardPrompt).toContain('"g":"尾帧精确构图和人物状态"')
-    expect(storyboardPrompt).toContain('"z":"剧情专属禁止项和具体负面缺陷词"')
+    expect(storyboardPrompt).toContain('你是一位深耕电影30余年的世界顶级导演')
+    expect(storyboardPrompt).toContain('适合即梦生成动漫视频')
+    expect(storyboardPrompt).toContain('同一原子分镜可以按剧本顺序包含多名角色的连续对话')
+    expect(storyboardPrompt).toContain('同一原子分镜允许多位现场对白说话人按剧本顺序依次说话')
+    expect(storyboardPrompt).toContain('内心独白标注【OS】')
+    expect(storyboardPrompt).toContain('本次生成任务')
+    expect(storyboardPrompt).toContain('项目画风补充')
+    expect(storyboardPrompt).toContain('【本段可用场景资产】')
+    expect(storyboardPrompt).toContain('【本段锁定剧本】')
+    expect(storyboardPrompt).not.toContain('【统一画风锁定】')
+    expect(storyboardPrompt).not.toContain('CINE-LOCK')
+    expect(storyboardPrompt).not.toContain('【不可违反】')
+    expect(storyboardPrompt).not.toContain('每个独立分镜累计最多 4 名角色')
     expect(storyboardPrompt).toContain('{"shots"')
     expect(storyboardPrompt).toContain('翡翠山庄别墅客厅')
-    expect(storyboardPrompt).toContain('本段允许的场景资产｜唯一地点白名单')
-    expect(storyboardPrompt).toContain('n 必须严格使用“时间｜场景资产标准名”')
     expect(storyboardPrompt).toContain('米白长沙发、黑色矮几与左侧暖黄落地灯位置固定')
-    expect(storyboardPrompt).toContain('不得让画面人物错误开口')
-    expect(storyboardPrompt).toContain('通用电影参数由系统自动补齐')
-    expect(storyboardPrompt).toContain('初始神态 -> 触发动作或对白 -> 可见变化')
-    expect(storyboardPrompt).toContain('相邻镜头要有连续而不重复的情绪递进')
-    expect(storyboardPrompt).toContain('禁止脱离剧情随机变脸')
-    expect(storyboardPrompt).toContain('shots 必须至少包含一个镜头')
-    expect(storyboardPrompt).toContain('严禁跨集组合')
-    expect(storyboardPrompt).toContain('3-4 个相邻分镜')
-    expect(storyboardPrompt).toContain('每集至少形成约 20 个分镜')
+    expect(storyboardPrompt).toContain('每 3 个连续原子分镜合成为一条 15 秒视频')
+    expect(storyboardPrompt).toContain('每条视频提示词开头固定包含【风格基调】【本分镜人物】【场景】')
+    expect(storyboardPrompt).toContain('无背景音乐、无字幕')
     expect(STORYBOARD_GLOBAL_RULES).toContain('相邻镜头承接上一情绪但不得无理由重复同一表情')
     expect(STORYBOARD_GLOBAL_RULES).toContain('只有当前时间段指定的角色开口')
     expect(STORYBOARD_GLOBAL_RULES).toContain('下一镜首帧必须从上一镜尾帧')
@@ -291,15 +462,16 @@ describe('preproduction prompt rules', () => {
     expect(STORYBOARD_GLOBAL_RULES).toContain('禁止两个时空的人物或陈设同时存在')
     expect(STORYBOARD_GLOBAL_RULES).toContain('双脚接触地面时不得滑移')
     expect(STORYBOARD_GLOBAL_RULES).toContain('复杂动作时，优先中景、全身景别的固定机位或单向稳定跟拍')
-    expect(STORYBOARD_GLOBAL_RULES).toContain('默认无旁白、无画外音、无内心独白')
+    expect(STORYBOARD_GLOBAL_RULES).toContain('完整保留原剧本明确存在的旁白、画外音和【OS】')
+    expect(STORYBOARD_GLOBAL_RULES).toContain('不得用斜杠标题、蒙太奇、快切')
 
     const missingDialoguePrompt = buildMissingDialogueShotsPrompt({
       episodeNumber: 1,
       script: '苏文菁垂眼看着屏幕。\n苏文菁：下周见。',
       missing: [{ speaker: '苏文菁', os: false, text: '下周见。' }],
     })
-    expect(missingDialoguePrompt).toContain('初始神态 -> 遗漏对白触发 -> 可见变化')
-    expect(missingDialoguePrompt).toContain('视线以及眉眼或嘴角微变化')
+    expect(missingDialoguePrompt).toContain('初始神态 -> 对白触发 -> 可见变化')
+    expect(missingDialoguePrompt).toContain('当前说话者口型、其他人物的倾听反应')
     expect(missingDialoguePrompt).toContain('人物、道具、环境、照明、首尾帧和禁止项')
   })
 
@@ -325,10 +497,31 @@ describe('preproduction prompt rules', () => {
       visualStyle: VisualStyle.photorealistic,
     })
     expect(prompt).toContain('当前处于先分镜、后资产规划流程')
-    expect(prompt).toContain('本段允许的剧本标准场景｜唯一地点白名单')
-    expect(prompt).toContain('n 必须严格使用“时间｜剧本标准场景名”')
+    expect(prompt).toContain('【本段剧本场景】')
     expect(prompt).toContain('翡翠山庄34号客厅')
-    expect(prompt).toContain('后续资产规划必须复用的唯一名称')
+    expect(prompt).not.toContain('唯一地点白名单')
+  })
+
+  it('recognizes compact pipe headings and splits explicitly combined interior and exterior spaces', () => {
+    const locations = extractScriptSceneLocations([
+      '场次 1｜日/内｜民政局登记大厅',
+      '林夏与洛雪微走到登记窗口前。',
+      '场次 2｜日/外/内｜民政局门口及迈巴赫车内',
+      '两人走出民政局门口，随后坐进迈巴赫车内。',
+      '场次 3｜日/外/内｜临江大学新生报到处及校园长椅',
+      '林夏先到新生报到处，随后在校园长椅坐下。',
+    ].join('\n'))
+
+    expect(locations.map((location) => location.name)).toEqual([
+      '民政局登记大厅',
+      '民政局门口',
+      '迈巴赫车内',
+      '临江大学新生报到处',
+      '校园长椅',
+    ])
+    expect(locations[0].description).toContain('林夏与洛雪微走到登记窗口前')
+    expect(locations[1].description).toContain('复合场次中的独立空间“民政局门口”')
+    expect(locations[2].description).toContain('复合场次中的独立空间“迈巴赫车内”')
   })
 
   it('recognizes bracketed scene headings used by uploaded short-drama scripts', () => {
@@ -356,6 +549,81 @@ describe('preproduction prompt rules', () => {
     expect(locations[0].description).not.toContain('皇后大桥')
   })
 
+  it('recognizes compact numbered headings such as scene one, day, exterior', () => {
+    const locations = extractScriptSceneLocations([
+      '【场1】日/外/哈德逊河边',
+      '林晨扶着栏杆打电话。',
+      '【场2】日/内/翡翠山庄客厅',
+      '林晨打开茶几上的文件盒。',
+      '【场3】日/内/翡翠山庄书房',
+      '林晨坐在黑胡桃木书桌前。',
+    ].join('\n'))
+
+    expect(locations.map((location) => location.name)).toEqual([
+      '哈德逊河边',
+      '翡翠山庄客厅',
+      '翡翠山庄书房',
+    ])
+    expect(locations[2].description).toContain('日，内')
+  })
+
+  it('recognizes unbracketed scene numbers and an explicit underwater hook transition', () => {
+    const locations = extractScriptSceneLocations([
+      '场1-1',
+      '日 内 黑松庄园主屋客厅',
+      '克莱尔整理药箱。',
+      '场1-2',
+      '夜 外 月光悬崖',
+      '克莱尔从崖边坠落，画面切黑。',
+      '△ 深海之下，克莱尔的身体缓缓下沉，手腕封印开始碎裂。',
+    ].join('\n'))
+
+    expect(locations.map((location) => location.name)).toEqual([
+      '黑松庄园主屋客厅',
+      '月光悬崖',
+      '深海之下',
+    ])
+    expect(locations[2].description).toContain('独立水下空间')
+  })
+
+  it('extracts an inline flashback laboratory and a following exterior as separate scenes', () => {
+    const locations = extractScriptSceneLocations([
+      '场2-3',
+      '夜 内 崖底木屋',
+      '克莱尔脑海中闪过破碎画面——童年，白色实验室，针管，尖叫。',
+      '【闪回】',
+      '幼年克莱尔被绑在金属床上。',
+      '【闪回结束】',
+      '克莱尔手腕金光暴涨，单膝跪地，阿德里安被力量震开。',
+      '△ 木屋外，月光下一头白狼虚影仰天长啸。',
+    ].join('\n'))
+
+    expect(locations.map((location) => location.name)).toEqual([
+      '崖底木屋',
+      '实验室（闪回）',
+      '木屋外',
+    ])
+    expect(locations.find((location) => location.name === '崖底木屋')?.description).toContain('手腕金光暴涨')
+    expect(locations.find((location) => location.name === '实验室（闪回）')?.description).not.toContain('手腕金光暴涨')
+    expect(locations.find((location) => location.name === '木屋外')?.description).toContain('白狼虚影')
+  })
+
+  it('treats walking out of a named building as a new exterior scene', () => {
+    const locations = extractScriptSceneLocations([
+      '【场4】夜 内 黑松庄园·走廊',
+      '克莱尔在走廊扶起艾玛。',
+      '【结尾Hook】',
+      '△ 克莱尔、艾玛和阿德里安三人走出黑松庄园。突然，远处传来狼嚎，无数黑影逼近。',
+    ].join('\n'))
+
+    expect(locations.map((location) => location.name)).toEqual([
+      '夜 内 黑松庄园·走廊',
+      '黑松庄园外',
+    ])
+    expect(locations[0].description).not.toContain('远处传来狼嚎')
+    expect(locations[1].description).toContain('远处传来狼嚎')
+  })
+
   it('builds small API-only inventory prompts for one asset type at a time', () => {
     const prompt = buildAssetInventoryPrompt({
       script: '夜晚，苏文菁在别墅客厅拿起红酒杯。',
@@ -369,6 +637,7 @@ describe('preproduction prompt rules', () => {
     expect(prompt).toContain('水晶红酒杯')
     expect(prompt).not.toContain('中年女性')
     expect(prompt).toContain('没有该类型资产时返回空数组')
+    expect(prompt).toContain('每一项都必须明确保留 type:"prop"')
 
     const locationInventoryPrompt = buildAssetInventoryPrompt({
       script: '场次一，夜晚，翡翠山庄别墅客厅。',
@@ -385,7 +654,9 @@ describe('preproduction prompt rules', () => {
       type: AssetType.character,
     })
     expect(characterInventoryPrompt).toContain('不同角色即使职业、族裔、服装或道具相同也不得合并')
+    expect(characterInventoryPrompt).toContain('至少记录三项可稳定复现的面部身份锚点')
     expect(characterInventoryPrompt).toContain('地点或剧情身份 + 年龄层 + 职业')
+    expect(characterInventoryPrompt).toContain('每一项都必须明确保留 type:"character"')
   })
 
   it('builds a complete single-asset prompt for the same text API', () => {
@@ -401,6 +672,7 @@ describe('preproduction prompt rules', () => {
     expect(characterPrompt).toContain('正面、侧面、背面')
     expect(characterPrompt).toContain('统一画风')
     expect(characterPrompt).toContain('林野')
+    expect(characterPrompt).toContain('同项目角色至少在其中三项形成可见差异')
     expect(characterPrompt).toContain('只输出严格 JSON')
 
     const locationPrompt = buildSingleAssetPrompt({
@@ -412,8 +684,9 @@ describe('preproduction prompt rules', () => {
       },
       visualStyle: VisualStyle.photorealistic,
     })
-    expect(locationPrompt).toContain('不能出现其他人, 无人, 纯场景,')
-    expect(locationPrompt).toContain('no humans, empty, landscape only')
+    expect(locationPrompt).toContain('建筑与环境为画面主体')
+    expect(locationPrompt).toContain('280-620 个中文字')
+    expect(locationPrompt).not.toContain('no humans, empty, landscape only')
   })
 
   it('asks the API to remove incidental candidates before prompt generation', () => {

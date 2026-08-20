@@ -36,6 +36,7 @@ export async function POST(request: NextRequest) {
         sceneNumber: (latest._max.sceneNumber || 0) + 1,
         notes: body.notes || null,
         imagePrompt: body.imagePrompt || null,
+        directorPrompt: body.directorPrompt || null,
         videoPrompt: body.videoPrompt,
         duration: body.duration,
         aspectRatio: body.aspectRatio,
